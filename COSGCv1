@@ -1,0 +1,332 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <AccelStepper.h>
+#include <Adafruit_MotorShield.h>
+#include <AFMotor.h>              
+#include <IrWidgetAggregating.h>  
+#include <IrReceiverPoll.h>       
+#include <IrReceiverSampler.h>    
+#include <HCSR04.h>
+
+// ***************************************
+// Configuration & Pin Assignments
+// ***************************************
+
+// --- Stepper Motor Pin Definitions ---
+// Each stepper uses one STEP and one DIR pin.
+const int STEPPER1_STEP = D0;
+const int STEPPER1_DIR  = D9;
+const int STEPPER2_STEP = D10;
+const int STEPPER2_DIR  = D11;
+
+// --- IR Sensor ---
+// Analog IR sensor for obstacle detection.
+const int IR_SENSOR_PIN = A0;
+const int IR_THRESHOLD  = 500; // Adjust based on your sensor's readings
+
+// --- Ultrasonic Sensor ---
+// Using an HC-SR04 sensor.
+const int ULTRASONIC_TRIG_PIN = D13; // Trigger pin
+const int ULTRASONIC_ECHO_PIN = D14; // Echo pin (ensure proper level shifting)
+const int ULTRASONIC_THRESHOLD = 20; // Distance in centimeters for an obstacle
+
+// --- Control Mode Switch ---
+// A physical switch connected to this pin selects between autonomous mode (LOW)
+// and WiFi remote control mode (HIGH). Using built-in pull-up.
+const int CONTROL_SWITCH_PIN = D12;
+
+// --- WiFi Settings ---
+const char* AP_SSID = "RobotAP";
+const char* AP_PASSWORD = "password";  // Change this for security
+
+// --- Stepper Steering Positions ---
+// For a Nema 17 with 200 steps per revolution:
+//   0 steps: Forward (centered steering)
+//   +81 steps: Left
+//   -81 steps: Right
+const long STEPPER_CENTER = 0;
+const long STEPPER_LEFT   = 81;
+const long STEPPER_RIGHT  = -81;
+
+// ***************************************
+// Global Objects
+// ***************************************
+
+// Create two AccelStepper objects in DRIVER mode.
+AccelStepper stepper1(AccelStepper::DRIVER, STEPPER1_STEP, STEPPER1_DIR);
+AccelStepper stepper2(AccelStepper::DRIVER, STEPPER2_STEP, STEPPER2_DIR);
+
+// Create the web server on port 80.
+ESP8266WebServer server(80);
+
+// Create an instance of the Adafruit Motor Shield.
+Adafruit_MotorShield AFMS = Adafruit_MotorShield(); // Default I2C address
+
+// Get pointers to the four DC motors (channels 1-4).
+Adafruit_DCMotor *motor1 = AFMS.getMotor(1);
+Adafruit_DCMotor *motor2 = AFMS.getMotor(2);
+Adafruit_DCMotor *motor3 = AFMS.getMotor(3);
+Adafruit_DCMotor *motor4 = AFMS.getMotor(4);
+
+// Create an instance of the ultrasonic sensor using the HCSR04 library.
+HCSR04 ultrasonicSensor(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
+
+// ***************************************
+// Function Prototypes
+// ***************************************
+void driveForward();
+void driveBackward();
+void stopDCMotors();
+
+void centerSteering();
+void moveSteppersTo(long target);  // Moves both steppers to an absolute target position.
+void steerAvoidObstacle();
+
+// Sensor helper functions.
+float getUltrasonicDistance();  // Returns distance in centimeters.
+
+// WiFi remote control endpoint handlers.
+void handleForward();
+void handleBackward();
+void handleStop();
+void handleLeft();
+void handleRight();
+void handleCenter();
+void handleCamera();
+
+// ***************************************
+// Setup Function
+// ***************************************
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Self-Driving Robot Initializing...");
+
+  // --- Initialize the Adafruit Motor Shield ---
+  if (!AFMS.begin()) { // create with the default frequency 1.6KHz
+    Serial.println("Could not find Motor Shield. Check wiring.");
+    while (1);
+  }
+  // Optionally, set initial speed for all motors (0-255)
+  motor1->setSpeed(150);
+  motor2->setSpeed(150);
+  motor3->setSpeed(150);
+  motor4->setSpeed(150);
+
+  // --- Initialize IR Sensor Pin ---
+  pinMode(IR_SENSOR_PIN, INPUT);
+
+  // --- Initialize the Control Switch ---
+  // Using internal pull-up so that the switch grounds the pin when activated.
+  pinMode(CONTROL_SWITCH_PIN, INPUT_PULLUP);
+
+  // --- Initialize Stepper Motors ---
+  stepper1.setMaxSpeed(1000);
+  stepper1.setAcceleration(500);
+  stepper2.setMaxSpeed(1000);
+  stepper2.setAcceleration(500);
+
+  // --- Start with motors stopped and steering centered ---
+  stopDCMotors();
+  centerSteering();
+
+  // --- Setup WiFi Access Point ---
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("Access Point \"");
+  Serial.print(AP_SSID);
+  Serial.println("\" started");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // --- Define Web Server Routes ---
+  server.on("/forward", handleForward);
+  server.on("/backward", handleBackward);
+  server.on("/stop", handleStop);
+  server.on("/left", handleLeft);
+  server.on("/right", handleRight);
+  server.on("/center", handleCenter);
+  server.on("/camera", handleCamera);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ***************************************
+// Main Loop
+// ***************************************
+void loop() {
+  // Check the physical switch mode.
+  // With INPUT_PULLUP, unpressed state is HIGH.
+  bool wifiControl = (digitalRead(CONTROL_SWITCH_PIN) == HIGH);
+
+  if (wifiControl) {
+    // --- WiFi Remote Control Mode ---
+    server.handleClient();  // Process any incoming HTTP requests.
+    // Optionally, halt autonomous motor actions.
+    stopDCMotors();
+  } else {
+    // --- Autonomous Mode ---
+    // Read IR sensor.
+    int irValue = analogRead(IR_SENSOR_PIN);
+    Serial.print("IR Sensor Value: ");
+    Serial.println(irValue);
+
+    // Read ultrasonic sensor using the HCSR04 library.
+    float ultrasonicDistance = getUltrasonicDistance();
+    Serial.print("Ultrasonic Distance (cm): ");
+    Serial.println(ultrasonicDistance);
+
+    // Check if either sensor indicates an obstacle.
+    if ((irValue < IR_THRESHOLD) || (ultrasonicDistance > 0 && ultrasonicDistance < ULTRASONIC_THRESHOLD)) {
+      Serial.println("Obstacle detected!");
+      stopDCMotors();
+      steerAvoidObstacle();
+    } else {
+      driveForward();
+      centerSteering();
+    }
+  }
+
+  // Run the steppers toward their target positions.
+  stepper1.run();
+  stepper2.run();
+
+  delay(50); // Short delay for loop stability.
+}
+
+// ***************************************
+// Sensor Helper Functions
+// ***************************************
+
+// getUltrasonicDistance()
+// Uses the HCSR04 library to return distance in centimeters.
+float getUltrasonicDistance() {
+  // The HCSR04 library returns distance in centimeters.
+  // It handles triggering and echo internally.
+  float distance = ultrasonicSensor.dist();
+  return distance;
+}
+
+// ***************************************
+// DC Motor Control Functions (using Adafruit Motor Shield)
+// ***************************************
+
+// driveForward()
+// Sets the motors to run forward.
+void driveForward() {
+  motor1->run(FORWARD);
+  motor2->run(FORWARD);
+  motor3->run(FORWARD);
+  motor4->run(FORWARD);
+}
+
+// driveBackward()
+// Sets the motors to run backward.
+void driveBackward() {
+  motor1->run(BACKWARD);
+  motor2->run(BACKWARD);
+  motor3->run(BACKWARD);
+  motor4->run(BACKWARD);
+}
+
+// stopDCMotors()
+// Stops (releases) all motors.
+void stopDCMotors() {
+  motor1->run(RELEASE);
+  motor2->run(RELEASE);
+  motor3->run(RELEASE);
+  motor4->run(RELEASE);
+}
+
+// ***************************************
+// Steering (Stepper) Functions
+// ***************************************
+
+// centerSteering()
+// Moves both steppers to the centered position (0 steps).
+void centerSteering() {
+  moveSteppersTo(STEPPER_CENTER);
+}
+
+// moveSteppersTo(long target)
+// Commands both steppers to move to the specified absolute target position.
+void moveSteppersTo(long target) {
+  stepper1.moveTo(target);
+  stepper2.moveTo(target);
+  
+  // Run both steppers until both have reached the target.
+  while ((stepper1.distanceToGo() != 0) || (stepper2.distanceToGo() != 0)) {
+    stepper1.run();
+    stepper2.run();
+  }
+}
+
+// steerAvoidObstacle()
+// A simple avoidance maneuver that steers left.
+void steerAvoidObstacle() {
+  Serial.println("Avoidance maneuver: steering left.");
+  moveSteppersTo(STEPPER_LEFT);
+  driveForward();
+  delay(500);  // Move forward for 500 milliseconds.
+  centerSteering();
+}
+
+// ***************************************
+// WiFi Remote Control Handlers
+// ***************************************
+
+// handleForward()
+// Drives the robot forward.
+void handleForward() {
+  Serial.println("Remote Command: FORWARD");
+  driveForward();
+  server.send(200, "text/plain", "Driving Forward");
+}
+
+// handleBackward()
+// Drives the robot backward.
+void handleBackward() {
+  Serial.println("Remote Command: BACKWARD");
+  driveBackward();
+  server.send(200, "text/plain", "Driving Backward");
+}
+
+// handleStop()
+// Stops all DC motors.
+void handleStop() {
+  Serial.println("Remote Command: STOP");
+  stopDCMotors();
+  server.send(200, "text/plain", "Motors Stopped");
+}
+
+// handleLeft()
+// Sets steering to the left position (+81 steps).
+void handleLeft() {
+  Serial.println("Remote Command: LEFT");
+  moveSteppersTo(STEPPER_LEFT);
+  server.send(200, "text/plain", "Steering Left");
+}
+
+// handleRight()
+// Sets steering to the right position (-81 steps).
+void handleRight() {
+  Serial.println("Remote Command: RIGHT");
+  moveSteppersTo(STEPPER_RIGHT);
+  server.send(200, "text/plain", "Steering Right");
+}
+
+// handleCenter()
+// Returns steering to the centered position (0 steps).
+void handleCenter() {
+  Serial.println("Remote Command: CENTER");
+  centerSteering();
+  server.send(200, "text/plain", "Steering Centered");
+}
+
+// handleCamera()
+// Redirects the client to the ESP32-CAM's video stream.
+void handleCamera() {
+  Serial.println("Remote Command: CAMERA");
+  // Replace the IP address below with the actual IP of your ESP32-CAM.
+  String html = "<html><head><meta http-equiv='refresh' content='0; url=http://192.168.4.2/stream'></head><body></body></html>";
+  server.send(200, "text/html", html);
+}
