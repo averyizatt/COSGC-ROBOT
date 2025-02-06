@@ -1,0 +1,316 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Adafruit_MotorShield.h>
+#include <Servo.h>
+#include <HCSR04.h>
+#include <Wire.h>  // Needed for I2C communication with the motor shield
+
+// ***************************************
+// Configuration & Pin Assignments
+// ***************************************
+
+// --- DC Motor H-Bridge (via Devmo L293D/Adafruit Motor Shield) ---
+// These motors are controlled by the Motor Shield.
+  
+// (No changes here—these ports are used by the Motor Shield library.)
+  
+// --- Servo for Steering ---
+// We assume the servo is connected to one of the servo headers on the shield.
+// On the Adafruit Motor Shield v1, the servo port S1 is usually on Arduino pin 9.
+const int SERVO_PIN = 9;  
+// Servo angle mapping:
+//   90°   => Forward/center steering
+//   0°    => Steer right
+//   180°  => Steer left
+
+// --- IR Sensor ---
+// Analog IR sensor for obstacle detection.
+const int IR_SENSOR_PIN = A0;
+const int IR_THRESHOLD  = 500; // Adjust based on your sensor's readings
+
+// --- Ultrasonic Sensor ---
+// Using an HC-SR04 sensor.
+const int ULTRASONIC_TRIG_PIN = D13; // Trigger pin
+const int ULTRASONIC_ECHO_PIN = D14; // Echo pin (ensure proper level shifting to 3.3V)
+const int ULTRASONIC_THRESHOLD = 20; // Distance in centimeters for an obstacle
+
+// --- Control Mode Switch ---
+// A physical switch connected to this pin selects between autonomous mode (LOW)
+// and WiFi remote control mode (HIGH). Using built-in pull-up.
+const int CONTROL_SWITCH_PIN = D12;
+
+// --- WiFi Settings ---
+const char* AP_SSID = "RobotAP";
+const char* AP_PASSWORD = "password";  // Change this for security
+
+// ***************************************
+// Global Objects
+// ***************************************
+
+// Create the web server on port 80.
+ESP8266WebServer server(80);
+
+// Create an instance of the Adafruit Motor Shield.
+Adafruit_MotorShield AFMS = Adafruit_MotorShield(); // uses default I2C address
+
+// Get pointers to the four DC motors (channels 1-4).
+Adafruit_DCMotor *motor1 = AFMS.getMotor(1);
+Adafruit_DCMotor *motor2 = AFMS.getMotor(2);
+Adafruit_DCMotor *motor3 = AFMS.getMotor(3);
+Adafruit_DCMotor *motor4 = AFMS.getMotor(4);
+
+// Create a Servo object for steering.
+Servo steeringServo;
+
+// Create an instance of the ultrasonic sensor using the HCSR04 library.
+HCSR04 ultrasonicSensor(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
+
+// ***************************************
+// Function Prototypes
+// ***************************************
+void driveForward();
+void driveBackward();
+void stopDCMotors();
+
+void centerSteering();       // Set servo to 90° (center/forward)
+void steerLeft();            // Set servo to 180° (left)
+void steerRight();           // Set servo to 0° (right)
+void steerAvoidObstacle();
+
+float getUltrasonicDistance();  // Returns distance in centimeters.
+
+void handleForward();
+void handleBackward();
+void handleStop();
+void handleLeft();
+void handleRight();
+void handleCenter();
+void handleCamera();
+
+// ***************************************
+// Setup Function
+// ***************************************
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Self-Driving Robot Initializing...");
+
+  // --- Initialize the Adafruit Motor Shield ---
+  if (!AFMS.begin()) { // Default frequency is 1.6KHz
+    Serial.println("Could not find Motor Shield. Check wiring.");
+    while (1);
+  }
+  
+  // Optionally, set an initial speed for all DC motors (speed range is 0-255).
+  motor1->setSpeed(150);
+  motor2->setSpeed(150);
+  motor3->setSpeed(150);
+  motor4->setSpeed(150);
+
+  // --- Initialize Servo for Steering ---
+  steeringServo.attach(SERVO_PIN);
+  centerSteering();  // Start with steering centered
+
+  // --- Initialize IR Sensor Pin ---
+  pinMode(IR_SENSOR_PIN, INPUT);
+
+  // --- Initialize Ultrasonic Sensor Pins ---
+  // (The HCSR04 library handles triggering internally.)
+  
+  // --- Initialize the Control Switch ---
+  // Using internal pull-up so that the switch reads HIGH when not pressed.
+  pinMode(CONTROL_SWITCH_PIN, INPUT_PULLUP);
+
+  // --- Setup WiFi Access Point ---
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("Access Point \"");
+  Serial.print(AP_SSID);
+  Serial.println("\" started");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // --- Define Web Server Routes ---
+  server.on("/forward", handleForward);
+  server.on("/backward", handleBackward);
+  server.on("/stop", handleStop);
+  server.on("/left", handleLeft);
+  server.on("/right", handleRight);
+  server.on("/center", handleCenter);
+  server.on("/camera", handleCamera);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ***************************************
+// Main Loop
+// ***************************************
+void loop() {
+  // Check the physical switch mode.
+  // With INPUT_PULLUP, the unpressed state is HIGH.
+  bool wifiControl = (digitalRead(CONTROL_SWITCH_PIN) == HIGH);
+
+  if (wifiControl) {
+    // --- WiFi Remote Control Mode ---
+    server.handleClient();  // Process incoming HTTP requests.
+    // Optionally, halt autonomous actions.
+    stopDCMotors();
+  } else {
+    // --- Autonomous Mode ---
+    // Read IR sensor.
+    int irValue = analogRead(IR_SENSOR_PIN);
+    Serial.print("IR Sensor Value: ");
+    Serial.println(irValue);
+
+    // Read ultrasonic sensor.
+    float ultrasonicDistance = getUltrasonicDistance();
+    Serial.print("Ultrasonic Distance (cm): ");
+    Serial.println(ultrasonicDistance);
+
+    // Check if either sensor indicates an obstacle.
+    if ((irValue < IR_THRESHOLD) || (ultrasonicDistance > 0 && ultrasonicDistance < ULTRASONIC_THRESHOLD)) {
+      Serial.println("Obstacle detected!");
+      stopDCMotors();
+      steerAvoidObstacle();
+    } else {
+      driveForward();
+      centerSteering();
+    }
+  }
+
+  delay(50); // Short delay for loop stability.
+}
+
+// ***************************************
+// Sensor Helper Functions
+// ***************************************
+
+// getUltrasonicDistance()
+// Uses the HCSR04 library to return distance in centimeters.
+float getUltrasonicDistance() {
+  float distance = ultrasonicSensor.dist();
+  return distance;
+}
+
+// ***************************************
+// DC Motor Control Functions (using Adafruit Motor Shield)
+// ***************************************
+
+// driveForward()
+// Sets all DC motors to run forward.
+void driveForward() {
+  motor1->run(FORWARD);
+  motor2->run(FORWARD);
+  motor3->run(FORWARD);
+  motor4->run(FORWARD);
+}
+
+// driveBackward()
+// Sets all DC motors to run backward.
+void driveBackward() {
+  motor1->run(BACKWARD);
+  motor2->run(BACKWARD);
+  motor3->run(BACKWARD);
+  motor4->run(BACKWARD);
+}
+
+// stopDCMotors()
+// Stops (releases) all DC motors.
+void stopDCMotors() {
+  motor1->run(RELEASE);
+  motor2->run(RELEASE);
+  motor3->run(RELEASE);
+  motor4->run(RELEASE);
+}
+
+// ***************************************
+// Steering (Servo) Functions
+// ***************************************
+
+// centerSteering()
+// Sets the servo to 90° for forward/centered steering.
+void centerSteering() {
+  steeringServo.write(90);
+}
+
+// steerLeft()
+// Sets the servo to 180° for left steering.
+void steerLeft() {
+  steeringServo.write(180);
+}
+
+// steerRight()
+// Sets the servo to 0° for right steering.
+void steerRight() {
+  steeringServo.write(0);
+}
+
+// steerAvoidObstacle()
+// An obstacle avoidance maneuver that steers left briefly.
+void steerAvoidObstacle() {
+  Serial.println("Avoidance maneuver: steering left.");
+  steerLeft();
+  driveForward();
+  delay(500);  // Move forward for 500 milliseconds while steered left.
+  centerSteering();
+}
+
+// ***************************************
+// WiFi Remote Control Handlers
+// ***************************************
+
+// handleForward()
+// Drives the robot forward.
+void handleForward() {
+  Serial.println("Remote Command: FORWARD");
+  driveForward();
+  server.send(200, "text/plain", "Driving Forward");
+}
+
+// handleBackward()
+// Drives the robot backward.
+void handleBackward() {
+  Serial.println("Remote Command: BACKWARD");
+  driveBackward();
+  server.send(200, "text/plain", "Driving Backward");
+}
+
+// handleStop()
+// Stops all DC motors.
+void handleStop() {
+  Serial.println("Remote Command: STOP");
+  stopDCMotors();
+  server.send(200, "text/plain", "Motors Stopped");
+}
+
+// handleLeft()
+// Steers the robot to the left.
+void handleLeft() {
+  Serial.println("Remote Command: LEFT");
+  steerLeft();
+  server.send(200, "text/plain", "Steering Left");
+}
+
+// handleRight()
+// Steers the robot to the right.
+void handleRight() {
+  Serial.println("Remote Command: RIGHT");
+  steerRight();
+  server.send(200, "text/plain", "Steering Right");
+}
+
+// handleCenter()
+// Returns steering to the centered position (forward).
+void handleCenter() {
+  Serial.println("Remote Command: CENTER");
+  centerSteering();
+  server.send(200, "text/plain", "Steering Centered");
+}
+
+// handleCamera()
+// Redirects the client to the ESP32-CAM's video stream.
+void handleCamera() {
+  Serial.println("Remote Command: CAMERA");
+  // Replace the IP address with the actual IP of your ESP32-CAM.
+  String html = "<html><head><meta http-equiv='refresh' content='0; url=http://192.168.4.2/stream'></head><body></body></html>";
+  server.send(200, "text/html", html);
+}
