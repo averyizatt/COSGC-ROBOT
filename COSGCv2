@@ -14,12 +14,12 @@
 // --- Servo Motors ---
 // Steering servo (for steering) and an auxiliary servo for future use.
 const int STEERING_SERVO_PIN = 9;   // Steering servo (attached to Motor Shield servo port)
-const int AUX_SERVO_PIN = D5;       // Auxiliary servo (choose a free pin)
+const int AUX_SERVO_PIN = D5;       // Auxiliary servo (reserved for future use)
 
 // Servo angle mapping for steeringServo:
-  // Center/Forward: 90°
-  // Right side: Mild = 60°, Aggressive = 0°
-  // Left side: Mild = 120°, Aggressive = 180°
+//   Center/Forward: 90°
+//   Right side: Mild = 60°, Aggressive = 0°
+//   Left side: Mild = 120°, Aggressive = 180°
 
   
 // --- Ultrasonic Sensor ---
@@ -27,7 +27,7 @@ const int AUX_SERVO_PIN = D5;       // Auxiliary servo (choose a free pin)
 const int ULTRASONIC_TRIG_PIN = A0;  // Trigger pin
 const int ULTRASONIC_ECHO_PIN = A1;  // Echo pin (ensure proper level shifting)
 const int ULTRASONIC_THRESHOLD = 20;           // Overall obstacle threshold in cm
-const int ULTRASONIC_AGGRESSIVE_THRESHOLD = 10;  // If below 10 cm, use aggressive steering
+const int ULTRASONIC_AGGRESSIVE_THRESHOLD = 10;  // Below 10 cm, use aggressive steering
 
 // --- IR Sensor ---
 // Now moved to analog pin A2.
@@ -35,16 +35,22 @@ const int IR_SENSOR_PIN = A2;
 const int IR_THRESHOLD  = 500;  // Adjust based on your sensor's readings
 
 // --- RGB Sensor ---
-// Using the Adafruit TCS34725. Thresholds for various colors:
+// Using the Adafruit TCS34725 sensor.
 Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
 const uint16_t GREEN_FLAG_THRESHOLD = 1000;  // Finish condition for green flag
-const uint16_t RED_THRESHOLD        = 800;   // Minimum value for red to be considered dominant
-const uint16_t BLUE_THRESHOLD       = 800;   // Minimum value for blue to be considered dominant
-const uint16_t WHITE_THRESHOLD      = 1500;  // All channels high indicates white wall
+const uint16_t RED_THRESHOLD        = 800;   // Red dominant threshold
+const uint16_t BLUE_THRESHOLD       = 800;   // Blue dominant threshold
+const uint16_t WHITE_THRESHOLD      = 1500;  // White (all channels high) threshold
 
-// --- Control Mode Switch ---
-// A physical switch selects between autonomous mode (LOW) and WiFi control (HIGH)
-const int CONTROL_SWITCH_PIN = D12;  // Using internal pull-up
+// --- Mode Switch ---
+// The mode-selection switch is now wired to A3.
+// Using internal pull-up: when unpressed, reads HIGH; when pressed, reads LOW.
+const int MODE_SWITCH_PIN = A3;
+
+// --- LED Indicators ---
+// Green LED on A4 (indicates “going forward”) and Red LED on A5 (indicates obstacle avoidance)
+const int LED_GREEN_PIN = A4;
+const int LED_RED_PIN   = A5;
 
 // --- WiFi Settings ---
 const char* AP_SSID = "RobotAP";
@@ -76,7 +82,7 @@ HCSR04 ultrasonicSensor(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
 // Global variables for obstacle detection and recovery.
 unsigned long obstacleStartTime = 0;
 const unsigned long stuckThreshold = 5000; // 5 seconds
-bool finished = false;  // Flag when the course is complete (green flag detected)
+bool finished = false;  // Flag to mark course complete (green flag detected)
 
 // ***************************************
 // Function Prototypes
@@ -85,11 +91,11 @@ void driveForward();
 void driveBackward();
 void stopDCMotors();
 
-void centerSteering();         // Set steering servo to 90°
-void steerRightAggressive();   // Set steering servo to 0° (aggressive right)
-void steerRightMild();         // Set steering servo to 60° (mild right)
-void steerLeftMild();          // Set steering servo to 120° (mild left)
-void steerLeftAggressive();    // Set steering servo to 180° (aggressive left)
+void centerSteering();         // Sets steering servo to 90°
+void steerRightAggressive();   // Sets steering servo to 0° (aggressive right)
+void steerRightMild();         // Sets steering servo to 60° (mild right)
+void steerLeftMild();          // Sets steering servo to 120° (mild left)
+void steerLeftAggressive();    // Sets steering servo to 180° (aggressive left)
 
 void autonomousSteering();     // Chooses servo angle based on ultrasonic sensor
 float getUltrasonicDistance(); // Returns distance in cm
@@ -119,7 +125,7 @@ void setup() {
     Serial.println("Could not find Motor Shield. Check wiring.");
     while (1);
   }
-  // Set initial speed for DC motors (0–255)
+  // Set an initial speed for all DC motors (range 0–255)
   motor1->setSpeed(150);
   motor2->setSpeed(150);
   motor3->setSpeed(150);
@@ -132,11 +138,13 @@ void setup() {
 
   // --- Initialize Sensors ---
   pinMode(IR_SENSOR_PIN, INPUT);
-  // The HCSR04 library handles ultrasonic sensor triggering internally.
-  // Initialize control switch (with internal pull-up)
-  pinMode(CONTROL_SWITCH_PIN, INPUT_PULLUP);
+  
+  // Initialize mode switch and LED pins (using accessory pins on the shield)
+  pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);  // Mode switch (A3) with internal pull-up
+  pinMode(LED_GREEN_PIN, OUTPUT);          // Green LED (A4)
+  pinMode(LED_RED_PIN, OUTPUT);            // Red LED (A5)
 
-  // --- Initialize RGB Sensor ---
+  // --- Initialize the RGB Sensor ---
   if (tcs.begin()) {
     Serial.println("RGB sensor initialized.");
   } else {
@@ -155,10 +163,10 @@ void setup() {
   server.on("/forward", handleForward);
   server.on("/backward", handleBackward);
   server.on("/stop", handleStop);
-  // Right side endpoints
+  // Right side endpoints:
   server.on("/right", handleRight);         // Aggressive right (0°)
   server.on("/rightmild", handleRightMild);   // Mild right (60°)
-  // Left side endpoints
+  // Left side endpoints:
   server.on("/left", handleLeft);           // Aggressive left (180°)
   server.on("/leftmild", handleLeftMild);     // Mild left (120°)
   server.on("/center", handleCenter);
@@ -183,26 +191,32 @@ void loop() {
   Serial.print(" C=");
   Serial.println(c);
   
-  // Check for finish condition: green flag.
+  // Check for finish condition: green flag detection.
   if (!finished && (g > GREEN_FLAG_THRESHOLD) && (g > r) && (g > b)) {
     finished = true;
     Serial.println("Green flag detected! Course complete.");
     stopDCMotors();
     centerSteering();
+    // Set LED: Green on, Red off.
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
     delay(1000);
-    return;  // Stop further processing.
+    return;  // End further processing.
   }
   
-  // Autonomous mode vs. WiFi remote control:
-  bool wifiControl = (digitalRead(CONTROL_SWITCH_PIN) == HIGH);
+  // Check the mode switch (using A3).
+  bool wifiControl = (digitalRead(MODE_SWITCH_PIN) == HIGH);
+  
   if (wifiControl) {
     // WiFi Remote Control Mode:
     server.handleClient();
     stopDCMotors();
     obstacleStartTime = 0; // Reset obstacle timer.
+    // Set LED to indicate manual mode (we'll use green here).
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
   } else {
     // Autonomous Mode:
-    // Read IR and ultrasonic sensors.
     int irValue = analogRead(IR_SENSOR_PIN);
     float ultrasonicDistance = getUltrasonicDistance();
     Serial.print("IR Sensor Value: ");
@@ -210,30 +224,32 @@ void loop() {
     Serial.print("Ultrasonic Distance (cm): ");
     Serial.println(ultrasonicDistance);
 
-    // Check for obstacles.
+    // Check for obstacles (via IR or ultrasonic).
     if ((irValue < IR_THRESHOLD) || (ultrasonicDistance > 0 && ultrasonicDistance < ULTRASONIC_THRESHOLD)) {
       Serial.println("Obstacle detected!");
       stopDCMotors();
       
-      // Start (or continue) timing the obstacle.
+      // Set LED to red to indicate obstacle avoidance.
+      digitalWrite(LED_GREEN_PIN, LOW);
+      digitalWrite(LED_RED_PIN, HIGH);
+      
+      // Start or continue timing the obstacle.
       if (obstacleStartTime == 0) {
         obstacleStartTime = millis();
       }
       
-      // If the obstacle persists beyond the stuck threshold, trigger recovery.
+      // If the obstacle persists for too long, trigger recovery.
       if (millis() - obstacleStartTime > stuckThreshold) {
         recoverFromStuck();
       } else {
-        // Use autonomous steering based on ultrasonic distance.
+        // Otherwise, adjust steering based on ultrasonic distance.
         autonomousSteering();
         driveForward();
       }
     } else {
       // No obstacle detected.
       obstacleStartTime = 0;  // Reset timer.
-      // Use RGB sensor guidance if available:
-      // If red is dominant, steer mild left; if blue is dominant, steer mild right;
-      // if white (all channels high) is detected, center the steering.
+      // Use RGB sensor guidance:
       if (r > RED_THRESHOLD && r > g && r > b) {
         Serial.println("Red dominant detected – steering mild left (120°).");
         steerLeftMild();
@@ -247,6 +263,9 @@ void loop() {
         centerSteering();
       }
       driveForward();
+      // Set LED to green to indicate forward movement.
+      digitalWrite(LED_GREEN_PIN, HIGH);
+      digitalWrite(LED_RED_PIN, LOW);
     }
   }
   
@@ -312,10 +331,10 @@ void steerLeftAggressive() {
 }
 
 // autonomousSteering():
-// Uses ultrasonic sensor distance to choose a right turn:
+// Uses ultrasonic sensor distance to choose a right turn.
 //   - If very close (< ULTRASONIC_AGGRESSIVE_THRESHOLD): aggressive right (0°)
 //   - Else if moderately close (< ULTRASONIC_THRESHOLD): mild right (60°)
-//   - Otherwise: center steering (90°)
+//   - Otherwise: center (90°)
 void autonomousSteering() {
   float distance = getUltrasonicDistance();
   if (distance > 0) {
@@ -334,12 +353,12 @@ void autonomousSteering() {
 }
 
 // recoverFromStuck():
-// Increases reverse speed to try to free the robot, then steers slightly before resuming.
+// Increases reverse speed to free the robot, then steers slightly before resuming.
 void recoverFromStuck() {
   Serial.println("Recovering from being stuck...");
   stopDCMotors();
   
-  // Increase reverse speed: set motors to maximum speed temporarily.
+  // Increase reverse speed temporarily.
   motor1->setSpeed(255);
   motor2->setSpeed(255);
   motor3->setSpeed(255);
@@ -358,7 +377,7 @@ void recoverFromStuck() {
   // After reversing, steer mild right.
   steerRightMild();
   driveForward();
-  delay(1000);  // Move forward while turning for 1 second
+  delay(1000);  // Drive forward while turning for 1 second
   centerSteering();
   obstacleStartTime = 0;  // Reset obstacle timer
 }
@@ -417,7 +436,7 @@ void handleCenter() {
 
 void handleCamera() {
   Serial.println("Remote Command: CAMERA");
-  // Replace with the actual IP of your ESP32-CAM.
+  // Replace with the actual IP address of your ESP32-CAM.
   String html = "<html><head><meta http-equiv='refresh' content='0; url=http://192.168.4.2/stream'></head><body></body></html>";
   server.send(200, "text/html", html);
 }
