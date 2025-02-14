@@ -1,0 +1,101 @@
+#include <Arduino.h>
+#include <Servo.h>
+
+// Motor Pins (L293D Motor Shield)
+const int MOTOR1_EN = 10;
+const int MOTOR1_IN1 = 7;
+const int MOTOR1_IN2 = 8;
+
+const int MOTOR2_EN = 5;
+const int MOTOR2_IN1 = 4;
+const int MOTOR2_IN2 = 3;
+
+const int MOTOR3_EN = 6;
+const int MOTOR3_IN1 = 2;
+const int MOTOR3_IN2 = 9;
+
+const int MOTOR4_EN = 11;
+const int MOTOR4_IN1 = 12;
+const int MOTOR4_IN2 = 13;
+
+// Servo Pins
+const int SERVO1_PIN = 9;
+const int SERVO2_PIN = 6;
+
+Servo servo1;
+Servo servo2;
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("Hardware Test Starting...");
+
+    // Setup motor pins
+    pinMode(MOTOR1_EN, OUTPUT);
+    pinMode(MOTOR1_IN1, OUTPUT);
+    pinMode(MOTOR1_IN2, OUTPUT);
+
+    pinMode(MOTOR2_EN, OUTPUT);
+    pinMode(MOTOR2_IN1, OUTPUT);
+    pinMode(MOTOR2_IN2, OUTPUT);
+
+    pinMode(MOTOR3_EN, OUTPUT);
+    pinMode(MOTOR3_IN1, OUTPUT);
+    pinMode(MOTOR3_IN2, OUTPUT);
+
+    pinMode(MOTOR4_EN, OUTPUT);
+    pinMode(MOTOR4_IN1, OUTPUT);
+    pinMode(MOTOR4_IN2, OUTPUT);
+
+    // Attach servos
+    servo1.attach(SERVO1_PIN);
+    servo2.attach(SERVO2_PIN);
+
+    servo1.write(90);
+    servo2.write(90);
+}
+
+void loop() {
+    Serial.println("Testing Motors...");
+
+    // Test each motor
+    testMotor(MOTOR1_EN, MOTOR1_IN1, MOTOR1_IN2);
+    testMotor(MOTOR2_EN, MOTOR2_IN1, MOTOR2_IN2);
+    testMotor(MOTOR3_EN, MOTOR3_IN1, MOTOR3_IN2);
+    testMotor(MOTOR4_EN, MOTOR4_IN1, MOTOR4_IN2);
+
+    Serial.println("Testing Servos...");
+
+    // Test Servo 1
+    for (int pos = 0; pos <= 180; pos++) {
+        servo1.write(pos);
+        servo2.write(pos);
+        delay(15);
+    }
+
+    for (int pos = 180; pos >= 0; pos--) {
+        servo1.write(pos);
+        servo2.write(pos);
+        delay(15);
+    }
+
+    servo1.write(90);
+    servo2.write(90);
+
+    Serial.println("Hardware Test Complete. Restarting...");
+    delay(2000);
+}
+
+void testMotor(int en, int in1, int in2) {
+    analogWrite(en, 150);
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    delay(1000);
+
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    delay(1000);
+
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    delay(500);
+}
