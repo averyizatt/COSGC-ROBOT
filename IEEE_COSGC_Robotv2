@@ -1,0 +1,438 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <Adafruit_MotorShield.h>
+#include <ESP8266Servo.h>       // Use ESP8266Servo library instead of standard Servo.h
+#include <HCSR04.h>
+#include <Wire.h>
+#include <Adafruit_TCS34725.h>
+
+// ***************************************
+// Configuration & Pin Assignments
+// ***************************************
+
+// --- Servo Motors ---
+// Steering servo and auxiliary servo.
+const int STEERING_SERVO_PIN = 9;   // Steering servo (attached to Motor Shield servo port)
+const int AUX_SERVO_PIN = D5;       // Auxiliary servo (reserved for future use)
+
+// Servo angle mapping for steeringServo:
+//   Center/Forward: 90°
+//   Right side: Aggressive = 0°, Mild = 60°
+//   Left side: Mild = 120°, Aggressive = 180°
+
+  
+// --- Ultrasonic Sensor ---
+// Using analog pins:
+const int ULTRASONIC_TRIG_PIN = A0;  // Trigger pin
+const int ULTRASONIC_ECHO_PIN = A1;  // Echo pin (ensure proper level shifting)
+const int ULTRASONIC_THRESHOLD = 20;           // Overall obstacle threshold in cm
+const int ULTRASONIC_AGGRESSIVE_THRESHOLD = 10;  // If below 10 cm, use aggressive steering
+
+// --- IR Sensor ---
+// Now on analog pin A2.
+const int IR_SENSOR_PIN = A2;
+const int IR_THRESHOLD  = 500;  // Adjust based on sensor readings
+
+// --- RGB Sensor ---
+// Using Adafruit TCS34725 sensor.
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_50MS, TCS34725_GAIN_4X);
+const uint16_t GREEN_FLAG_THRESHOLD = 1000;  // Finish condition for green flag
+const uint16_t RED_THRESHOLD        = 800;   // Red dominant threshold
+const uint16_t BLUE_THRESHOLD       = 800;   // Blue dominant threshold
+const uint16_t WHITE_THRESHOLD      = 1500;  // White wall threshold
+
+// --- Mode Switch ---
+// Wired to A3 with internal pull-up.
+const int MODE_SWITCH_PIN = A3;
+
+// --- LED Indicators ---
+// Green LED on A4 (indicates forward) and Red LED on A5 (indicates obstacle avoidance).
+const int LED_GREEN_PIN = A4;
+const int LED_RED_PIN   = A5;
+
+// --- WiFi Settings ---
+const char* AP_SSID = "RobotAP";
+const char* AP_PASSWORD = "password";  // Change for security
+
+// ***************************************
+// Global Objects
+// ***************************************
+
+// Create the web server on port 80.
+ESP8266WebServer server(80);
+
+// Create an instance of the Adafruit Motor Shield.
+Adafruit_MotorShield AFMS = Adafruit_MotorShield(); // Default I2C address
+
+// Get pointers to the four DC motors.
+Adafruit_DCMotor *motor1 = AFMS.getMotor(1);
+Adafruit_DCMotor *motor2 = AFMS.getMotor(2);
+Adafruit_DCMotor *motor3 = AFMS.getMotor(3);
+Adafruit_DCMotor *motor4 = AFMS.getMotor(4);
+
+// Create Servo objects.
+ESP8266Servo steeringServo;  // For steering
+ESP8266Servo auxServo;       // Auxiliary servo
+
+// Create an instance of the ultrasonic sensor.
+HCSR04 ultrasonicSensor(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN);
+
+// Global variables for obstacle detection and recovery.
+unsigned long obstacleStartTime = 0;
+const unsigned long stuckThreshold = 5000; // 5 seconds
+bool finished = false;  // Flag when course is complete (green flag detected)
+
+// ***************************************
+// Function Prototypes
+// ***************************************
+void driveForward();
+void driveBackward();
+void stopDCMotors();
+
+void centerSteering();         // Set steering servo to 90°
+void steerRightAggressive();   // Set steering servo to 0° (aggressive right)
+void steerRightMild();         // Set steering servo to 60° (mild right)
+void steerLeftMild();          // Set steering servo to 120° (mild left)
+void steerLeftAggressive();    // Set steering servo to 180° (aggressive left)
+
+void autonomousSteering();     // Chooses servo angle based on ultrasonic sensor
+float getUltrasonicDistance(); // Returns distance in cm
+
+void recoverFromStuck();       // Recovery routine if the robot is stuck
+
+// WiFi remote control endpoint handlers.
+void handleForward();
+void handleBackward();
+void handleStop();
+void handleRight();
+void handleRightMild();
+void handleLeft();
+void handleLeftMild();
+void handleCenter();
+void handleCamera();
+
+// ***************************************
+// Setup Function
+// ***************************************
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Self-Driving Robot Initializing...");
+
+  // --- Initialize the Adafruit Motor Shield ---
+  if (!AFMS.begin()) { // Default frequency is 1.6KHz
+    Serial.println("Could not find Motor Shield. Check wiring.");
+    while (1);
+  }
+  // Set an initial speed for all DC motors (0–255)
+  motor1->setSpeed(150);
+  motor2->setSpeed(150);
+  motor3->setSpeed(150);
+  motor4->setSpeed(150);
+
+  // --- Initialize Servos ---
+  steeringServo.attach(STEERING_SERVO_PIN);
+  auxServo.attach(AUX_SERVO_PIN);
+  centerSteering();  // Start with steering centered (90°)
+
+  // --- Initialize Sensors ---
+  pinMode(IR_SENSOR_PIN, INPUT);
+  
+  // Initialize mode switch and LED pins
+  pinMode(MODE_SWITCH_PIN, INPUT_PULLUP);  // Mode switch on A3 with internal pull-up
+  pinMode(LED_GREEN_PIN, OUTPUT);          // Green LED on A4
+  pinMode(LED_RED_PIN, OUTPUT);            // Red LED on A5
+
+  // --- Initialize the RGB Sensor ---
+  if (tcs.begin()) {
+    Serial.println("RGB sensor initialized.");
+  } else {
+    Serial.println("RGB sensor not found. Check wiring.");
+  }
+
+  // --- Setup WiFi Access Point ---
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("Access Point \"");
+  Serial.print(AP_SSID);
+  Serial.println("\" started");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // --- Define Web Server Routes ---
+  server.on("/forward", handleForward);
+  server.on("/backward", handleBackward);
+  server.on("/stop", handleStop);
+  // Right side endpoints:
+  server.on("/right", handleRight);         // Aggressive right (0°)
+  server.on("/rightmild", handleRightMild);   // Mild right (60°)
+  // Left side endpoints:
+  server.on("/left", handleLeft);           // Aggressive left (180°)
+  server.on("/leftmild", handleLeftMild);     // Mild left (120°)
+  server.on("/center", handleCenter);
+  server.on("/camera", handleCamera);
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ***************************************
+// Main Loop
+// ***************************************
+void loop() {
+  // Read RGB sensor values.
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+  Serial.print("RGB: R=");
+  Serial.print(r);
+  Serial.print(" G=");
+  Serial.print(g);
+  Serial.print(" B=");
+  Serial.print(b);
+  Serial.print(" C=");
+  Serial.println(c);
+  
+  // Check for finish condition: green flag detection.
+  if (!finished && (g > GREEN_FLAG_THRESHOLD) && (g > r) && (g > b)) {
+    finished = true;
+    Serial.println("Green flag detected! Course complete.");
+    stopDCMotors();
+    centerSteering();
+    // Set LED: Green on, Red off.
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
+    delay(1000);
+    return;  // Stop further processing.
+  }
+  
+  // Read mode switch (A3)
+  bool wifiControl = (digitalRead(MODE_SWITCH_PIN) == HIGH);
+  
+  if (wifiControl) {
+    // WiFi Remote Control Mode:
+    server.handleClient();
+    stopDCMotors();
+    obstacleStartTime = 0; // Reset obstacle timer.
+    // Set LED: Green on, Red off.
+    digitalWrite(LED_GREEN_PIN, HIGH);
+    digitalWrite(LED_RED_PIN, LOW);
+  } else {
+    // Autonomous Mode:
+    int irValue = analogRead(IR_SENSOR_PIN);
+    float ultrasonicDistance = getUltrasonicDistance();
+    Serial.print("IR Sensor Value: ");
+    Serial.println(irValue);
+    Serial.print("Ultrasonic Distance (cm): ");
+    Serial.println(ultrasonicDistance);
+
+    // Check for obstacles.
+    if ((irValue < IR_THRESHOLD) || (ultrasonicDistance > 0 && ultrasonicDistance < ULTRASONIC_THRESHOLD)) {
+      Serial.println("Obstacle detected!");
+      stopDCMotors();
+      
+      // Set LED to red.
+      digitalWrite(LED_GREEN_PIN, LOW);
+      digitalWrite(LED_RED_PIN, HIGH);
+      
+      if (obstacleStartTime == 0) {
+        obstacleStartTime = millis();
+      }
+      
+      // If obstacle persists too long, trigger recovery.
+      if (millis() - obstacleStartTime > stuckThreshold) {
+        recoverFromStuck();
+      } else {
+        autonomousSteering();
+        driveForward();
+      }
+    } else {
+      // No obstacle detected.
+      obstacleStartTime = 0;  // Reset timer.
+      // Use RGB sensor guidance:
+      if (r > RED_THRESHOLD && r > g && r > b) {
+        Serial.println("Red dominant detected – steering mild left (120°).");
+        steerLeftMild();
+      } else if (b > BLUE_THRESHOLD && b > r && b > g) {
+        Serial.println("Blue dominant detected – steering mild right (60°).");
+        steerRightMild();
+      } else if ((r > WHITE_THRESHOLD) && (g > WHITE_THRESHOLD) && (b > WHITE_THRESHOLD)) {
+        Serial.println("White wall detected – centering steering (90°).");
+        centerSteering();
+      } else {
+        centerSteering();
+      }
+      driveForward();
+      // Set LED to green.
+      digitalWrite(LED_GREEN_PIN, HIGH);
+      digitalWrite(LED_RED_PIN, LOW);
+    }
+  }
+  
+  delay(50); // Short delay for loop stability.
+}
+
+// ***************************************
+// Sensor Helper Functions
+// ***************************************
+
+float getUltrasonicDistance() {
+  return ultrasonicSensor.dist();
+}
+
+// ***************************************
+// DC Motor Control Functions (using Adafruit Motor Shield)
+// ***************************************
+
+void driveForward() {
+  motor1->run(FORWARD);
+  motor2->run(FORWARD);
+  motor3->run(FORWARD);
+  motor4->run(FORWARD);
+}
+
+void driveBackward() {
+  motor1->run(BACKWARD);
+  motor2->run(BACKWARD);
+  motor3->run(BACKWARD);
+  motor4->run(BACKWARD);
+}
+
+void stopDCMotors() {
+  motor1->run(RELEASE);
+  motor2->run(RELEASE);
+  motor3->run(RELEASE);
+  motor4->run(RELEASE);
+}
+
+// ***************************************
+// Servo Steering Functions
+// ***************************************
+
+void centerSteering() {
+  steeringServo.write(90);
+}
+
+void steerRightAggressive() {
+  steeringServo.write(0);
+}
+
+void steerRightMild() {
+  steeringServo.write(60);
+}
+
+void steerLeftMild() {
+  steeringServo.write(120);
+}
+
+void steerLeftAggressive() {
+  steeringServo.write(180);
+}
+
+// autonomousSteering():
+// Uses ultrasonic sensor distance to choose a right turn:
+// - If very close (< ULTRASONIC_AGGRESSIVE_THRESHOLD): aggressive right (0°)
+// - Else if moderately close (< ULTRASONIC_THRESHOLD): mild right (60°)
+// - Otherwise: center (90°)
+void autonomousSteering() {
+  float distance = getUltrasonicDistance();
+  if (distance > 0) {
+    if (distance < ULTRASONIC_AGGRESSIVE_THRESHOLD) {
+      Serial.println("Very close obstacle – aggressive right turn (0°)");
+      steerRightAggressive();
+    } else if (distance < ULTRASONIC_THRESHOLD) {
+      Serial.println("Moderate obstacle – mild right turn (60°)");
+      steerRightMild();
+    } else {
+      centerSteering();
+    }
+  } else {
+    centerSteering();
+  }
+}
+
+// recoverFromStuck():
+// Increases reverse speed to free the robot, then steers slightly before resuming.
+void recoverFromStuck() {
+  Serial.println("Recovering from being stuck...");
+  stopDCMotors();
+  
+  // Increase reverse speed temporarily.
+  motor1->setSpeed(255);
+  motor2->setSpeed(255);
+  motor3->setSpeed(255);
+  motor4->setSpeed(255);
+  
+  driveBackward();
+  delay(1000);  // Reverse for 1 second
+  stopDCMotors();
+  
+  // Restore normal speed.
+  motor1->setSpeed(150);
+  motor2->setSpeed(150);
+  motor3->setSpeed(150);
+  motor4->setSpeed(150);
+  
+  // After reversing, steer mild right.
+  steerRightMild();
+  driveForward();
+  delay(1000);  // Drive forward while turning for 1 second
+  centerSteering();
+  obstacleStartTime = 0;  // Reset obstacle timer
+}
+
+// ***************************************
+// WiFi Remote Control Handlers
+// ***************************************
+
+void handleForward() {
+  Serial.println("Remote Command: FORWARD");
+  driveForward();
+  server.send(200, "text/plain", "Driving Forward");
+}
+
+void handleBackward() {
+  Serial.println("Remote Command: BACKWARD");
+  driveBackward();
+  server.send(200, "text/plain", "Driving Backward");
+}
+
+void handleStop() {
+  Serial.println("Remote Command: STOP");
+  stopDCMotors();
+  server.send(200, "text/plain", "Motors Stopped");
+}
+
+void handleRight() {
+  Serial.println("Remote Command: RIGHT (Aggressive)");
+  steerRightAggressive();
+  server.send(200, "text/plain", "Steering Aggressively Right (0°)");
+}
+
+void handleRightMild() {
+  Serial.println("Remote Command: RIGHT MILD");
+  steerRightMild();
+  server.send(200, "text/plain", "Steering Mildly Right (60°)");
+}
+
+void handleLeft() {
+  Serial.println("Remote Command: LEFT (Aggressive)");
+  steerLeftAggressive();
+  server.send(200, "text/plain", "Steering Aggressively Left (180°)");
+}
+
+void handleLeftMild() {
+  Serial.println("Remote Command: LEFT MILD");
+  steerLeftMild();
+  server.send(200, "text/plain", "Steering Mildly Left (120°)");
+}
+
+void handleCenter() {
+  Serial.println("Remote Command: CENTER");
+  centerSteering();
+  server.send(200, "text/plain", "Steering Centered (90°)");
+}
+
+void handleCamera() {
+  Serial.println("Remote Command: CAMERA");
+  // Replace with the actual IP address of your ESP32-CAM.
+  String html = "<html><head><meta http-equiv='refresh' content='0; url=http://192.168.4.2/stream'></head><body></body></html>";
+  server.send(200, "text/html", html);
+}

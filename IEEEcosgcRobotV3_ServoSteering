@@ -1,0 +1,248 @@
+#include <AFMotor.h>
+#include <Servo.h>
+
+// -----------------------------
+// Create motor objects (using AFMotor library)
+// The channel numbers (1, 2, 3, 4) correspond to the motor channels on your L2983D shield.
+AF_DCMotor motorA(1);  
+AF_DCMotor motorB(2);
+AF_DCMotor motorC(3);
+AF_DCMotor motorD(4);
+
+// -----------------------------
+// Create servo objects for steering
+Servo leftServo;   // Left servo (attached to A0)
+Servo rightServo;  // Right servo (attached to A1)
+
+// -----------------------------
+// Sensor Pin Definitions
+#define ULTRASONIC_TRIG_PIN A2   // Ultrasonic sensor Trigger
+#define ULTRASONIC_ECHO_PIN A3   // Ultrasonic sensor Echo
+#define IR_SENSOR_PIN       A4   // IR sensor
+
+// -----------------------------
+// Autonomous behavior thresholds
+const int IR_THRESHOLD = 500;                // IR sensor threshold
+const int ULTRASONIC_THRESHOLD = 20;         // in cm; obstacle if below this distance
+const int ULTRASONIC_AGGRESSIVE_THRESHOLD = 10; // in cm; use aggressive maneuver if very close
+const unsigned long stuckThreshold = 3000;   // If obstacle persists for 3 sec, trigger recovery
+
+unsigned long obstacleStartTime = 0;
+
+// -----------------------------
+// Function Prototypes
+void driveForward();
+void driveBackward();
+void stopMotors();
+
+void centerSteering();
+void steerRightAggressive();
+void steerRightMild();
+void steerLeftMild();
+void steerLeftAggressive();
+
+float getUltrasonicDistance();
+
+void recoverFromStuck();
+
+void debugSensors();
+
+// -----------------------------
+// Setup Function
+void setup() {
+  Serial.begin(9600);
+  Serial.println("Autonomous Robot Starting...");
+  
+  // Initialize motors: Set initial speed (0-255) and stop them.
+  motorA.setSpeed(200);
+  motorB.setSpeed(200);
+  motorC.setSpeed(200);
+  motorD.setSpeed(200);
+  stopMotors();
+  
+  // Attach servos to the specified pins.
+  leftServo.attach(A0);
+  rightServo.attach(A1);
+  centerSteering();  // Set servos to center (90°)
+
+  Serial.println("Setup complete. Entering autonomous mode.");
+}
+
+void loop() {
+  debugSensors();  // Print sensor values for debugging
+
+  // Read sensor values
+  int irValue = analogRead(IR_SENSOR_PIN);
+  float ultrasonicDistance = getUltrasonicDistance();
+  
+  Serial.print("IR Value: ");
+  Serial.print(irValue);
+  Serial.print(" | Ultrasonic: ");
+  Serial.print(ultrasonicDistance);
+  Serial.println(" cm");
+  
+  // Check if an obstacle is detected by IR or ultrasonic sensor.
+  if (irValue < IR_THRESHOLD || (ultrasonicDistance > 0 && ultrasonicDistance < ULTRASONIC_THRESHOLD)) {
+    Serial.println("Obstacle detected!");
+    stopMotors();
+    
+    // Start (or continue) the obstacle timer.
+    if (obstacleStartTime == 0) {
+      obstacleStartTime = millis();
+    }
+    
+    // If the obstacle persists too long, trigger recovery.
+    if (millis() - obstacleStartTime > stuckThreshold) {
+      recoverFromStuck();
+    } else {
+      // Adjust steering based on ultrasonic distance.
+      if (ultrasonicDistance < ULTRASONIC_AGGRESSIVE_THRESHOLD) {
+        steerRightAggressive();
+      } else {
+        steerRightMild();
+      }
+      driveForward();
+    }
+  } else {
+    // No obstacle detected: reset the timer, center steering, and drive forward.
+    obstacleStartTime = 0;
+    centerSteering();
+    driveForward();
+  }
+  
+  delay(100);  // Short delay for loop stability
+}
+
+//
+// --- Motor Control Functions ---
+//
+void driveForward() {
+  motorA.run(FORWARD);
+  motorB.run(FORWARD);
+  motorC.run(FORWARD);
+  motorD.run(FORWARD);
+  Serial.println("Motors: Driving Forward");
+}
+
+void driveBackward() {
+  motorA.run(BACKWARD);
+  motorB.run(BACKWARD);
+  motorC.run(BACKWARD);
+  motorD.run(BACKWARD);
+  Serial.println("Motors: Driving Backward");
+}
+
+void stopMotors() {
+  motorA.run(RELEASE);
+  motorB.run(RELEASE);
+  motorC.run(RELEASE);
+  motorD.run(RELEASE);
+  Serial.println("Motors: Stopped");
+}
+
+//
+// --- Servo Steering Functions ---
+// These functions set both servos (left and right) to achieve a mirrored steering effect.
+//
+// Center (Straight):
+void centerSteering() {
+  leftServo.write(90);
+  rightServo.write(90);
+  Serial.println("Steering: Center (90°/90°)");
+}
+
+// For a right turn, the left servo moves inward and the right servo moves inward too.
+// Aggressive right turn:
+void steerRightAggressive() {
+  leftServo.write(60);    // Decrease left servo angle
+  rightServo.write(120);  // Increase right servo angle
+  Serial.println("Steering: Aggressive Right (60°/120°)");
+}
+
+// Mild right turn:
+void steerRightMild() {
+  leftServo.write(75);
+  rightServo.write(105);
+  Serial.println("Steering: Mild Right (75°/105°)");
+}
+
+// For a left turn, mirror the values.
+// Mild left turn:
+void steerLeftMild() {
+  leftServo.write(105);
+  rightServo.write(75);
+  Serial.println("Steering: Mild Left (105°/75°)");
+}
+
+// Aggressive left turn:
+void steerLeftAggressive() {
+  leftServo.write(120);
+  rightServo.write(60);
+  Serial.println("Steering: Aggressive Left (120°/60°)");
+}
+
+//
+// --- Ultrasonic Sensor Function ---
+//
+float getUltrasonicDistance() {
+  // Trigger the ultrasonic sensor
+  pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
+  
+  // Read the echo pulse
+  pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+  long duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, 30000); // Timeout 30ms
+  // Calculate distance (cm). Speed of sound ≈ 343 m/s, so 0.0343 cm/µs; divide by 2 for round-trip.
+  float distance = (duration * 0.0343) / 2.0;
+  return distance;
+}
+
+//
+// --- Recovery Routine ---
+//
+void recoverFromStuck() {
+  Serial.println("Recovery: Robot is stuck! Initiating recovery procedure.");
+  stopMotors();
+  
+  // Increase motor power temporarily for recovery
+  motorA.setSpeed(255);
+  motorB.setSpeed(255);
+  motorC.setSpeed(255);
+  motorD.setSpeed(255);
+  
+  // Reverse for 1 second
+  driveBackward();
+  delay(1000);
+  stopMotors();
+  
+  // Restore normal motor speed
+  motorA.setSpeed(200);
+  motorB.setSpeed(200);
+  motorC.setSpeed(200);
+  motorD.setSpeed(200);
+  
+  // After reversing, perform a mild right turn while moving forward for 1 second
+  steerRightMild();
+  driveForward();
+  delay(1000);
+  
+  centerSteering();
+  obstacleStartTime = 0;  // Reset obstacle timer
+}
+
+//
+// --- Debug Function ---
+//
+void debugSensors() {
+  int irVal = analogRead(IR_SENSOR_PIN);
+  float dist = getUltrasonicDistance();
+  Serial.print("DEBUG -> IR: ");
+  Serial.print(irVal);
+  Serial.print(" | Ultrasonic: ");
+  Serial.print(dist);
+  Serial.println(" cm");
+}
