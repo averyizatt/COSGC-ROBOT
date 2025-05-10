@@ -17,7 +17,7 @@ GPIO.setup(ECHO, GPIO.IN)
 
 # === Arduino Serial ===
 ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1)
-time.sleep(2)
+time.sleep(2)  # let serial stabilize
 
 # === Grid Setup ===
 GRID_W, GRID_H = 100, 100
@@ -25,12 +25,12 @@ grid = np.zeros((GRID_H, GRID_W), dtype=np.uint8)
 robot_pos = (GRID_H - 1, GRID_W // 2)
 goal_pos = (0, GRID_W // 2)
 
-# === Logger ===
+# === Logger Setup ===
 log_file = open("log.csv", "w", newline='')
 log_writer = csv.writer(log_file)
-log_writer.writerow(["Time", "Edges", "Lines", "PathLen", "Distance", "Command"])
+log_writer.writerow(["Time", "Edges", "Lines", "PathLen", "Distance", "Command", "ArduinoResponse"])
 
-# === Distance ===
+# === Distance Reading ===
 def get_distance_cm():
     GPIO.output(TRIG, False)
     time.sleep(0.05)
@@ -48,7 +48,7 @@ def get_distance_cm():
     duration = stop_time - start_time
     return round((duration * 34300) / 2, 1)
 
-# === Pathfinding ===
+# === A* Pathfinding ===
 def heuristic(a, b):
     return abs(a[0]-b[0]) + abs(a[1]-b[1])
 
@@ -86,7 +86,7 @@ def astar(grid, start, goal):
                     heapq.heappush(oheap, (f[neighbor], neighbor))
     return []
 
-# === Movement Command Conversion ===
+# === Determine Direction ===
 def get_direction(prev, curr):
     dy = curr[1] - prev[1]
     dx = prev[0] - curr[0]
@@ -107,10 +107,10 @@ try:
                   "--shutter 6000 --gain 2 --brightness 0.2 --timeout 1 --quality 90")
         img = cv2.imread("frame.jpg")
         if img is None:
-            print("❌ Failed to capture image.")
+            print("❌ Failed to load image.")
             continue
-        height, width = img.shape[:2]
 
+        height, width = img.shape[:2]
         blurred = cv2.GaussianBlur(img, (5, 5), 0)
         gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
         edges = cv2.Canny(gray, 50, 100)
@@ -130,7 +130,7 @@ try:
                 cv2.line(img, (x1, y1), (x2, y2), (255, 255, 0), 2)
 
         distance = get_distance_cm()
-        print(f"📏 Distance: {distance} cm")
+        print(f"📏 Ultrasonic: {distance} cm")
         if 0 < distance < 30:
             fx, fy = robot_pos[0] - 1, robot_pos[1]
             if 0 <= fx < GRID_H:
@@ -149,23 +149,39 @@ try:
         cv2.imwrite("debug.jpg", img)
         cv2.imwrite("map.png", cv2.resize(map_img, (500, 500), interpolation=cv2.INTER_NEAREST))
 
-        # Get and send movement command
         if len(path) > 1:
             move_cmd = get_direction(path[0], path[1])
         else:
             move_cmd = "S"
-        print(f"🚀 Command: {move_cmd}")
-        ser.write((move_cmd + "\n").encode())
-        time.sleep(0.2)  # short delay before sending center
-        ser.write(b"C\n")  # center steering after each move
 
-        # Log
-        log_writer.writerow([datetime.now().isoformat(), edge_count, line_count, path_len, distance, move_cmd])
+        print(f"🚀 Sending: {move_cmd}")
+        ser.write((move_cmd + "\n").encode())
+        time.sleep(0.2)
+        ser.write(b"C\n")
+
+        # === Read Arduino serial responses
+        arduino_response = ""
+        while ser.in_waiting:
+            line = ser.readline().decode().strip()
+            if line:
+                print(f"🧾 Arduino says: {line}")
+                arduino_response += line + " | "
+
+        # === Log to CSV
+        log_writer.writerow([
+            datetime.now().isoformat(),
+            edge_count,
+            line_count,
+            path_len,
+            distance,
+            move_cmd,
+            arduino_response.strip(" | ")
+        ])
         log_file.flush()
         time.sleep(2)
 
 except KeyboardInterrupt:
-    print("🛑 Ending...")
+    print("🛑 Terminated.")
     ser.close()
     GPIO.cleanup()
     log_file.close()
