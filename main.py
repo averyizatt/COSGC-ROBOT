@@ -3,26 +3,43 @@ from detector import ObstacleDetector
 from boundaries import BoundaryDetector
 from terrain import TerrainAnalyzer
 from decision import DecisionMaker
+from overlay import OverlayDrawer
 
 import cv2
 import time
+import requests
+import json
+
+SERVER_URL = "http://192.168.0.41:5000/log"   # <-- your Flask server
+
+def send_log_to_server(perception, decision):
+    data = {
+        "obstacles": perception["obstacles"],
+        "boundary": perception["boundary"],
+        "terrain": perception["terrain"],
+        "decision": decision
+    }
+
+    try:
+        requests.post(SERVER_URL, json=data, timeout=0.2)
+    except Exception as e:
+        print("Could not send log:", e)
 
 def main():
     print("Starting rover perception system...")
-    
-    # Initialize modules
+
     cam = Camera()
     det = ObstacleDetector()
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()
     decider = DecisionMaker()
+    overlay = OverlayDrawer()
 
-    time.sleep(1)   # give camera time to warm up
+    time.sleep(1)
 
     while True:
         frame = cam.get_frame()
 
-        # -------- PERCEPTION -------- #
         obstacles = det.detect(frame)
         boundary_info = bounds.detect(frame)
         terrain_info = terrain.analyze(frame)
@@ -33,24 +50,20 @@ def main():
             "terrain": terrain_info
         }
 
-        # -------- DECISION MAKING -------- #
         decision = decider.decide(perception)
 
-        # -------- OUTPUT / DEBUG -------- #
-        print("\n=== Frame Perception ===")
-        print(f"Obstacles: {len(obstacles)} detected")
-        print(f"Left boundary lines: {len(boundary_info['left_boundary'])}")
-        print(f"Right boundary lines: {len(boundary_info['right_boundary'])}")
-        print(f"Dip: {terrain_info['dip_detected']}  Incline: {terrain_info['incline_detected']}")
+        # Apply overlays
+        frame_overlay = overlay.apply(frame.copy(), obstacles, boundary_info, terrain_info, decision)
 
-        print("\n=== Decision ===")
-        print(f"Command: {decision['command']} | Reason: {decision['reason']}")
+        # Show in window
+        cv2.imshow("Rover Vision", frame_overlay)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-        # Here is where you'd actually SEND the command to the rover:
-        # send_to_rover(decision["command"])
+        # Send logs to your Flask server
+        send_log_to_server(perception, decision)
 
-        # Control loop speed (20 Hz-ish)
-        time.sleep(0.05)
+        time.sleep(0.02)
 
 if __name__ == '__main__':
     main()
