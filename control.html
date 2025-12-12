@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Rover Control</title>
+<style>
+body { background: black; color: white; text-align: center; }
+video { width: 80vw; border: 3px solid white; }
+</style>
+</head>
+<body>
+
+<h1>Live Rover Control</h1>
+
+<video src="http://YOUR_PI_IP:8554" autoplay></video>
+
+<script>
+document.addEventListener("keydown", (e) => {
+    let url = null;
+
+    if (e.key === "w") url = "/cmd/f";
+    if (e.key === "s") url = "/cmd/b";
+    if (e.key === "a") url = "/cmd/l";
+    if (e.key === "d") url = "/cmd/r";
+    if (e.key === " ") url = "/cmd/s";
+
+    if (url) fetch(url);
+});
+</script>
+
+</body>
+</html>
