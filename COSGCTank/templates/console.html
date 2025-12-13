@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Rover Console</title>
+    <style>
+        body { background: #111; color: #0f0; font-family: monospace; padding: 20px; }
+        pre { border: 1px solid #0f0; padding: 10px; height: 80vh; overflow-y: scroll; }
+    </style>
+</head>
+<body>
+    <h1>Rover Perception Console</h1>
+    <pre id="consoleBox">Waiting for data...</pre>
+
+<script>
+function updateConsole() {
+    fetch("/console_data")
+    .then(res => res.json())
+    .then(data => {
+        document.getElementById("consoleBox").textContent =
+            JSON.stringify(data, null, 4);
+    });
+}
+setInterval(updateConsole, 500);  // refresh every half second
+</script>
+
+</body>
+</html>

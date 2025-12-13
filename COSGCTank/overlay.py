@@ -40,6 +40,26 @@ class OverlayDrawer:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
         return frame
 
+    def draw_center_line(self, frame, color=(200,200,200)):
+        h, w, _ = frame.shape
+        cv2.line(frame, (w//2, 0), (w//2, h), color, 1)
+        return frame
+
+    def draw_fps(self, frame, fps):
+        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+        return frame
+
+    def export_log(self, perception, decision):
+        """Return a JSON-serializable dict combining perception and decision for logging."""
+        log = {
+            'timestamp': float(perception.get('timestamp', 0.0)),
+            'decision': decision,
+            'obstacles': perception.get('obstacles', []),
+            'boundary': perception.get('boundary', {}),
+            'terrain': perception.get('terrain', {})
+        }
+        return log
+
     def apply(self, frame, obstacles, boundary, terrain, decision):
         frame = self.draw_obstacles(frame, obstacles)
         frame = self.draw_boundaries(frame, boundary)
