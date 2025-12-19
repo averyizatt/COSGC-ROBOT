@@ -46,6 +46,13 @@ SETTINGS = {
     # RC tuning
     'rc_speed': 0.6,
     'rc_turn_gain': 1.0,
+
+    # Autonomy speed policy (0..1 throttle knobs; MotorController maps to PWM duty)
+    'auto_speed': 0.6,
+    'auto_speed_slow': 0.35,
+    'auto_speed_turn': 1.0,
+    # When stuck is detected (via SLAM pose delta), boost to full
+    'auto_speed_stuck': 1.0,
 }
 
 # How long without a keepalive before server forces stop (seconds)
@@ -172,9 +179,9 @@ def keepalive():
         elif action == 'b':
             motor.reverse(speed=sp)
         elif action == 'l':
-            motor.turn_left(speed=sp)
+            motor.turn_left(speed=1.0)
         elif action == 'r':
-            motor.turn_right(speed=sp)
+            motor.turn_right(speed=1.0)
         else:
             return jsonify({'error': 'unknown action'}), 400
         _active_actions.add(action)
@@ -313,9 +320,9 @@ def joystick():
     else:
         # steering-dominant: pivot
         if rx < -DZ:
-            motor.turn_left(speed=max(0.2, min(1.0, sp*turn_gain)))
+            motor.turn_left(speed=1.0)
         elif rx > DZ:
-            motor.turn_right(speed=max(0.2, min(1.0, sp*turn_gain)))
+            motor.turn_right(speed=1.0)
         else:
             motor.stop()
 

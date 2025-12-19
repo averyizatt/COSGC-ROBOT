@@ -219,19 +219,14 @@ class MotorController:
         self._drive(False, False, left_speed=sp, right_speed=sp)
 
     def turn_left(self, speed=0.5):
-        # Arc left (more torque than a pivot for many drivetrains):
-        # left wheel slower forward, right wheel faster forward.
+        # True pivot left: left wheel reverse, right wheel forward.
         sp = self._clamp_speed(speed)
-        left_sp = max(0.0, sp * 0.55)
-        right_sp = sp
-        self._drive(True, True, left_speed=left_sp, right_speed=right_sp)
+        self._drive(False, True, left_speed=sp, right_speed=sp)
 
     def turn_right(self, speed=0.5):
-        # Arc right: left wheel faster forward, right wheel slower forward.
+        # True pivot right: left wheel forward, right wheel reverse.
         sp = self._clamp_speed(speed)
-        left_sp = sp
-        right_sp = max(0.0, sp * 0.55)
-        self._drive(True, True, left_speed=left_sp, right_speed=right_sp)
+        self._drive(True, False, left_speed=sp, right_speed=sp)
 
     def adjust_left(self, speed=0.45):
         # gentle left correction: slow left wheel, forward right wheel

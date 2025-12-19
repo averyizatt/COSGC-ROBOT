@@ -94,7 +94,7 @@ def main():
             decision = decider.decide(perception)
 
             # execute mapped motor action
-            action, params = decider.map_to_motor(decision["command"])
+            action, params = decider.map_to_motor(decision["command"], speed=decision.get('speed'))
             if hasattr(motor, action):
                 try:
                     getattr(motor, action)(**params)

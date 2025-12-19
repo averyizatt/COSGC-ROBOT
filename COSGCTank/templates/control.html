@@ -164,6 +164,16 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
 
                 <div style="height:10px;"></div>
 
+                <div class="field"><label><span>Autonomy speed</span><input id="t-autospeed" type="number" step="0.05" min="0" max="1" value="0.6" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field"><label><span>Autonomy slow speed</span><input id="t-autospeed-slow" type="number" step="0.05" min="0" max="1" value="0.35" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field"><label><span>Autonomy turn speed</span><input id="t-autospeed-turn" type="number" step="0.05" min="0" max="1" value="0.55" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field"><label><span>Stuck boost speed</span><input id="t-autospeed-stuck" type="number" step="0.05" min="0" max="1" value="1.0" /></label></div>
+
+                <div style="height:10px;"></div>
+
                 <div class="grid-2">
                     <button class="btn" id="t-apply">Apply settings</button>
                     <button class="btn stop" id="btn-clear-estop">Clear E‑STOP</button>
@@ -377,7 +387,11 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
         det_contour_min_area: parseInt(document.getElementById('t-area').value, 10),
         dec_obstacle_stop_ymin: parseFloat(document.getElementById('t-ymin').value),
         det_rock_score_threshold: parseFloat(document.getElementById('t-rockthr').value),
-        rc_speed: parseFloat(document.getElementById('t-rcspeed').value)
+        rc_speed: parseFloat(document.getElementById('t-rcspeed').value),
+        auto_speed: parseFloat(document.getElementById('t-autospeed').value),
+        auto_speed_slow: parseFloat(document.getElementById('t-autospeed-slow').value),
+        auto_speed_turn: parseFloat(document.getElementById('t-autospeed-turn').value),
+        auto_speed_stuck: parseFloat(document.getElementById('t-autospeed-stuck').value)
     };
     fetch('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
         .then(r=>r.json()).then(js=>{ console.log('settings updated', js); })

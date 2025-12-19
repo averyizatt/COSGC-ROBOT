@@ -122,12 +122,42 @@ class DecisionMaker:
         except Exception:
             pass
 
+        # Speed policy
+        # - `auto_speed` is a 0..1 throttle knob (mapped to PWM by MotorController)
+        # - when stuck, boost to `auto_speed_stuck`
+        try:
+            auto_speed = float(s.get('auto_speed', 0.6))
+        except Exception:
+            auto_speed = 0.6
+        try:
+            auto_speed_slow = float(s.get('auto_speed_slow', 0.35))
+        except Exception:
+            auto_speed_slow = 0.35
+        try:
+            auto_speed_turn = float(s.get('auto_speed_turn', 1.0))
+        except Exception:
+            auto_speed_turn = 1.0
+        try:
+            auto_speed_stuck = float(s.get('auto_speed_stuck', 1.0))
+        except Exception:
+            auto_speed_stuck = 1.0
+
         # 1) Immediate priority checks
         immediate = self._choose_immediate(perception)
         if immediate is not None:
             # Emergency commands bypass hysteresis
             self.prev_command = immediate["command"]
             self.command_counter = 0
+            # annotate speed hints
+            cmd = immediate.get('command')
+            if cmd == 'SLOW':
+                immediate['speed'] = auto_speed_slow
+            elif cmd in ('TURN_LEFT', 'TURN_RIGHT', 'ADJUST_LEFT', 'ADJUST_RIGHT'):
+                immediate['speed'] = auto_speed_turn
+            elif cmd in ('STOP_REVERSE',):
+                immediate['speed'] = auto_speed_stuck
+            else:
+                immediate['speed'] = auto_speed
             return immediate
 
         # 2) Boundary-based corrections
@@ -148,38 +178,51 @@ class DecisionMaker:
             # try a small reverse and turn
             self.prev_command = 'STOP_REVERSE'
             self.command_counter = 0
-            return {"command": "STOP_REVERSE", "reason": "Stuck detected - escape", "stuck": True}
+            return {"command": "STOP_REVERSE", "reason": "Stuck detected - escape", "stuck": True, "speed": auto_speed_stuck}
 
         if candidate == self.prev_command:
             self.command_counter = 0
-            return {"command": candidate, "reason": "Continuation"}
+            speed = auto_speed
+            if candidate == 'SLOW':
+                speed = auto_speed_slow
+            return {"command": candidate, "reason": "Continuation", "speed": speed}
         else:
             self.command_counter += 1
             if self.command_counter >= self.hysteresis_frames:
                 self.prev_command = candidate
                 self.command_counter = 0
-                return {"command": candidate, "reason": "Hysteresis switch"}
+                speed = auto_speed
+                if candidate == 'SLOW':
+                    speed = auto_speed_slow
+                return {"command": candidate, "reason": "Hysteresis switch", "speed": speed}
             else:
                 # keep previous command while waiting for confirmation
-                return {"command": self.prev_command or "FORWARD", "reason": "Hysteresis hold"}
+                hold_cmd = self.prev_command or "FORWARD"
+                speed = auto_speed
+                if hold_cmd == 'SLOW':
+                    speed = auto_speed_slow
+                return {"command": hold_cmd, "reason": "Hysteresis hold", "speed": speed}
 
-    def map_to_motor(self, command):
+    def map_to_motor(self, command, speed=None):
         """Map decision command to motor control action names.
 
         This returns a small tuple (action, params) for use by motor_control.
         """
+        sp = 0.6 if speed is None else speed
         if command == "FORWARD":
-            return ("forward", {"speed": 0.6})
+            return ("forward", {"speed": sp})
         if command == "SLOW":
-            return ("forward", {"speed": 0.35})
+            return ("forward", {"speed": sp})
         if command == "TURN_LEFT":
-            return ("turn_left", {"speed": 0.5})
+            return ("turn_left", {"speed": sp})
         if command == "TURN_RIGHT":
-            return ("turn_right", {"speed": 0.5})
+            return ("turn_right", {"speed": sp})
         if command == "STOP_REVERSE":
-            return ("stop_and_reverse", {"duration": 0.5})
+            # speed is handled inside motor logic via duty mapping; use longer reverse when stuck
+            dur = 0.6 if (speed is not None and speed >= 0.95) else 0.5
+            return ("stop_and_reverse", {"duration": dur})
         if command == "ADJUST_LEFT":
-            return ("adjust_left", {"speed": 0.45})
+            return ("adjust_left", {"speed": sp})
         if command == "ADJUST_RIGHT":
-            return ("adjust_right", {"speed": 0.45})
+            return ("adjust_right", {"speed": sp})
         return ("stop", {})
