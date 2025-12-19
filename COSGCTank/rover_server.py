@@ -172,9 +172,9 @@ def keepalive():
         elif action == 'b':
             motor.reverse(speed=sp)
         elif action == 'l':
-            motor.turn_left(speed=0.5*sp)
+            motor.turn_left(speed=sp)
         elif action == 'r':
-            motor.turn_right(speed=0.5*sp)
+            motor.turn_right(speed=sp)
         else:
             return jsonify({'error': 'unknown action'}), 400
         _active_actions.add(action)
@@ -313,9 +313,9 @@ def joystick():
     else:
         # steering-dominant: pivot
         if rx < -DZ:
-            motor.turn_left(speed=max(0.2, min(1.0, 0.5*sp*turn_gain)))
+            motor.turn_left(speed=max(0.2, min(1.0, sp*turn_gain)))
         elif rx > DZ:
-            motor.turn_right(speed=max(0.2, min(1.0, 0.5*sp*turn_gain)))
+            motor.turn_right(speed=max(0.2, min(1.0, sp*turn_gain)))
         else:
             motor.stop()
 

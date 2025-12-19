@@ -43,6 +43,12 @@ class MotorController:
         self.invert_right = bool(invert_right)
         self.pwm_mode = pwm_mode  # 'auto' | 'enable' | 'in_pins' | 'stby' | 'none'
 
+        # For small DC motors + DRV8833 it is common to have a duty-cycle deadzone.
+        # These values treat the incoming `speed` (0..1) as a throttle knob and map
+        # it into a usable PWM window.
+        self.min_effective_duty = 0.75  # 75% duty minimum to reliably start moving
+        self.max_effective_duty = 1.00
+
         if self._using_gpio:
             GPIO.setmode(GPIO.BCM)
             GPIO.setwarnings(False)
@@ -95,6 +101,19 @@ class MotorController:
             s = 1.0
         return s
 
+    def _map_effective_speed(self, speed):
+        """Map a 0..1 'requested speed' into an effective PWM window.
+
+        Many drivetrains won't move below ~70-80% PWM due to static friction and
+        battery sag. This maps the UI speed into [min_effective_duty, max_effective_duty].
+        """
+        s = self._clamp_speed(speed)
+        lo = float(self.min_effective_duty)
+        hi = float(self.max_effective_duty)
+        if hi < lo:
+            lo, hi = hi, lo
+        return lo + (hi - lo) * s
+
     def _set_speed(self, left_speed, right_speed, standby=True):
         """Apply speed via PWM if available.
 
@@ -141,8 +160,8 @@ class MotorController:
 
         # If using IN-pin PWM, keep one pin LOW and PWM the other.
         if self._using_gpio and self.pwm_mode == 'in_pins':
-            ls = self._clamp_speed(left_speed)
-            rs = self._clamp_speed(right_speed)
+            ls = self._map_effective_speed(left_speed)
+            rs = self._map_effective_speed(right_speed)
 
             # ensure standby enabled (if present)
             if 'STBY' in self.pins:
@@ -200,14 +219,19 @@ class MotorController:
         self._drive(False, False, left_speed=sp, right_speed=sp)
 
     def turn_left(self, speed=0.5):
-        # pivot left: left wheel backward, right wheel forward
+        # Arc left (more torque than a pivot for many drivetrains):
+        # left wheel slower forward, right wheel faster forward.
         sp = self._clamp_speed(speed)
-        self._drive(False, True, left_speed=sp, right_speed=sp)
+        left_sp = max(0.0, sp * 0.55)
+        right_sp = sp
+        self._drive(True, True, left_speed=left_sp, right_speed=right_sp)
 
     def turn_right(self, speed=0.5):
-        # pivot right: left wheel forward, right wheel backward
+        # Arc right: left wheel faster forward, right wheel slower forward.
         sp = self._clamp_speed(speed)
-        self._drive(True, False, left_speed=sp, right_speed=sp)
+        left_sp = sp
+        right_sp = max(0.0, sp * 0.55)
+        self._drive(True, True, left_speed=left_sp, right_speed=right_sp)
 
     def adjust_left(self, speed=0.45):
         # gentle left correction: slow left wheel, forward right wheel
