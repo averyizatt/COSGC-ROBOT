@@ -152,7 +152,3 @@ python3 rover_server.py
 ```bash
 python3 main.py
 ```
-
-Support and contributions
-
-If you want me to implement specific PID algorithms, safer SD logging, or to add a simulated test harness (headless, replay video), tell me which piece to prioritize and I will implement it.

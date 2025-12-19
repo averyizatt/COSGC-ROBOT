@@ -8,12 +8,22 @@ class DecisionMaker:
         # internal state for smoothing
         self.prev_command = None
         self.command_counter = 0
+        # stuck detection state
+        self.prev_pose = None
+        self.no_progress_count = 0
+        self.stuck_threshold = 3  # number of consecutive frames with no progress
 
     def _choose_immediate(self, perception):
         """Highest priority immediate checks that should bypass hysteresis."""
         terrain = perception.get("terrain", {})
+        # if a deep dip detected, do immediate stop+reverse
         if terrain.get("dip_detected"):
             return {"command": "STOP_REVERSE", "reason": "Dip detected"}
+
+        # terrain roughness: if very rough, slow and prefer careful steering
+        roughness = terrain.get('variance', 0.0)
+        if roughness > 120.0:
+            return {"command": "SLOW", "reason": f"High roughness ({roughness:.1f})"}
 
         # Ultrasonic distance check (safety)
         distance = perception.get("distance_cm")
@@ -23,18 +33,67 @@ class DecisionMaker:
                 return {"command": "STOP_REVERSE", "reason": f"Ultrasonic too close ({distance:.1f}cm)"}
             # if within a near range prefer turning rather than driving forward
             if distance < 30.0:
-                return {"command": "TURN_RIGHT", "reason": f"Obstacle detected by distance ({distance:.1f}cm)"}
+                # choose turn direction based on boundary suggestion if present
+                b = perception.get('boundary', {})
+                left = len(b.get('left_boundary', []))
+                right = len(b.get('right_boundary', []))
+                dir_cmd = 'TURN_RIGHT' if left >= right else 'TURN_LEFT'
+                return {"command": dir_cmd, "reason": f"Obstacle by distance ({distance:.1f}cm)"}
 
         # Obstacle close - immediate steering or stop depending on vertical position
         obstacles = perception.get("obstacles", [])
         for obj in obstacles:
             ymin = obj["box"][0]
             score = obj.get("score", 0.0)
+            cls = obj.get('class')
+            # treat 'contour' detections with less priority but still react
+            label = obj.get('label','')
             if score > 0.5 and ymin > self.obstacle_stop_threshold:
-                # prefer turning away from the object's horizontal center
-                return {"command": "TURN_LEFT", "reason": f"Obstacle close: class {obj.get('class')}"}
+                # if dynamic detection (moving) prioritize avoidance
+                dyn = perception.get('dynamic_detections', [])
+                if dyn:
+                    return {"command": "STOP_REVERSE", "reason": f"Moving obstacle close: {label}"}
+                # prefer turning away from the object's horizontal center using box center
+                center_x = (obj['box'][1] + obj['box'][3]) / 2.0
+                if center_x < 0.5:
+                    return {"command": "TURN_RIGHT", "reason": f"Obstacle left-close: {label}"}
+                else:
+                    return {"command": "TURN_LEFT", "reason": f"Obstacle right-close: {label}"}
 
         return None
+
+    def _detect_stuck(self, perception, command):
+        # Use SLAM pose to detect lack of forward progress when commanded to move
+        pose = perception.get('slam_pose')
+        if pose is None:
+            # can't determine; reset counters
+            self.prev_pose = None
+            self.no_progress_count = 0
+            return False
+        x, y = None, None
+        if isinstance(pose, dict) and 'x' in pose and 'y' in pose:
+            x = float(pose['x']); y = float(pose['y'])
+        elif isinstance(pose, (list, tuple)) and len(pose) >= 2:
+            x = float(pose[0]); y = float(pose[1])
+        else:
+            return False
+
+        if self.prev_pose is None:
+            self.prev_pose = (x, y)
+            self.no_progress_count = 0
+            return False
+
+        dx = ((x - self.prev_pose[0])**2 + (y - self.prev_pose[1])**2)**0.5
+        self.prev_pose = (x, y)
+        # if commanded forward but very small movement, increment
+        if command in ('FORWARD', 'SLOW') and dx < 0.02:
+            self.no_progress_count += 1
+            if self.no_progress_count >= self.stuck_threshold:
+                self.no_progress_count = 0
+                return True
+        else:
+            self.no_progress_count = 0
+        return False
 
     def _choose_by_boundary(self, perception):
         boundary = perception.get("boundary", {})
@@ -55,6 +114,14 @@ class DecisionMaker:
 
         Keeps interface: returns {'command': str, 'reason': str}
         """
+        # Apply live settings if present
+        s = perception.get('settings', {})
+        try:
+            self.obstacle_stop_threshold = float(s.get('dec_obstacle_stop_ymin', self.obstacle_stop_threshold))
+            self.stuck_threshold = int(s.get('dec_stuck_frames', self.stuck_threshold))
+        except Exception:
+            pass
+
         # 1) Immediate priority checks
         immediate = self._choose_immediate(perception)
         if immediate is not None:
@@ -76,6 +143,13 @@ class DecisionMaker:
                 candidate = "FORWARD"
 
         # Apply hysteresis: require the candidate to appear for N frames before switching
+        # stuck detection: if we are commanding forward but not moving, attempt escape
+        if self._detect_stuck(perception, self.prev_command or candidate):
+            # try a small reverse and turn
+            self.prev_command = 'STOP_REVERSE'
+            self.command_counter = 0
+            return {"command": "STOP_REVERSE", "reason": "Stuck detected - escape", "stuck": True}
+
         if candidate == self.prev_command:
             self.command_counter = 0
             return {"command": candidate, "reason": "Continuation"}

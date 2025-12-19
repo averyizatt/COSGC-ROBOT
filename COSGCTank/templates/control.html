@@ -11,20 +11,274 @@ video { width: 80vw; border: 3px solid white; }
 
 <h1>Live Rover Control</h1>
 
-<video src="http://YOUR_PI_IP:8554" autoplay></video>
+<video id="video" src="http://YOUR_PI_IP:8554" autoplay playsinline></video>
+
+<div style="margin-top:12px;">
+    <button id="btn-forward">Forward (W)</button>
+    <button id="btn-left">Left (A)</button>
+    <button id="btn-stop">STOP</button>
+    <button id="btn-right">Right (D)</button>
+    <button id="btn-back">Back (S)</button>
+</div>
+
+<div style="margin-top:10px;">
+    <span id="conn" style="padding:6px;border-radius:6px;background:#550;">Connecting...</span>
+    <span id="e-stop" style="margin-left:8px;padding:6px;border-radius:6px;background:#333;">E-STOP: OFF</span>
+    <div style="margin-top:6px;">
+        Active: <span id="active-list">none</span>
+    </div>
+</div>
+
+<div style="margin-top:8px;">
+    Mode:
+    <select id="mode-select">
+        <option value="rc">RC (manual)</option>
+        <option value="autonomous">Autonomous (generic)</option>
+        <option value="single_cam">Autonomous (single cam)</option>
+        <option value="stereo_cam">Autonomous (stereo)</option>
+    </select>
+    <small style="margin-left:8px;color:#aaa;">Autonomous enables SLAM/navigation stack (server must handle pipeline).</small>
+</div>
 
 <script>
-document.addEventListener("keydown", (e) => {
-    let url = null;
+// Map keys/actions
+const keyAction = {
+    'w': 'f',
+    's': 'b',
+    'a': 'l',
+    'd': 'r',
+    ' ': 's'
+};
 
-    if (e.key === "w") url = "/cmd/f";
-    if (e.key === "s") url = "/cmd/b";
-    if (e.key === "a") url = "/cmd/l";
-    if (e.key === "d") url = "/cmd/r";
-    if (e.key === " ") url = "/cmd/s";
+// Track pressed keys to avoid repeat start events
+const pressed = new Set();
+const keepaliveIntervals = {};
+const failureCounts = {};
+let disconnected = false;
+let currentMode = 'rc';
 
-    if (url) fetch(url);
+function setConnState(ok) {
+    const el = document.getElementById('conn');
+    if (ok) { el.textContent = 'Connected'; el.style.background = '#0a0'; }
+    else { el.textContent = 'Disconnected'; el.style.background = '#a00'; }
+}
+
+function setEStop(on) {
+    const el = document.getElementById('e-stop');
+    el.textContent = (on ? 'E-STOP: ON' : 'E-STOP: OFF');
+    el.style.background = on ? '#a00' : '#333';
+}
+
+function setActiveList(list) {
+    const el = document.getElementById('active-list');
+    if (!list || list.length === 0) el.textContent = 'none';
+    else el.textContent = list.map(a => ({'f':'F','b':'B','l':'L','r':'R'}[a]||a)).join(', ');
+}
+
+function setModeUI(mode) {
+    currentMode = mode;
+    const sel = document.getElementById('mode-select');
+    if (sel && sel.value !== mode) sel.value = mode;
+    const disable = (mode !== 'rc');
+    // disable buttons
+    ['btn-forward','btn-back','btn-left','btn-right'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.disabled = disable;
+        el.style.opacity = disable ? '0.5' : '1.0';
+    });
+}
+
+async function postKeepalive(action, state) {
+    try {
+        const res = await fetch('/keepalive', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({action: action, state: state})
+        });
+        if (!res.ok) throw new Error('bad');
+        setConnState(true);
+        failureCounts[action] = 0;
+        return true;
+    } catch (e) {
+        failureCounts[action] = (failureCounts[action] || 0) + 1;
+        if (failureCounts[action] >= 3) {
+            disconnected = true;
+            setConnState(false);
+            // clear this action's interval to avoid spamming
+            stopKeepalive(action, true);
+        }
+        return false;
+    }
+}
+
+function sendState(action, state) {
+    // backwards-compatible fallback for single-shot
+    fetch(`/cmd/${action}/${state}`).catch(()=>{});
+}
+
+function startKeepalive(action) {
+    if (disconnected) return;
+    if (keepaliveIntervals[action]) return; // already running
+    // immediate attempt
+    postKeepalive(action, 'start');
+    const id = setInterval(()=>postKeepalive(action,'start'), 200);
+    keepaliveIntervals[action] = id;
+    // visual
+    setButtonActive(action, true);
+}
+
+function stopKeepalive(action, suppressFetch=false) {
+    const id = keepaliveIntervals[action];
+    if (id) { clearInterval(id); delete keepaliveIntervals[action]; }
+    if (!suppressFetch) postKeepalive(action, 'stop');
+    setButtonActive(action, false);
+}
+
+document.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    const a = keyAction[k];
+    if (!a) return;
+    // ignore manual controls if not in RC mode
+    if (currentMode !== 'rc') return;
+    if (pressed.has(k)) return; // already pressed
+    pressed.add(k);
+    if (a === 's') {
+        // space toggles emergency stop (instant)
+        fetch('/emergency_stop', {method:'POST'}).catch(()=>{});
+    } else {
+        startKeepalive(a);
+    }
 });
+
+document.addEventListener('keyup', (e) => {
+    const k = e.key.toLowerCase();
+    const a = keyAction[k];
+    if (!a) return;
+    if (currentMode !== 'rc') return;
+    pressed.delete(k);
+    if (a === 's') return;
+    stopKeepalive(a);
+});
+
+// Button/touch handlers for mobile
+function wireButton(id, action) {
+    const btn = document.getElementById(id);
+    btn.addEventListener('touchstart', (ev) => { ev.preventDefault(); startKeepalive(action); });
+    btn.addEventListener('mousedown', (ev) => { ev.preventDefault(); startKeepalive(action); });
+    btn.addEventListener('touchend', (ev) => { ev.preventDefault(); stopKeepalive(action); });
+    btn.addEventListener('mouseup', (ev) => { ev.preventDefault(); stopKeepalive(action); });
+    // also handle mouseleave to stop when pointer leaves
+    btn.addEventListener('mouseleave', (ev) => { stopKeepalive(action); });
+}
+
+wireButton('btn-forward','f');
+wireButton('btn-left','l');
+wireButton('btn-right','r');
+wireButton('btn-back','b');
+
+// mode selector
+document.getElementById('mode-select').addEventListener('change', (ev)=>{
+    const m = ev.target.value;
+    fetch('/mode', {method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({mode: m})})
+        .then(r=>r.json()).then(js=>{ setModeUI(js.mode); }).catch(()=>{ alert('Failed to set mode'); });
+});
+
+// Stop button immediate
+document.getElementById('btn-stop').addEventListener('click', ()=>{ fetch('/emergency_stop',{method:'POST'}).catch(()=>{}); });
+
+function setButtonActive(action, on) {
+    const map = {'f':'btn-forward','b':'btn-back','l':'btn-left','r':'btn-right'};
+    const el = document.getElementById(map[action]);
+    if (!el) return;
+    el.style.background = on ? '#0a0' : '';
+    // update active list
+    // fetch status to get authoritative active list
+    fetch('/status').then(r=>r.json()).then(js=>{ setActiveList(js.active_actions || []); setEStop(js.e_stop); }).catch(()=>{});
+}
+
+// poll server status periodically
+setInterval(()=>{
+    fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); }).catch(()=>{ setConnState(false); });
+}, 1000);
+
+// initial status probe
+fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); setModeUI(js.mode||'rc');
+    // initialize smoothing toggle
+    const sm = js.smoothing || false;
+    const toggle = document.getElementById('smoothing-toggle');
+    if (toggle) toggle.checked = sm;
+}).catch(()=>{ setConnState(false); });
+
+// smoothing toggle handler
+const smoothingToggle = document.createElement('label');
+smoothingToggle.style.display = 'block';
+smoothingToggle.style.marginTop = '8px';
+smoothingToggle.innerHTML = '<input id="smoothing-toggle" type="checkbox"> Enable path smoothing';
+document.body.appendChild(smoothingToggle);
+document.getElementById('smoothing-toggle').addEventListener('change', (ev)=>{
+    const v = ev.target.checked;
+    fetch('/settings', {method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({smoothing: v})})
+        .then(r=>r.json()).then(js=>{ /* noop */ }).catch(()=>{ alert('Failed to update settings'); });
+});
+
+// Live tuning controls
+const tuning = document.createElement('div');
+tuning.style.marginTop = '10px';
+tuning.style.padding = '10px';
+tuning.style.border = '1px solid #333';
+tuning.innerHTML = `
+    <h3 style="margin:0 0 8px 0;">Tuning</h3>
+    <label>Detector gamma <input id="t-gamma" type="number" step="0.05" min="0.5" max="1.5" value="0.9"></label><br>
+    <label>Contour min area <input id="t-area" type="number" step="50" min="50" max="5000" value="400"></label><br>
+    <label>Obstacle stop ymin <input id="t-ymin" type="number" step="0.02" min="0" max="1" value="0.35"></label><br>
+    <button id="t-apply">Apply</button>
+`;
+document.body.appendChild(tuning);
+
+document.getElementById('t-apply').addEventListener('click', ()=>{
+    const payload = {
+        det_gamma: parseFloat(document.getElementById('t-gamma').value),
+        det_contour_min_area: parseInt(document.getElementById('t-area').value, 10),
+        dec_obstacle_stop_ymin: parseFloat(document.getElementById('t-ymin').value)
+    };
+    fetch('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
+        .then(r=>r.json()).then(js=>{ console.log('settings updated', js); })
+        .catch(()=>{ alert('Failed to apply tuning'); });
+});
+
+// Gamepad support
+let gpIndex = null;
+const GP_POLL_MS = 100;
+const DEADZONE = 0.15;
+
+function pollGamepad() {
+    const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+    if (!gps) return;
+    const g = gpIndex !== null ? gps[gpIndex] : null;
+    if (!g) return;
+    // map left stick (axes[0]=lx, axes[1]=ly) and right stick horizontal axes[2]
+    const lx = g.axes[0] || 0;
+    const ly = g.axes[1] || 0;
+    const rx = g.axes[2] || 0;
+    // apply deadzone
+    const applyDZ = (v) => Math.abs(v) < DEADZONE ? 0 : v;
+    const plx = applyDZ(lx), ply = applyDZ(ly), prx = applyDZ(rx);
+    // send joystick only if in RC mode
+    if (currentMode === 'rc') {
+        fetch('/joystick', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({lx: plx, ly: ply, rx: prx})})
+            .catch(()=>{});
+    }
+}
+
+window.addEventListener('gamepadconnected', (e)=>{
+    gpIndex = e.gamepad.index;
+    console.log('Gamepad connected', e.gamepad.id);
+    setConnState(true);
+    setInterval(pollGamepad, GP_POLL_MS);
+});
+
+window.addEventListener('gamepaddisconnected', (e)=>{ if (gpIndex === e.gamepad.index) gpIndex = null; setConnState(false); });
+
 </script>
 
 </body>
