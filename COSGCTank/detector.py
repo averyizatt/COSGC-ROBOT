@@ -113,6 +113,48 @@ class ObstacleDetector:
         except Exception:
             return []
 
+    def _rock_score(self, frame, box):
+        """Return a rough rockiness score for the patch in box.
+
+        Uses normalized gradient energy + local binary pattern-like comparison.
+        Returns value in [0,1] where higher means more likely rock/texture.
+        """
+        try:
+            h, w = frame.shape[:2]
+            ymin, xmin, ymax, xmax = box
+            y0 = max(0, min(h-1, int(ymin*h)))
+            y1 = max(0, min(h, int(ymax*h)))
+            x0 = max(0, min(w-1, int(xmin*w)))
+            x1 = max(0, min(w, int(xmax*w)))
+            if (y1 - y0) < 10 or (x1 - x0) < 10:
+                return 0.0
+            patch = frame[y0:y1, x0:x1]
+            gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+            gray = cv2.GaussianBlur(gray, (3,3), 0)
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            mag = cv2.magnitude(gx, gy)
+            # gradient energy normalized
+            ge = float(np.mean(mag)) / 64.0
+            ge = max(0.0, min(1.0, ge))
+
+            # simple local binary pattern-like: compare to center pixel on a subsampled grid
+            g = gray.astype(np.int16)
+            c = g[1:-1:2, 1:-1:2]
+            if c.size == 0:
+                lbp_ratio = 0.0
+            else:
+                n1 = (g[0:-2:2, 1:-1:2] > c).astype(np.uint8)
+                n2 = (g[2::2, 1:-1:2] > c).astype(np.uint8)
+                n3 = (g[1:-1:2, 0:-2:2] > c).astype(np.uint8)
+                n4 = (g[1:-1:2, 2::2] > c).astype(np.uint8)
+                lbp = (n1 + n2 + n3 + n4)
+                lbp_ratio = float(np.mean(lbp)) / 4.0
+            score = 0.65*ge + 0.35*lbp_ratio
+            return max(0.0, min(1.0, score))
+        except Exception:
+            return 0.0
+
     def detect(self, frame):
         """Run the detector on an RGB frame and return normalized detections.
 
@@ -175,4 +217,17 @@ class ObstacleDetector:
 
         # final: sort by score desc
         detections.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+
+        # Attach texture-based rockiness score to help distinguish sand glare from rocks
+        try:
+            thr = float(self.settings.get('det_rock_score_threshold', 0.45))
+            for d in detections:
+                rs = self._rock_score(frame, d['box'])
+                d['rock_score'] = float(rs)
+                if rs >= thr:
+                    d['rock_like'] = True
+                else:
+                    d['rock_like'] = False
+        except Exception:
+            pass
         return detections

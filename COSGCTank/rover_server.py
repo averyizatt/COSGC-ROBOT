@@ -23,12 +23,16 @@ SETTINGS = {
     'det_gamma': 0.9,
     'det_contour_min_area': 400,
     'det_clahe_clip': 3.0,
+    'det_rock_score_threshold': 0.45,
     # decision tuning
     'dec_obstacle_stop_ymin': 0.35,
     'dec_ultra_stop_cm': 12.0,
     'dec_ultra_turn_cm': 30.0,
     'dec_stuck_dx_m': 0.02,
     'dec_stuck_frames': 3,
+    # RC tuning
+    'rc_speed': 0.6,
+    'rc_turn_gain': 1.0,
 }
 
 # How long without a keepalive before server forces stop (seconds)
@@ -148,15 +152,16 @@ def keepalive():
             return jsonify({'error': 'not_in_rc_mode'}), 409
         if _e_stop:
             return jsonify({'error': 'e_stop_active'}), 423
+        sp = float(SETTINGS.get('rc_speed', 0.6))
         # map action letters to motor calls
         if action == 'f':
-            motor.forward()
+            motor.forward(speed=sp)
         elif action == 'b':
-            motor.reverse()
+            motor.reverse(speed=sp)
         elif action == 'l':
-            motor.turn_left()
+            motor.turn_left(speed=0.5*sp)
         elif action == 'r':
-            motor.turn_right()
+            motor.turn_right(speed=0.5*sp)
         else:
             return jsonify({'error': 'unknown action'}), 400
         _active_actions.add(action)
@@ -280,21 +285,24 @@ def joystick():
         motor.stop()
         return jsonify({'status': 'stopped'})
 
+    sp = float(SETTINGS.get('rc_speed', 0.6))
+    turn_gain = float(SETTINGS.get('rc_turn_gain', 1.0))
+
     # steering vs throttle dominance
     if abs(ly) >= abs(rx):
         # throttle-dominant: forward/back
         if ly < -DZ:
-            motor.forward()
+            motor.forward(speed=sp)
         elif ly > DZ:
-            motor.reverse()
+            motor.reverse(speed=sp)
         else:
             motor.stop()
     else:
         # steering-dominant: pivot
         if rx < -DZ:
-            motor.turn_left()
+            motor.turn_left(speed=max(0.2, min(1.0, 0.5*sp*turn_gain)))
         elif rx > DZ:
-            motor.turn_right()
+            motor.turn_right(speed=max(0.2, min(1.0, 0.5*sp*turn_gain)))
         else:
             motor.stop()
 
