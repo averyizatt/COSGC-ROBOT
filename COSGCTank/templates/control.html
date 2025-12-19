@@ -91,6 +91,7 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
             <span class="pill"><span class="dot" id="estop-dot" style="background: rgba(233,238,252,0.25);"></span><strong id="e-stop">E‑STOP: OFF</strong></span>
             <span class="pill"><strong>Active</strong><span id="active-list">none</span></span>
             <span class="pill"><span class="dot" id="gp-dot" style="background: rgba(233,238,252,0.25);"></span><strong>Gamepad</strong><span id="gp-status">Not connected</span></span>
+            <span class="pill"><span class="dot" id="imu-dot" style="background: rgba(233,238,252,0.25);"></span><strong>IMU</strong><span id="imu-status">No data</span></span>
         </div>
     </div>
 
@@ -138,23 +139,6 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
             <div class="card-b">
                 <div class="field">
                     <label>
-                        <span>Enable path smoothing</span>
-                        <input id="smoothing-toggle" type="checkbox" />
-                    </label>
-                </div>
-
-                <div style="height:10px;"></div>
-
-                <div class="field"><label><span>Detector gamma</span><input id="t-gamma" type="number" step="0.05" min="0.5" max="1.5" value="0.9" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field"><label><span>Contour min area</span><input id="t-area" type="number" step="50" min="50" max="5000" value="400" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field"><label><span>Obstacle stop ymin</span><input id="t-ymin" type="number" step="0.02" min="0" max="1" value="0.35" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field"><label><span>Rock score threshold</span><input id="t-rockthr" type="number" step="0.05" min="0" max="1" value="0.45" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field">
-                    <label>
                         <span>RC speed</span>
                         <span class="val" id="t-rcspeed-val">0.6</span>
                     </label>
@@ -164,15 +148,71 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
 
                 <div style="height:10px;"></div>
 
-                <div class="field"><label><span>Autonomy speed</span><input id="t-autospeed" type="number" step="0.05" min="0" max="1" value="0.6" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field"><label><span>Autonomy slow speed</span><input id="t-autospeed-slow" type="number" step="0.05" min="0" max="1" value="0.35" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field"><label><span>Autonomy turn speed</span><input id="t-autospeed-turn" type="number" step="0.05" min="0" max="1" value="0.55" /></label></div>
-                <div style="height:10px;"></div>
-                <div class="field"><label><span>Stuck boost speed</span><input id="t-autospeed-stuck" type="number" step="0.05" min="0" max="1" value="1.0" /></label></div>
+                <div id="autonomy-settings">
+                    <div class="field">
+                        <label>
+                            <span>Enable path smoothing</span>
+                            <input id="smoothing-toggle" type="checkbox" />
+                        </label>
+                    </div>
 
-                <div style="height:10px;"></div>
+                    <div style="height:10px;"></div>
+
+                    <div class="field"><label><span>Detector gamma</span><input id="t-gamma" type="number" step="0.05" min="0.5" max="1.5" value="0.9" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Contour min area</span><input id="t-area" type="number" step="50" min="50" max="5000" value="400" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Obstacle stop ymin</span><input id="t-ymin" type="number" step="0.02" min="0" max="1" value="0.35" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Rock score threshold</span><input id="t-rockthr" type="number" step="0.05" min="0" max="1" value="0.45" /></label></div>
+
+                    <div style="height:10px;"></div>
+
+                    <div class="field"><label><span>CLAHE clip limit</span><input id="t-clahe" type="number" step="0.1" min="0.5" max="10" value="3.0" /></label></div>
+
+                    <div style="height:10px;"></div>
+
+                    <div class="field"><label><span>Ultrasonic stop (cm)</span><input id="t-ultra-stop" type="number" step="1" min="2" max="200" value="12" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Ultrasonic turn (cm)</span><input id="t-ultra-turn" type="number" step="1" min="2" max="300" value="30" /></label></div>
+
+                    <div style="height:10px;"></div>
+
+                    <div class="field"><label><span>Stuck delta x threshold (m)</span><input id="t-stuck-dx" type="number" step="0.005" min="0.0" max="1.0" value="0.02" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Stuck frames</span><input id="t-stuck-frames" type="number" step="1" min="1" max="50" value="3" /></label></div>
+
+                    <div style="height:10px;"></div>
+
+                    <div class="field"><label><span>Autonomy speed</span><input id="t-autospeed" type="number" step="0.05" min="0" max="1" value="0.6" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Autonomy slow speed</span><input id="t-autospeed-slow" type="number" step="0.05" min="0" max="1" value="0.35" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Autonomy turn speed</span><input id="t-autospeed-turn" type="number" step="0.05" min="0" max="1" value="1.0" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Stuck boost speed</span><input id="t-autospeed-stuck" type="number" step="0.05" min="0" max="1" value="1.0" /></label></div>
+
+                    <div style="height:10px;"></div>
+
+                    <div class="field">
+                        <label>
+                            <span>IMU enabled (MPU-6050)</span>
+                            <input id="t-imu-enabled" type="checkbox" checked />
+                        </label>
+                    </div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>IMU I2C bus</span><input id="t-imu-bus" type="number" step="1" min="0" max="10" value="1" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>IMU I2C addr (hex)</span><input id="t-imu-addr" type="text" value="0x68" style="width:120px;padding:8px 10px;border-radius:10px;border:1px solid var(--border);background: rgba(0,0,0,0.18);color: var(--text);" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Complementary alpha</span><input id="t-imu-alpha" type="number" step="0.01" min="0" max="0.999" value="0.98" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>DLPF cfg (0-6)</span><input id="t-imu-dlpf" type="number" step="1" min="0" max="6" value="3" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Sample div (0-255)</span><input id="t-imu-div" type="number" step="1" min="0" max="255" value="4" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Gyro calib seconds</span><input id="t-imu-calib" type="number" step="0.1" min="0.2" max="10" value="1.0" /></label></div>
+                </div>
 
                 <div class="grid-2">
                     <button class="btn" id="t-apply">Apply settings</button>
@@ -216,6 +256,28 @@ function setConnState(ok) {
     }
 }
 
+function setImuStatus(imu) {
+    const el = document.getElementById('imu-status');
+    const dot = document.getElementById('imu-dot');
+    if (!el) return;
+    if (!imu) {
+        el.textContent = 'No data';
+        if (dot) { dot.classList.remove('ok'); dot.classList.remove('bad'); }
+        return;
+    }
+    if (imu.connected) {
+        const r = (typeof imu.roll_deg === 'number') ? imu.roll_deg.toFixed(1) : '—';
+        const p = (typeof imu.pitch_deg === 'number') ? imu.pitch_deg.toFixed(1) : '—';
+        const t = (typeof imu.temp_c === 'number') ? imu.temp_c.toFixed(1) : '—';
+        el.textContent = `Roll ${r}°  Pitch ${p}°  Temp ${t}°C`;
+        if (dot) { dot.classList.add('ok'); dot.classList.remove('bad'); }
+    } else {
+        const age = (typeof imu.age_s === 'number') ? ` (${imu.age_s.toFixed(1)}s)` : '';
+        el.textContent = `Not connected${age}`;
+        if (dot) { dot.classList.remove('ok'); dot.classList.add('bad'); }
+    }
+}
+
 function setEStop(on) {
     const el = document.getElementById('e-stop');
     const dot = document.getElementById('estop-dot');
@@ -237,6 +299,10 @@ function setModeUI(mode) {
     const sel = document.getElementById('mode-select');
     if (sel && sel.value !== mode) sel.value = mode;
     const disable = (mode !== 'rc');
+    const autoPanel = document.getElementById('autonomy-settings');
+    if (autoPanel) {
+        autoPanel.style.display = (mode === 'rc') ? 'none' : 'block';
+    }
     // disable buttons
     ['btn-forward','btn-back','btn-left','btn-right'].forEach(id => {
         const el = document.getElementById(id);
@@ -359,15 +425,53 @@ function setButtonActive(action, on) {
 
 // poll server status periodically
 setInterval(()=>{
-    fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); }).catch(()=>{ setConnState(false); });
+    fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); setImuStatus(js.imu); }).catch(()=>{ setConnState(false); setImuStatus(null); });
 }, 1000);
 
 // initial status probe
 fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); setModeUI(js.mode||'rc');
-    // initialize smoothing toggle
-    const sm = js.smoothing || false;
-    const toggle = document.getElementById('smoothing-toggle');
-    if (toggle) toggle.checked = sm;
+    setImuStatus(js.imu);
+    // load settings from server to populate tuning UI (survives reboot)
+    fetch('/settings').then(r=>r.json()).then(s=>{
+        // RC
+        const rcs = document.getElementById('t-rcspeed');
+        if (rcs && typeof s.rc_speed === 'number') {
+            rcs.value = s.rc_speed;
+            document.getElementById('t-rcspeed-val').textContent = s.rc_speed;
+        }
+        // Autonomy (only shown in non-RC modes, but keep fields in sync)
+        const setNum = (id, key) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            if (typeof s[key] === 'number') el.value = s[key];
+        };
+        setNum('t-gamma', 'det_gamma');
+        setNum('t-area', 'det_contour_min_area');
+        setNum('t-ymin', 'dec_obstacle_stop_ymin');
+        setNum('t-rockthr', 'det_rock_score_threshold');
+        setNum('t-clahe', 'det_clahe_clip');
+        setNum('t-ultra-stop', 'dec_ultra_stop_cm');
+        setNum('t-ultra-turn', 'dec_ultra_turn_cm');
+        setNum('t-stuck-dx', 'dec_stuck_dx_m');
+        setNum('t-stuck-frames', 'dec_stuck_frames');
+        setNum('t-autospeed', 'auto_speed');
+        setNum('t-autospeed-slow', 'auto_speed_slow');
+        setNum('t-autospeed-turn', 'auto_speed_turn');
+        setNum('t-autospeed-stuck', 'auto_speed_stuck');
+        // IMU
+        const imuToggle = document.getElementById('t-imu-enabled');
+        if (imuToggle && typeof s.imu_enabled === 'boolean') imuToggle.checked = s.imu_enabled;
+        setNum('t-imu-bus', 'imu_i2c_bus');
+        // address as hex string
+        const addrEl = document.getElementById('t-imu-addr');
+        if (addrEl && typeof s.imu_i2c_addr === 'number') addrEl.value = '0x' + s.imu_i2c_addr.toString(16);
+        setNum('t-imu-alpha', 'imu_alpha');
+        setNum('t-imu-dlpf', 'imu_dlpf_cfg');
+        setNum('t-imu-div', 'imu_sample_div');
+        setNum('t-imu-calib', 'imu_gyro_calib_seconds');
+        const toggle = document.getElementById('smoothing-toggle');
+        if (toggle && typeof s.smoothing === 'boolean') toggle.checked = s.smoothing;
+    }).catch(()=>{});
 }).catch(()=>{ setConnState(false); });
 
 // smoothing toggle handler
@@ -383,16 +487,39 @@ document.getElementById('t-rcspeed').addEventListener('input', (ev)=>{
 
 document.getElementById('t-apply').addEventListener('click', ()=>{
     const payload = {
-        det_gamma: parseFloat(document.getElementById('t-gamma').value),
-        det_contour_min_area: parseInt(document.getElementById('t-area').value, 10),
-        dec_obstacle_stop_ymin: parseFloat(document.getElementById('t-ymin').value),
-        det_rock_score_threshold: parseFloat(document.getElementById('t-rockthr').value),
-        rc_speed: parseFloat(document.getElementById('t-rcspeed').value),
-        auto_speed: parseFloat(document.getElementById('t-autospeed').value),
-        auto_speed_slow: parseFloat(document.getElementById('t-autospeed-slow').value),
-        auto_speed_turn: parseFloat(document.getElementById('t-autospeed-turn').value),
-        auto_speed_stuck: parseFloat(document.getElementById('t-autospeed-stuck').value)
+        rc_speed: parseFloat(document.getElementById('t-rcspeed').value)
     };
+    // Only send autonomy tuning keys when in an autonomous mode
+    if (currentMode !== 'rc') {
+        payload.smoothing = !!document.getElementById('smoothing-toggle').checked;
+        payload.det_gamma = parseFloat(document.getElementById('t-gamma').value);
+        payload.det_contour_min_area = parseInt(document.getElementById('t-area').value, 10);
+        payload.dec_obstacle_stop_ymin = parseFloat(document.getElementById('t-ymin').value);
+        payload.det_rock_score_threshold = parseFloat(document.getElementById('t-rockthr').value);
+        payload.det_clahe_clip = parseFloat(document.getElementById('t-clahe').value);
+        payload.dec_ultra_stop_cm = parseFloat(document.getElementById('t-ultra-stop').value);
+        payload.dec_ultra_turn_cm = parseFloat(document.getElementById('t-ultra-turn').value);
+        payload.dec_stuck_dx_m = parseFloat(document.getElementById('t-stuck-dx').value);
+        payload.dec_stuck_frames = parseInt(document.getElementById('t-stuck-frames').value, 10);
+        payload.auto_speed = parseFloat(document.getElementById('t-autospeed').value);
+        payload.auto_speed_slow = parseFloat(document.getElementById('t-autospeed-slow').value);
+        payload.auto_speed_turn = parseFloat(document.getElementById('t-autospeed-turn').value);
+        payload.auto_speed_stuck = parseFloat(document.getElementById('t-autospeed-stuck').value);
+
+        // IMU settings (autonomy only)
+        payload.imu_enabled = !!document.getElementById('t-imu-enabled').checked;
+        payload.imu_i2c_bus = parseInt(document.getElementById('t-imu-bus').value, 10);
+        const addrRaw = (document.getElementById('t-imu-addr').value || '').trim().toLowerCase();
+        // allow "0x68" or "68"
+        let addr = 0x68;
+        if (addrRaw.startsWith('0x')) addr = parseInt(addrRaw, 16);
+        else if (addrRaw.length) addr = parseInt(addrRaw, 16);
+        payload.imu_i2c_addr = addr;
+        payload.imu_alpha = parseFloat(document.getElementById('t-imu-alpha').value);
+        payload.imu_dlpf_cfg = parseInt(document.getElementById('t-imu-dlpf').value, 10);
+        payload.imu_sample_div = parseInt(document.getElementById('t-imu-div').value, 10);
+        payload.imu_gyro_calib_seconds = parseFloat(document.getElementById('t-imu-calib').value);
+    }
     fetch('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
         .then(r=>r.json()).then(js=>{ console.log('settings updated', js); })
         .catch(()=>{ alert('Failed to apply tuning'); });

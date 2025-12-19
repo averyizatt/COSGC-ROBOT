@@ -1,6 +1,8 @@
 from flask import Flask, render_template, request, jsonify
 import time
 import threading
+import json
+from pathlib import Path
 
 from motor_control import MotorController
 
@@ -53,7 +55,122 @@ SETTINGS = {
     'auto_speed_turn': 1.0,
     # When stuck is detected (via SLAM pose delta), boost to full
     'auto_speed_stuck': 1.0,
+
+    # IMU (MPU-6050 / GY-521) tuning
+    'imu_enabled': True,
+    'imu_i2c_bus': 1,
+    'imu_i2c_addr': 0x68,
+    'imu_alpha': 0.98,
+    'imu_dlpf_cfg': 3,
+    'imu_sample_div': 4,
+    'imu_gyro_calib_seconds': 1.0,
 }
+
+SETTINGS_PATH = Path(__file__).with_name('settings.json')
+
+
+def _load_settings_from_disk():
+    global SETTINGS
+    try:
+        if not SETTINGS_PATH.exists():
+            return
+        data = json.loads(SETTINGS_PATH.read_text())
+        if not isinstance(data, dict):
+            return
+        # Only accept known keys; coerce to the existing type
+        for k, v in data.items():
+            if k not in SETTINGS:
+                continue
+            if isinstance(SETTINGS[k], bool):
+                SETTINGS[k] = bool(v)
+            elif isinstance(SETTINGS[k], int):
+                try:
+                    SETTINGS[k] = int(v)
+                except Exception:
+                    pass
+            elif isinstance(SETTINGS[k], float):
+                try:
+                    SETTINGS[k] = float(v)
+                except Exception:
+                    pass
+            else:
+                SETTINGS[k] = v
+    except Exception:
+        # best-effort; don't prevent server start
+        pass
+
+
+def _save_settings_to_disk():
+    try:
+        SETTINGS_PATH.write_text(json.dumps(SETTINGS, indent=2, sort_keys=True))
+    except Exception:
+        # best-effort
+        pass
+
+
+def _clamp(v, lo, hi):
+    try:
+        x = float(v)
+    except Exception:
+        return lo
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _clamp_int(v, lo, hi):
+    try:
+        x = int(v)
+    except Exception:
+        return lo
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def _apply_settings_ranges():
+    """Enforce safe min/max ranges on known tuning knobs."""
+    # RC
+    SETTINGS['rc_speed'] = _clamp(SETTINGS.get('rc_speed', 0.6), 0.2, 1.0)
+    SETTINGS['rc_turn_gain'] = _clamp(SETTINGS.get('rc_turn_gain', 1.0), 0.2, 2.5)
+
+    # Detector
+    SETTINGS['det_gamma'] = _clamp(SETTINGS.get('det_gamma', 0.9), 0.5, 1.5)
+    SETTINGS['det_contour_min_area'] = _clamp_int(SETTINGS.get('det_contour_min_area', 400), 50, 20000)
+    SETTINGS['det_clahe_clip'] = _clamp(SETTINGS.get('det_clahe_clip', 3.0), 0.5, 10.0)
+    SETTINGS['det_rock_score_threshold'] = _clamp(SETTINGS.get('det_rock_score_threshold', 0.45), 0.0, 1.0)
+
+    # Decision
+    SETTINGS['dec_obstacle_stop_ymin'] = _clamp(SETTINGS.get('dec_obstacle_stop_ymin', 0.35), 0.0, 1.0)
+    # Ultrasonic thresholds (HC-SR04 typical operating range)
+    SETTINGS['dec_ultra_stop_cm'] = _clamp(SETTINGS.get('dec_ultra_stop_cm', 12.0), 2.0, 200.0)
+    SETTINGS['dec_ultra_turn_cm'] = _clamp(SETTINGS.get('dec_ultra_turn_cm', 30.0), 5.0, 300.0)
+    SETTINGS['dec_stuck_dx_m'] = _clamp(SETTINGS.get('dec_stuck_dx_m', 0.02), 0.0, 1.0)
+    SETTINGS['dec_stuck_frames'] = _clamp_int(SETTINGS.get('dec_stuck_frames', 3), 1, 50)
+
+    # Autonomy speed policy
+    SETTINGS['auto_speed'] = _clamp(SETTINGS.get('auto_speed', 0.6), 0.0, 1.0)
+    SETTINGS['auto_speed_slow'] = _clamp(SETTINGS.get('auto_speed_slow', 0.35), 0.0, 1.0)
+    SETTINGS['auto_speed_turn'] = _clamp(SETTINGS.get('auto_speed_turn', 1.0), 0.0, 1.0)
+    SETTINGS['auto_speed_stuck'] = _clamp(SETTINGS.get('auto_speed_stuck', 1.0), 0.0, 1.0)
+
+    # IMU (MPU-6050)
+    SETTINGS['imu_enabled'] = bool(SETTINGS.get('imu_enabled', True))
+    SETTINGS['imu_i2c_bus'] = _clamp_int(SETTINGS.get('imu_i2c_bus', 1), 0, 10)
+    # 0x68 or 0x69 are common; allow 0x08..0x77 (7-bit I2C address range)
+    SETTINGS['imu_i2c_addr'] = _clamp_int(SETTINGS.get('imu_i2c_addr', 0x68), 0x08, 0x77)
+    SETTINGS['imu_alpha'] = _clamp(SETTINGS.get('imu_alpha', 0.98), 0.0, 0.999)
+    SETTINGS['imu_dlpf_cfg'] = _clamp_int(SETTINGS.get('imu_dlpf_cfg', 3), 0, 6)
+    SETTINGS['imu_sample_div'] = _clamp_int(SETTINGS.get('imu_sample_div', 4), 0, 255)
+    SETTINGS['imu_gyro_calib_seconds'] = _clamp(SETTINGS.get('imu_gyro_calib_seconds', 1.0), 0.2, 10.0)
+
+
+_load_settings_from_disk()
+_apply_settings_ranges()
 
 # How long without a keepalive before server forces stop (seconds)
 KEEPALIVE_TIMEOUT = 0.6
@@ -192,11 +309,36 @@ def keepalive():
 @app.route('/status')
 def status():
     with _keepalive_lock:
+        # best-effort IMU summary from the last autonomy log (if running)
+        imu_summary = None
+        try:
+            p = (latest_log or {}).get('perception', {}) if isinstance(latest_log, dict) else {}
+            imu = p.get('imu') if isinstance(p, dict) else None
+            if isinstance(imu, dict):
+                orient = imu.get('orientation')
+                if not isinstance(orient, dict):
+                    orient = {}
+                roll = orient.get('roll_rad')
+                pitch = orient.get('pitch_rad')
+                temp_c = imu.get('temperature_c')
+                imu_summary = {
+                    'connected': True,
+                    'roll_deg': None if roll is None else (float(roll) * 57.29577951308232),
+                    'pitch_deg': None if pitch is None else (float(pitch) * 57.29577951308232),
+                    'temp_c': None if temp_c is None else float(temp_c),
+                    'age_s': max(0.0, time.time() - latest_log_ts) if latest_log_ts else None,
+                }
+            else:
+                imu_summary = {'connected': False, 'age_s': max(0.0, time.time() - latest_log_ts) if latest_log_ts else None}
+        except Exception:
+            imu_summary = None
         return jsonify({
             'active_actions': list(_active_actions),
             'e_stop': bool(_e_stop),
             'mode': MODE,
-            'smoothing': bool(SETTINGS.get('smoothing', False))
+            'smoothing': bool(SETTINGS.get('smoothing', False)),
+            'settings': SETTINGS,
+            'imu': imu_summary,
         })
 
 
@@ -276,6 +418,8 @@ def settings():
                 pass
         else:
             SETTINGS[k] = v
+    _apply_settings_ranges()
+    _save_settings_to_disk()
     return jsonify(SETTINGS)
 
 
@@ -336,11 +480,13 @@ def led(state):
 # ---------------- PERCEPTION LOGGING ---------------- #
 
 latest_log = {}  # store latest perception + decision
+latest_log_ts = 0.0
 
 @app.route("/log", methods=["POST"])
 def log_update():
-    global latest_log
+    global latest_log, latest_log_ts
     latest_log = request.json
+    latest_log_ts = time.time()
     return jsonify({"status": "received"})
 
 @app.route("/console")

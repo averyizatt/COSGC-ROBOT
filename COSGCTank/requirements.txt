@@ -1,0 +1,9 @@
+flask
+requests
+numpy
+opencv-python
+smbus2
+# Optional (Pi-only)
+# RPi.GPIO
+# picamera2
+# tflite-runtime

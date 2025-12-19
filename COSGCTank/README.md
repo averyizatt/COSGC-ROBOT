@@ -125,6 +125,146 @@ The main loop (`main.py`) polls `/settings` about once per second and:
 - injects `perception['settings']` for modules that read it (navigator/decision)
 - updates detector tuning live via `det.settings = settings_cache`
 
+### Settings persistence (survives reboot)
+
+`rover_server.py` now loads/saves settings to `COSGCTank/settings.json`.
+
+- On startup, it loads known keys from `settings.json` if present.
+- On `POST /settings`, it clamps values to safe ranges and writes them back to disk.
+
+### Enforced min/max ranges
+
+The server clamps these keys to prevent unsafe/invalid values:
+
+- `rc_speed`: $[0.2, 1.0]$
+- `rc_turn_gain`: $[0.2, 2.5]$
+- `det_gamma`: $[0.5, 1.5]$
+- `det_contour_min_area`: $[50, 20000]$
+- `det_clahe_clip`: $[0.5, 10.0]$
+- `det_rock_score_threshold`: $[0.0, 1.0]$
+- `dec_obstacle_stop_ymin`: $[0.0, 1.0]$
+- `dec_ultra_stop_cm`: $[2, 200]$
+- `dec_ultra_turn_cm`: $[5, 300]$
+- `dec_stuck_dx_m`: $[0.0, 1.0]$
+- `dec_stuck_frames`: $[1, 50]$
+- `auto_speed`, `auto_speed_slow`, `auto_speed_turn`, `auto_speed_stuck`: $[0.0, 1.0]$
+
+## Ultrasonic sensor (HC-SR04)
+
+The autonomy stack supports an HC-SR04-style ultrasonic rangefinder mounted near the camera.
+
+### GPIO choice (BCM)
+
+To avoid conflicts with the DRV8833 motor pins (`17, 27, 23, 18, 4`), the rover uses:
+
+- **TRIG**: `GPIO 24`
+- **ECHO**: `GPIO 25`
+
+These are the defaults in `ultrasonic.py`, and `main.py` initializes the sensor with these pins.
+
+### Wiring (important)
+
+- HC-SR04 power: **VCC = 5V**, **GND = GND**
+- **TRIG** (5V-tolerant input on sensor) can be driven directly from Pi `GPIO 24`.
+- **ECHO is typically 5V** and **must be level-shifted** down to **3.3V** for Pi `GPIO 25`.
+  - Use a voltage divider (example: 1k (top) + 2k (bottom) gives ~3.3V), or a logic-level shifter.
+
+### Usage in code
+
+`main.py` reads the sensor and injects:
+
+- `perception['distance_cm']` (float cm or `None`)
+
+`decision.py` uses `distance_cm` with these tunables:
+
+- `dec_ultra_stop_cm`: if distance is below this, trigger an emergency escape
+- `dec_ultra_turn_cm`: if distance is below this (but above stop), bias turning/avoidance
+
+The reader uses a small median filter (`samples=3`) and timeouts to avoid blocking the main loop.
+
+## Stereo camera assumptions
+
+You mentioned a **USB stereo camera** with:
+
+- Dual lens, **1080p** over USB
+- **60mm baseline** between the two cameras
+- Ultrasonic sensor mounted with the camera assembly
+
+Current code treats `stereo_cam` as a *mode flag* and does not yet perform true stereo depth.
+The baseline is noted here so future depth/range fusion can use it consistently.
+
+## IMU (GY-521 / MPU-6050)
+
+The rover supports an I2C IMU (GY-521 breakout with MPU-6050) for roll/pitch estimation and motion smoothing.
+
+### Pins (I2C)
+
+MPU-6050 uses the Raspberry Pi's I2C bus (not arbitrary GPIO):
+
+- **SDA**: `GPIO 2` (physical pin 3)
+- **SCL**: `GPIO 3` (physical pin 5)
+- **3.3V**: physical pin 1 (or 17)
+- **GND**: physical pin 6 (or any GND)
+
+Address selection:
+
+- `AD0` LOW → `0x68` (default)
+- `AD0` HIGH → `0x69`
+
+`INT` can be left unconnected (this code polls).
+
+### Enable I2C on the Pi
+
+On Raspberry Pi OS:
+
+```bash
+sudo raspi-config
+```
+
+Enable **Interface Options → I2C**, then reboot.
+
+Optional sanity check:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y i2c-tools
+i2cdetect -y 1
+```
+
+You should see `68` (or `69`) in the address table.
+
+### Python dependency
+
+The IMU reader uses `smbus2`:
+
+```bash
+python3 -m pip install smbus2
+```
+
+### What gets added to perception
+
+`main.py` attaches:
+
+- `perception['imu']` → accel (m/s²), gyro (rad/s), temperature (°C), and a simple complementary-filter roll/pitch estimate.
+
+### Tunables (saved in settings.json)
+
+These keys are exposed under autonomy tuning and are persisted via `settings.json`:
+
+- `imu_enabled` (bool)
+- `imu_i2c_bus` (default 1)
+- `imu_i2c_addr` (default 0x68)
+- `imu_alpha` (complementary filter alpha, default 0.98)
+- `imu_dlpf_cfg` (0..6, default 3)
+- `imu_sample_div` (0..255, default 4)
+- `imu_gyro_calib_seconds` (0.2..10.0, default 1.0)
+
+## Combined pin map (quick reference)
+
+- **DRV8833 motor driver (BCM)**: `AIN1=17`, `AIN2=27`, `BIN1=23`, `BIN2=18`, `STBY=4`
+- **Ultrasonic HC-SR04 (BCM)**: `TRIG=24`, `ECHO=25` (ECHO must be level-shifted)
+- **I2C (IMU MPU-6050)**: `SDA=2`, `SCL=3`
+
 ## Motor control and safety
 
 - `motor_control.py` (MotorController)

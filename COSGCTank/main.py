@@ -34,7 +34,8 @@ def main():
     motor = MotorController()
     try:
         from ultrasonic import Ultrasonic
-        us = Ultrasonic()
+        # HC-SR04 wiring (BCM): TRIG=24, ECHO=25 (ECHO must be level-shifted to 3.3V)
+        us = Ultrasonic(trig_pin=24, echo_pin=25)
     except Exception:
         us = None
     from navigator import Navigator
@@ -48,6 +49,10 @@ def main():
     # settings cache (poll /settings periodically)
     settings_cache = {'smoothing': True}
     settings_last = 0.0
+
+    # IMU (MPU-6050 / GY-521)
+    imu = None
+    imu_last_calib = 0.0
 
     try:
         for data in frame_iter:
@@ -68,7 +73,7 @@ def main():
             # read ultrasonic when available (non-blocking)
             if us is not None:
                 try:
-                    d = us.read_distance()
+                    d = us.read_distance_cm(samples=3)
                 except Exception:
                     d = None
                 perception['distance_cm'] = d
@@ -85,6 +90,56 @@ def main():
             except Exception:
                 pass
             perception['settings'] = settings_cache
+
+            # IMU setup/use (best-effort)
+            try:
+                imu_enabled = bool(settings_cache.get('imu_enabled', True))
+            except Exception:
+                imu_enabled = True
+            if not imu_enabled:
+                imu = None
+                perception['imu'] = None
+            else:
+                if imu is None:
+                    try:
+                        from imu import MPU6050, ImuSettings
+                        imu = MPU6050(ImuSettings(
+                            i2c_bus=int(settings_cache.get('imu_i2c_bus', 1)),
+                            i2c_addr=int(settings_cache.get('imu_i2c_addr', 0x68)),
+                            alpha=float(settings_cache.get('imu_alpha', 0.98)),
+                            dlpf_cfg=int(settings_cache.get('imu_dlpf_cfg', 3)),
+                            sample_div=int(settings_cache.get('imu_sample_div', 4)),
+                            gyro_calib_seconds=float(settings_cache.get('imu_gyro_calib_seconds', 1.0)),
+                        ))
+                        # Calibrate once near startup if available
+                        if getattr(imu, 'available', False):
+                            imu.calibrate_gyro_bias(seconds=float(settings_cache.get('imu_gyro_calib_seconds', 1.0)))
+                            imu_last_calib = time.time()
+                        else:
+                            imu = None
+                    except Exception:
+                        imu = None
+
+                if imu is not None:
+                    try:
+                        # If settings changed significantly, refresh filter alpha
+                        try:
+                            imu.settings.alpha = float(settings_cache.get('imu_alpha', imu.settings.alpha))
+                        except Exception:
+                            pass
+                        # Optionally re-calibrate gyro bias rarely (e.g. when rover is stationary)
+                        if time.time() - imu_last_calib > 60.0:
+                            try:
+                                imu.calibrate_gyro_bias(seconds=float(settings_cache.get('imu_gyro_calib_seconds', 1.0)))
+                            except Exception:
+                                pass
+                            imu_last_calib = time.time()
+
+                        perception['imu'] = imu.read()
+                    except Exception:
+                        perception['imu'] = None
+                else:
+                    perception['imu'] = None
             # update detector tuning live
             try:
                 det.settings = settings_cache
@@ -189,6 +244,11 @@ def main():
     finally:
         provider.release()
         motor.cleanup()
+        try:
+            if imu is not None:
+                imu.close()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
 
 
