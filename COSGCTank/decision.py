@@ -1,6 +1,11 @@
 import math
 import time
 
+try:
+    from pid import PID
+except Exception:
+    PID = None
+
 
 class DecisionMaker:
     def __init__(self, obstacle_stop_threshold=0.35, boundary_min_lines=1, hysteresis_frames=3):
@@ -27,6 +32,10 @@ class DecisionMaker:
         self._recovery_dir = 1  # +1 => prefer left, -1 => prefer right (alternates)
         self._recovery_attempts = 0
         self._recovery_cooldown_until = 0.0
+
+        # Optional yaw PID (heading tracking)
+        self._yaw_pid = None
+        self._yaw_pid_cfg = None
 
     def _choose_immediate(self, perception):
         """Highest priority immediate checks that should bypass hysteresis."""
@@ -206,6 +215,7 @@ class DecisionMaker:
         # If enabled, this can override the normal boundary/terrain candidate with TURN/ADJUST/FORWARD
         # to point toward a short-horizon target.
         nav_cmd = None
+        nav_turn_mag = None
         try:
             nav_enabled = bool(s.get('nav_heading_enabled', True))
         except Exception:
@@ -230,12 +240,57 @@ class DecisionMaker:
                             turn_stop, turn_adjust = 30.0, 10.0
                         err_deg = abs(math.degrees(err))
 
-                        if err_deg >= turn_stop:
-                            nav_cmd = 'TURN_LEFT' if err > 0 else 'TURN_RIGHT'
-                        elif err_deg >= turn_adjust:
-                            nav_cmd = 'ADJUST_LEFT' if err > 0 else 'ADJUST_RIGHT'
+                        # Optional yaw PID: heading error -> turn magnitude.
+                        # Keeps command interface as TURN/ADJUST/FORWARD.
+                        pid_enabled = False
+                        try:
+                            pid_enabled = bool(s.get('pid_yaw_enabled', False))
+                        except Exception:
+                            pid_enabled = False
+
+                        if pid_enabled and PID is not None:
+                            try:
+                                kp = float(s.get('pid_yaw_kp', 1.2))
+                                ki = float(s.get('pid_yaw_ki', 0.0))
+                                kd = float(s.get('pid_yaw_kd', 0.08))
+                                out_limit = float(s.get('pid_yaw_out_limit', 1.0))
+                                i_limit = float(s.get('pid_yaw_i_limit', 0.6))
+                            except Exception:
+                                kp, ki, kd, out_limit, i_limit = 1.2, 0.0, 0.08, 1.0, 0.6
+
+                            cfg = (kp, ki, kd, out_limit, i_limit)
+                            if self._yaw_pid is None or self._yaw_pid_cfg != cfg:
+                                self._yaw_pid = PID(kp=kp, ki=ki, kd=kd, out_limit=out_limit, i_limit=i_limit)
+                                self._yaw_pid_cfg = cfg
+
+                            try:
+                                tnow = float(perception.get('timestamp'))
+                            except Exception:
+                                tnow = time.time()
+                            u = self._yaw_pid.update(err, now=tnow)
+                            nav_turn_mag = abs(float(u))
+
+                            if err_deg >= turn_stop:
+                                nav_cmd = 'TURN_LEFT' if u > 0 else 'TURN_RIGHT'
+                            elif err_deg >= turn_adjust:
+                                nav_cmd = 'ADJUST_LEFT' if u > 0 else 'ADJUST_RIGHT'
+                            else:
+                                nav_cmd = 'FORWARD'
+
+                            # Scale turn speed by PID magnitude so small errors don't over-steer.
+                            # Keep within [auto_speed_slow, auto_speed_turn].
+                            try:
+                                mag = max(0.0, min(1.0, float(nav_turn_mag)))
+                                perception['pid_turn_speed_hint'] = float(auto_speed_slow + (auto_speed_turn - auto_speed_slow) * mag)
+                            except Exception:
+                                pass
                         else:
-                            nav_cmd = 'FORWARD'
+                            if err_deg >= turn_stop:
+                                nav_cmd = 'TURN_LEFT' if err > 0 else 'TURN_RIGHT'
+                            elif err_deg >= turn_adjust:
+                                nav_cmd = 'ADJUST_LEFT' if err > 0 else 'ADJUST_RIGHT'
+                            else:
+                                nav_cmd = 'FORWARD'
 
                         # add some debug fields into perception for logging/overlay
                         try:
@@ -244,6 +299,7 @@ class DecisionMaker:
                                 'yaw': yaw,
                                 'err': err,
                                 'err_deg': err_deg,
+                                'pid_turn_mag': nav_turn_mag,
                             }
                         except Exception:
                             pass
@@ -260,6 +316,12 @@ class DecisionMaker:
             self._recovery_stage = None
             self._recovery_until = 0.0
             self._recovery_attempts = 0
+            # Reset PID so it doesn't wind up across overrides.
+            try:
+                if self._yaw_pid is not None:
+                    self._yaw_pid.reset()
+            except Exception:
+                pass
             # Emergency commands bypass hysteresis
             self.prev_command = immediate["command"]
             self.command_counter = 0
@@ -340,7 +402,12 @@ class DecisionMaker:
         # Use this as the candidate *before* boundary heuristics.
         if nav_cmd is not None:
             candidate = nav_cmd
+            try:
+                nav_speed_hint = float(perception.get('pid_turn_speed_hint'))
+            except Exception:
+                nav_speed_hint = None
         else:
+            nav_speed_hint = None
             # 3) Boundary-based corrections
             boundary_decision = self._choose_by_boundary(perception)
             if boundary_decision is not None:
@@ -384,6 +451,11 @@ class DecisionMaker:
                     speed = auto_speed_slow
                 elif candidate in ('TURN_LEFT', 'TURN_RIGHT', 'ADJUST_LEFT', 'ADJUST_RIGHT'):
                     speed = auto_speed_turn
+                    if nav_speed_hint is not None:
+                        try:
+                            speed = float(nav_speed_hint)
+                        except Exception:
+                            speed = auto_speed_turn
 
                 # Start turn commitment when we switch into a turn.
                 if candidate in ('TURN_LEFT', 'TURN_RIGHT') and turn_commit_s > 0.0:
@@ -398,6 +470,11 @@ class DecisionMaker:
                     speed = auto_speed_slow
                 elif hold_cmd in ('TURN_LEFT', 'TURN_RIGHT', 'ADJUST_LEFT', 'ADJUST_RIGHT'):
                     speed = auto_speed_turn
+                    if nav_speed_hint is not None:
+                        try:
+                            speed = float(nav_speed_hint)
+                        except Exception:
+                            speed = auto_speed_turn
                 return {"command": hold_cmd, "reason": "Hysteresis hold", "speed": speed}
 
     def map_to_motor(self, command, speed=None):

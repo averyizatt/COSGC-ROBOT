@@ -231,6 +231,18 @@ def main():
 
             decision = decider.decide(perception)
 
+            # Recovery-aware exploration: if we trigger recovery while exploring,
+            # temporarily blacklist the current explore frontier goal.
+            try:
+                if bool(settings_cache.get('nav_explore_enabled', False)) and decision.get('recovery'):
+                    cd = float(settings_cache.get('nav_explore_blacklist_s', 12.0))
+                    # If navigator has an active explore goal cell, blacklist it.
+                    eg = getattr(nav, '_explore_goal_cell', None)
+                    if eg is not None and hasattr(nav, 'blacklist_explore_goal'):
+                        nav.blacklist_explore_goal(eg, cooldown_s=cd)
+            except Exception:
+                pass
+
             # execute mapped motor action
             action, params = decider.map_to_motor(decision["command"], speed=decision.get('speed'))
             if hasattr(motor, action):

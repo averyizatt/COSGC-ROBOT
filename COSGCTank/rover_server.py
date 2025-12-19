@@ -1,4 +1,10 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
+import os
+import cv2
+import numpy as np
+import re
+import shutil
+import subprocess
 import time
 import threading
 import json
@@ -6,8 +12,132 @@ from pathlib import Path
 import io
 
 from motor_control import MotorController
+from camera import FrameProvider
 
 app = Flask(__name__, template_folder="templates")
+
+
+def _parse_camera_device(device):
+    """Parse camera selector.
+
+    Accepts: 0, '0', '/dev/video0'. Returns an int index when possible.
+    """
+    if device is None:
+        return 0
+    if isinstance(device, int):
+        return device
+    s = str(device).strip()
+    if s.startswith('/dev/video'):
+        s = s.replace('/dev/video', '')
+    try:
+        return int(s)
+    except Exception:
+        return 0
+
+
+_video_provider = None
+_video_provider_key = None
+
+
+def _get_video_provider(device_idx, width, height, fps):
+    global _video_provider, _video_provider_key
+    key = (int(device_idx), int(width), int(height), int(fps))
+    if _video_provider is None or _video_provider_key != key:
+        try:
+            if _video_provider is not None:
+                _video_provider.release()
+        except Exception:
+            pass
+        _video_provider = FrameProvider(width=int(width), height=int(height), fps=int(fps), camera_index=int(device_idx))
+        _video_provider_key = key
+        try:
+            print(f"[video] opened /dev/video{device_idx} @ {width}x{height} {fps}fps")
+        except Exception:
+            pass
+    return _video_provider
+
+
+def _camera_caps_v4l2(device: str):
+    """Best-effort camera capability probe.
+
+    Uses `v4l2-ctl --list-formats-ext` if installed (v4l-utils).
+    Returns a dict:
+      {
+        'device': '/dev/video0',
+        'sizes': [ {'w': 640, 'h': 480, 'fps': [30.0, 15.0]} , ... ],
+        'formats': ['MJPG', 'YUYV']
+      }
+    """
+    dev = str(device or '/dev/video0').strip() or '/dev/video0'
+    if not dev.startswith('/dev/video'):
+        # accept numeric
+        try:
+            dev = f"/dev/video{int(dev)}"
+        except Exception:
+            dev = '/dev/video0'
+
+    exe = shutil.which('v4l2-ctl')
+    if not exe:
+        return {'device': dev, 'sizes': [], 'formats': [], 'source': 'v4l2-ctl-missing'}
+
+    try:
+        proc = subprocess.run(
+            [exe, '-d', dev, '--list-formats-ext'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        out = proc.stdout or ''
+    except Exception as e:
+        return {'device': dev, 'sizes': [], 'formats': [], 'source': f'v4l2-ctl-error:{type(e).__name__}'}
+
+    formats = []
+    # Example: "Pixel Format: 'MJPG'" or "Pixel Format: 'YUYV'"
+    for m in re.finditer(r"Pixel\s+Format:\s*'([A-Z0-9]{3,8})'", out):
+        fmt = m.group(1)
+        if fmt and fmt not in formats:
+            formats.append(fmt)
+
+    sizes_map = {}  # (w,h) -> set(fps)
+    current_w = None
+    current_h = None
+
+    # Lines typically contain:
+    #   Size: Discrete 640x480
+    #   Interval: Discrete 0.033s (30.000 fps)
+    for line in out.splitlines():
+        line = line.strip()
+        m = re.search(r"Size:\s*Discrete\s*(\d+)x(\d+)", line)
+        if m:
+            current_w = int(m.group(1))
+            current_h = int(m.group(2))
+            sizes_map.setdefault((current_w, current_h), set())
+            continue
+
+        m = re.search(r"\((\d+(?:\.\d+)?)\s*fps\)", line)
+        if m and current_w is not None and current_h is not None:
+            try:
+                fps = float(m.group(1))
+                sizes_map.setdefault((current_w, current_h), set()).add(fps)
+            except Exception:
+                pass
+
+    sizes = []
+    for (w, h), fps_set in sorted(sizes_map.items(), key=lambda x: (x[0][0], x[0][1])):
+        fps_list = sorted(fps_set, reverse=True)
+        sizes.append({'w': int(w), 'h': int(h), 'fps': fps_list})
+
+    return {'device': dev, 'sizes': sizes, 'formats': formats, 'source': 'v4l2-ctl'}
+
+
+@app.route('/camera_caps')
+def camera_caps():
+    """Return supported camera sizes/FPS for the selected device."""
+    device = request.args.get('device', SETTINGS.get('cam_device', '/dev/video0'))
+    caps = _camera_caps_v4l2(device)
+    return jsonify(caps)
 
 # Motor controller (abstracted)
 # DRV8833 pinout (BCM):
@@ -77,6 +207,13 @@ SETTINGS = {
     'nav_explore_frontier_candidates': 50,
     # Mark observed radius around robot for "known" vs "unknown" (meters)
     'nav_observe_radius_m': 1.0,
+
+    # Exploration stability / loop avoidance
+    'nav_explore_goal_reached_m': 0.5,
+    'nav_explore_progress_timeout_s': 4.0,
+    'nav_explore_progress_min_delta_m': 0.15,
+    'nav_explore_visit_weight': 0.25,
+    'nav_explore_blacklist_s': 12.0,
     # Planning budgets to prevent stalls
     'nav_plan_max_expansions': 12000,
     'nav_plan_max_time_s': 0.06,
@@ -85,6 +222,29 @@ SETTINGS = {
     'nav_dyn_half_life_s': 6.0,
     'nav_dyn_thresh': 0.40,
     'nav_dyn_prune_thresh': 0.05,
+
+    # Navigation global map persistence
+    'nav_persist_enabled': False,
+    # Where to save the global map (.npz). Relative paths are relative to COSGCTank/.
+    'nav_persist_path': 'nav_map_global.npz',
+    # Periodic save interval (seconds)
+    'nav_persist_period_s': 5.0,
+
+    # Yaw PID (autonomous steering smoothing)
+    'pid_yaw_enabled': False,
+    'pid_yaw_kp': 1.2,
+    'pid_yaw_ki': 0.0,
+    'pid_yaw_kd': 0.08,
+    'pid_yaw_out_limit': 1.0,
+    'pid_yaw_i_limit': 0.6,
+
+    # Web video stream (MJPEG via /video_feed)
+    # Accepts '/dev/videoN' or 'N'
+    'cam_device': '/dev/video0',
+    'cam_width': 640,
+    'cam_height': 480,
+    'cam_fps': 20,
+    'cam_jpeg_quality': 80,
 }
 
 SETTINGS_PATH = Path(__file__).with_name('settings.json')
@@ -225,6 +385,11 @@ def _apply_settings_ranges():
     SETTINGS['nav_explore_frontier_max_scan'] = _clamp_int(SETTINGS.get('nav_explore_frontier_max_scan', 8000), 500, 200000)
     SETTINGS['nav_explore_frontier_candidates'] = _clamp_int(SETTINGS.get('nav_explore_frontier_candidates', 50), 1, 500)
     SETTINGS['nav_observe_radius_m'] = _clamp(SETTINGS.get('nav_observe_radius_m', 1.0), 0.2, 10.0)
+    SETTINGS['nav_explore_goal_reached_m'] = _clamp(SETTINGS.get('nav_explore_goal_reached_m', 0.5), 0.1, 3.0)
+    SETTINGS['nav_explore_progress_timeout_s'] = _clamp(SETTINGS.get('nav_explore_progress_timeout_s', 4.0), 0.2, 30.0)
+    SETTINGS['nav_explore_progress_min_delta_m'] = _clamp(SETTINGS.get('nav_explore_progress_min_delta_m', 0.15), 0.0, 5.0)
+    SETTINGS['nav_explore_visit_weight'] = _clamp(SETTINGS.get('nav_explore_visit_weight', 0.25), 0.0, 10.0)
+    SETTINGS['nav_explore_blacklist_s'] = _clamp(SETTINGS.get('nav_explore_blacklist_s', 12.0), 0.0, 120.0)
 
     # Planning budgets
     SETTINGS['nav_plan_max_expansions'] = _clamp_int(SETTINGS.get('nav_plan_max_expansions', 12000), 200, 500000)
@@ -234,6 +399,32 @@ def _apply_settings_ranges():
     SETTINGS['nav_dyn_half_life_s'] = _clamp(SETTINGS.get('nav_dyn_half_life_s', 6.0), 0.0, 120.0)
     SETTINGS['nav_dyn_thresh'] = _clamp(SETTINGS.get('nav_dyn_thresh', 0.40), 0.05, 1.0)
     SETTINGS['nav_dyn_prune_thresh'] = _clamp(SETTINGS.get('nav_dyn_prune_thresh', 0.05), 0.0, 0.5)
+
+    # Persistence
+    SETTINGS['nav_persist_enabled'] = bool(SETTINGS.get('nav_persist_enabled', False))
+    try:
+        SETTINGS['nav_persist_path'] = str(SETTINGS.get('nav_persist_path', 'nav_map_global.npz'))
+    except Exception:
+        SETTINGS['nav_persist_path'] = 'nav_map_global.npz'
+    SETTINGS['nav_persist_period_s'] = _clamp(SETTINGS.get('nav_persist_period_s', 5.0), 0.0, 300.0)
+
+    # PID yaw
+    SETTINGS['pid_yaw_enabled'] = bool(SETTINGS.get('pid_yaw_enabled', False))
+    SETTINGS['pid_yaw_kp'] = _clamp(SETTINGS.get('pid_yaw_kp', 1.2), 0.0, 10.0)
+    SETTINGS['pid_yaw_ki'] = _clamp(SETTINGS.get('pid_yaw_ki', 0.0), 0.0, 10.0)
+    SETTINGS['pid_yaw_kd'] = _clamp(SETTINGS.get('pid_yaw_kd', 0.08), 0.0, 10.0)
+    SETTINGS['pid_yaw_out_limit'] = _clamp(SETTINGS.get('pid_yaw_out_limit', 1.0), 0.05, 1.0)
+    SETTINGS['pid_yaw_i_limit'] = _clamp(SETTINGS.get('pid_yaw_i_limit', 0.6), 0.0, 5.0)
+
+    # Camera stream
+    try:
+        SETTINGS['cam_device'] = str(SETTINGS.get('cam_device', '/dev/video0')).strip() or '/dev/video0'
+    except Exception:
+        SETTINGS['cam_device'] = '/dev/video0'
+    SETTINGS['cam_width'] = _clamp_int(SETTINGS.get('cam_width', 640), 160, 1920)
+    SETTINGS['cam_height'] = _clamp_int(SETTINGS.get('cam_height', 480), 120, 1080)
+    SETTINGS['cam_fps'] = _clamp_int(SETTINGS.get('cam_fps', 20), 1, 60)
+    SETTINGS['cam_jpeg_quality'] = _clamp_int(SETTINGS.get('cam_jpeg_quality', 80), 20, 95)
 
 
 _load_settings_from_disk()
@@ -269,6 +460,67 @@ _watchdog_thread.start()
 @app.route("/")
 def home():
     return render_template("control.html")
+
+
+@app.route('/video_feed')
+def video_feed():
+    """MJPEG stream for the control page.
+
+    Defaults to /dev/video0. Override via:
+      - query params: ?device=0&width=640&height=480&fps=20
+      - env vars: COSGC_CAMERA_DEVICE, COSGC_CAMERA_WIDTH, COSGC_CAMERA_HEIGHT, COSGC_CAMERA_FPS
+    """
+    device = request.args.get('device', SETTINGS.get('cam_device', os.environ.get('COSGC_CAMERA_DEVICE', '0')))
+    width = request.args.get('width', SETTINGS.get('cam_width', os.environ.get('COSGC_CAMERA_WIDTH', '640')))
+    height = request.args.get('height', SETTINGS.get('cam_height', os.environ.get('COSGC_CAMERA_HEIGHT', '480')))
+    fps = request.args.get('fps', SETTINGS.get('cam_fps', os.environ.get('COSGC_CAMERA_FPS', '20')))
+    quality = request.args.get('q', SETTINGS.get('cam_jpeg_quality', os.environ.get('COSGC_CAMERA_JPEG_QUALITY', '80')))
+
+    dev_idx = _parse_camera_device(device)
+    try:
+        width = int(width)
+        height = int(height)
+        fps = int(float(fps))
+        quality = int(quality)
+    except Exception:
+        width, height, fps, quality = 640, 480, 20, 80
+
+    # Clamp to safe-ish ranges
+    width = max(160, min(1920, width))
+    height = max(120, min(1080, height))
+    fps = max(1, min(60, fps))
+    quality = max(20, min(95, quality))
+
+    provider = _get_video_provider(dev_idx, width, height, fps)
+
+    def gen():
+        while True:
+            data = provider.get_frame()
+            if data is None:
+                time.sleep(0.05)
+                continue
+
+            # FrameProvider returns RGB; encode as JPEG (BGR expected by OpenCV conventions)
+            frame_rgb = data.get('frame')
+            if frame_rgb is None:
+                time.sleep(0.01)
+                continue
+            try:
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            except Exception:
+                frame_bgr = frame_rgb
+
+            ok, buf = cv2.imencode('.jpg', frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+            if not ok:
+                time.sleep(0.01)
+                continue
+
+            yield (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
+            )
+
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route("/cmd/<action>")
 def command(action):

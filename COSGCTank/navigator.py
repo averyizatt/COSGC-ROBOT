@@ -13,6 +13,8 @@ import math
 import time
 import numpy as np
 import heapq
+from pathlib import Path
+import os
 
 # Allow this module to work both as a package import and as a script import.
 try:
@@ -55,6 +57,140 @@ class Navigator:
         self._explore_goal_ts = 0.0
         self._last_plan_stats = {}
         self._last_frontier_stats = {}
+
+        # Exploration stability: progress + visit counts + blacklist
+        self.global_visit_count = np.zeros((self.global_size, self.global_size), dtype=np.uint16)
+        self._explore_last_dist = None
+        self._explore_progress_ts = 0.0
+        self._explore_blacklist = {}  # (cx,cy) -> until_ts
+
+        # Global map persistence runtime
+        self._persist_last_save_ts = 0.0
+        self._persist_loaded = False
+
+    def _persist_enabled(self, settings):
+        try:
+            return bool((settings or {}).get('nav_persist_enabled', False))
+        except Exception:
+            return False
+
+    def _persist_path(self, settings):
+        try:
+            p = str((settings or {}).get('nav_persist_path', '')).strip()
+        except Exception:
+            p = ''
+        if not p:
+            p = 'nav_map_global.npz'
+        return Path(p)
+
+    def _persist_period_s(self, settings):
+        try:
+            return float((settings or {}).get('nav_persist_period_s', 5.0))
+        except Exception:
+            return 5.0
+
+    def _persist_atomic_write(self, path: Path, payload: dict):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + '.tmp')
+        # Write to tmp, then atomically replace.
+        np.savez_compressed(tmp, **payload)
+        os.replace(tmp, path)
+
+    def save_global_map(self, path: Path):
+        """Save global map state to disk (.npz)."""
+        meta = {
+            'version': np.array([1], dtype=np.int32),
+            'global_size': np.array([int(self.global_size)], dtype=np.int32),
+            'global_res': np.array([float(self.global_res)], dtype=np.float32),
+        }
+        if self.global_origin is None:
+            origin = np.array([np.nan, np.nan], dtype=np.float32)
+        else:
+            origin = np.array([float(self.global_origin[0]), float(self.global_origin[1])], dtype=np.float32)
+        payload = {
+            **meta,
+            'global_origin': origin,
+            'global_occupancy': self.global_occupancy.astype(np.uint8, copy=False),
+            'global_seen': self.global_seen.astype(np.uint8, copy=False),
+            'global_dyn': self.global_dyn.astype(np.float32, copy=False),
+            'global_visit_count': self.global_visit_count.astype(np.uint16, copy=False),
+        }
+        self._persist_atomic_write(Path(path), payload)
+
+    def load_global_map(self, path: Path):
+        """Load global map state from disk (.npz) if compatible."""
+        p = Path(path)
+        if not p.exists():
+            return False
+        try:
+            data = np.load(p, allow_pickle=False)
+        except Exception:
+            return False
+
+        try:
+            gs = int(np.array(data.get('global_size')).reshape(-1)[0])
+            gr = float(np.array(data.get('global_res')).reshape(-1)[0])
+        except Exception:
+            return False
+
+        # Only accept if compatible with current navigator geometry.
+        if gs != int(self.global_size):
+            return False
+        if abs(gr - float(self.global_res)) > 1e-6:
+            return False
+
+        try:
+            occ = np.array(data['global_occupancy'], dtype=np.uint8, copy=False)
+            seen = np.array(data['global_seen'], dtype=np.uint8, copy=False)
+            dyn = np.array(data['global_dyn'], dtype=np.float32, copy=False)
+            visit = np.array(data['global_visit_count'], dtype=np.uint16, copy=False)
+            origin = np.array(data['global_origin'], dtype=np.float32, copy=False).reshape(-1)
+        except Exception:
+            return False
+
+        if occ.shape != (self.global_size, self.global_size):
+            return False
+        if seen.shape != (self.global_size, self.global_size):
+            return False
+        if dyn.shape != (self.global_size, self.global_size):
+            return False
+        if visit.shape != (self.global_size, self.global_size):
+            return False
+
+        # Apply loaded state
+        self.global_occupancy[:, :] = occ
+        self.global_seen[:, :] = seen
+        self.global_dyn[:, :] = dyn
+        self.global_visit_count[:, :] = visit
+        if origin.size >= 2 and np.isfinite(origin[0]) and np.isfinite(origin[1]):
+            self.global_origin = (float(origin[0]), float(origin[1]))
+        # Reset decay timestamp to now.
+        self._global_dyn_last_decay_ts = time.time()
+        return True
+
+    def _maybe_persist(self, settings):
+        if not self._persist_enabled(settings):
+            return
+        now = time.time()
+        # Load once (first time we see settings).
+        if not self._persist_loaded:
+            try:
+                self._persist_loaded = True
+                self.load_global_map(self._persist_path(settings))
+            except Exception:
+                pass
+        period = self._persist_period_s(settings)
+        if period <= 0:
+            return
+        if (now - float(self._persist_last_save_ts)) < period:
+            return
+        try:
+            self.save_global_map(self._persist_path(settings))
+            self._persist_last_save_ts = now
+        except Exception:
+            # Persistence should never kill nav loop
+            pass
 
     def _decay_global_dynamic(self, settings):
         """Decay dynamic occupancy layer over time."""
@@ -247,6 +383,13 @@ class Navigator:
 
         # Decay dynamic layer and mark local area around robot as observed for exploration.
         if self.global_enabled:
+            # mark visited
+            c = self._global_world_to_cell(x0, y0)
+            if c is not None:
+                try:
+                    self.global_visit_count[c[1], c[0]] = min(65535, int(self.global_visit_count[c[1], c[0]]) + 1)
+                except Exception:
+                    pass
             self._decay_global_dynamic(settings)
             try:
                 observe_m = float(settings.get('nav_observe_radius_m', 1.0))
@@ -342,6 +485,12 @@ class Navigator:
         except Exception:
             pass
 
+        # Persistence: load once (if enabled) and periodically save.
+        try:
+            self._maybe_persist(settings)
+        except Exception:
+            pass
+
         # Plan path if we have a goal
         if self.goal is None:
             return None
@@ -376,6 +525,10 @@ class Navigator:
             else:
                 path = self._astar(start, goal)
         if not path:
+            # If exploration is enabled and planning failed, allow immediate goal reselection next tick.
+            if self.global_enabled and explore_enabled and (not user_goal_present):
+                self._explore_goal_ts = 0.0
+                self._explore_last_dist = None
             return None
         # apply optional smoothing (simple moving average on the path)
         smooth = perception.get('settings', {}).get('smoothing', False)
@@ -398,9 +551,58 @@ class Navigator:
             replan_s = float(settings.get('nav_explore_replan_s', 2.0))
         except Exception:
             replan_s = 2.0
-        # Keep current explore goal for a bit to avoid thrashing.
-        if self._explore_goal_cell is not None and (now - self._explore_goal_ts) < replan_s:
-            return
+        # Goal lock/progress logic.
+        # Keep current goal if it's making progress; otherwise allow reselection.
+        try:
+            goal_reached_m = float(settings.get('nav_explore_goal_reached_m', 0.5))
+        except Exception:
+            goal_reached_m = 0.5
+        try:
+            progress_timeout_s = float(settings.get('nav_explore_progress_timeout_s', 4.0))
+        except Exception:
+            progress_timeout_s = 4.0
+        try:
+            progress_min_delta_m = float(settings.get('nav_explore_progress_min_delta_m', 0.15))
+        except Exception:
+            progress_min_delta_m = 0.15
+
+        # prune expired blacklist
+        try:
+            for k, until in list(self._explore_blacklist.items()):
+                if now >= float(until):
+                    self._explore_blacklist.pop(k, None)
+        except Exception:
+            pass
+
+        if self._explore_goal_cell is not None:
+            gw = self._global_cell_to_world(self._explore_goal_cell[0], self._explore_goal_cell[1])
+            if gw is not None:
+                dist = math.hypot(float(gw[0]) - float(pose_xy[0]), float(gw[1]) - float(pose_xy[1]))
+                # reached
+                if dist <= goal_reached_m:
+                    self._explore_goal_cell = None
+                    self._explore_last_dist = None
+                else:
+                    # initialize progress tracking
+                    if self._explore_last_dist is None:
+                        self._explore_last_dist = dist
+                        self._explore_progress_ts = now
+                        # keep locked for at least replan_s
+                        if (now - self._explore_goal_ts) < replan_s:
+                            return
+                    else:
+                        # progress check
+                        if (self._explore_last_dist - dist) >= progress_min_delta_m:
+                            self._explore_last_dist = dist
+                            self._explore_progress_ts = now
+                            if (now - self._explore_goal_ts) < replan_s:
+                                return
+                        else:
+                            # not enough progress
+                            if (now - self._explore_progress_ts) < progress_timeout_s and (now - self._explore_goal_ts) < replan_s:
+                                return
+                            # allow reselection
+                            self._explore_last_dist = dist
 
         start = self._global_world_to_cell(float(pose_xy[0]), float(pose_xy[1]))
         if start is None:
@@ -410,6 +612,8 @@ class Navigator:
         goal = self._select_frontier_goal(start, settings)
         self._explore_goal_cell = goal
         self._explore_goal_ts = now
+        self._explore_last_dist = None
+        self._explore_progress_ts = now
 
     def _select_frontier_goal(self, start_cell, settings):
         """Pick a frontier cell as an exploration goal.
@@ -470,16 +674,38 @@ class Navigator:
             self._last_frontier_stats = {'scanned': scanned, 'candidates': 0}
             return None
 
-        # Nearest in BFS order is already approximately nearest; still compute min distance.
+        # Score candidates using distance + visit penalty.
+        try:
+            visit_w = float(settings.get('nav_explore_visit_weight', 0.25))
+        except Exception:
+            visit_w = 0.25
         best = None
-        best_d2 = 1e18
+        best_score = 1e18
         for (cx, cy) in candidates:
-            d2 = (cx - sx) * (cx - sx) + (cy - sy) * (cy - sy)
-            if d2 < best_d2:
-                best_d2 = d2
+            if (cx, cy) in self._explore_blacklist:
+                continue
+            d = math.hypot(cx - sx, cy - sy)
+            try:
+                v = float(self.global_visit_count[cy, cx])
+            except Exception:
+                v = 0.0
+            score = d + visit_w * v
+            if score < best_score:
+                best_score = score
                 best = (cx, cy)
         self._last_frontier_stats = {'scanned': scanned, 'candidates': len(candidates)}
         return best
+
+    def blacklist_explore_goal(self, cell, cooldown_s=10.0):
+        """Temporarily blacklist a frontier cell (cx,cy) so exploration avoids it."""
+        try:
+            cx, cy = int(cell[0]), int(cell[1])
+        except Exception:
+            return
+        if not self._global_in_bounds(cx, cy):
+            return
+        until = time.time() + float(max(0.0, cooldown_s))
+        self._explore_blacklist[(cx, cy)] = until
 
     def _is_frontier_cell(self, cx, cy):
         if not self._global_in_bounds(cx, cy):

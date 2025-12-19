@@ -113,7 +113,41 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
                 </label>
             </div>
             <div class="card-b">
-                <video class="video" id="video" src="http://YOUR_PI_IP:8554" autoplay playsinline></video>
+                <img class="video" id="video" src="/video_feed" alt="Live rover camera" />
+
+                <div style="height:10px;"></div>
+
+                <div class="grid-2">
+                    <div class="field">
+                        <label>
+                            <span>Camera device</span>
+                            <input id="cam-device" type="text" value="/dev/video0" style="width:160px; padding:8px 10px; border-radius:10px; border:1px solid var(--border); background:rgba(0,0,0,0.18); color:var(--text);" />
+                        </label>
+                        <div class="hint" style="margin-top:6px;">Examples: <span class="val">/dev/video0</span> or <span class="val">0</span></div>
+                    </div>
+                    <div class="field">
+                        <label>
+                            <span>Resolution</span>
+                            <select id="cam-res" style="width:160px;">
+                                <option value="320x240">320×240</option>
+                                <option value="640x480" selected>640×480</option>
+                            </select>
+                        </label>
+                        <div class="hint" style="margin-top:6px;">Match your V4L2 supported sizes.</div>
+                    </div>
+                </div>
+
+                <div style="height:10px;"></div>
+
+                <div class="grid-2">
+                    <div class="field"><label><span>FPS</span><input id="cam-fps" type="number" step="1" min="1" max="60" value="20" list="cam-fps-list" /></label></div>
+                    <div class="field"><label><span>JPEG quality</span><input id="cam-q" type="number" step="1" min="20" max="95" value="80" /></label></div>
+                </div>
+
+                <datalist id="cam-fps-list"></datalist>
+
+                <div style="height:10px;"></div>
+                <button class="btn" id="cam-apply">Apply camera</button>
 
                 <div class="controls" aria-label="drive controls">
                     <button class="btn primary" id="btn-forward">Forward <span class="val">(W)</span></button>
@@ -214,6 +248,22 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
                     <div class="field"><label><span>Turn commit (s)</span><input id="t-nav-commit" type="number" step="0.05" min="0" max="3" value="0.55" /></label></div>
 
                     <div style="height:14px;"></div>
+                    <div class="badge" style="display:inline-block;">Yaw PID</div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Enable yaw PID</span><input id="t-pid-yaw" type="checkbox" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="grid-3">
+                        <div class="field"><label><span>Kp</span><input id="t-pid-kp" type="number" step="0.05" min="0" max="10" value="1.2" /></label></div>
+                        <div class="field"><label><span>Ki</span><input id="t-pid-ki" type="number" step="0.01" min="0" max="10" value="0.0" /></label></div>
+                        <div class="field"><label><span>Kd</span><input id="t-pid-kd" type="number" step="0.01" min="0" max="10" value="0.08" /></label></div>
+                    </div>
+                    <div style="height:10px;"></div>
+                    <div class="grid-2">
+                        <div class="field"><label><span>Output limit</span><input id="t-pid-out" type="number" step="0.05" min="0.05" max="1" value="1.0" /></label></div>
+                        <div class="field"><label><span>I clamp</span><input id="t-pid-ilim" type="number" step="0.05" min="0" max="5" value="0.6" /></label></div>
+                    </div>
+
+                    <div style="height:14px;"></div>
 
                     <div class="badge" style="display:inline-block;">Global exploration</div>
                     <div style="height:10px;"></div>
@@ -227,12 +277,41 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
                     <div style="height:10px;"></div>
                     <div class="field"><label><span>Frontier candidates</span><input id="t-nav-frontier-cand" type="number" step="1" min="1" max="500" value="50" /></label></div>
 
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Goal reached (m)</span><input id="t-nav-goal-reached" type="number" step="0.1" min="0.1" max="3" value="0.5" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Progress timeout (s)</span><input id="t-nav-prog-timeout" type="number" step="0.1" min="0.2" max="30" value="4.0" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Progress min delta (m)</span><input id="t-nav-prog-delta" type="number" step="0.05" min="0" max="5" value="0.15" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Visit weight</span><input id="t-nav-visit-w" type="number" step="0.05" min="0" max="10" value="0.25" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Blacklist on recovery (s)</span><input id="t-nav-blacklist" type="number" step="0.5" min="0" max="120" value="12.0" /></label></div>
+
                     <div style="height:14px;"></div>
                     <div class="badge" style="display:inline-block;">Planner budgets</div>
                     <div style="height:10px;"></div>
                     <div class="field"><label><span>Max expansions</span><input id="t-nav-maxexp" type="number" step="500" min="200" max="500000" value="12000" /></label></div>
                     <div style="height:10px;"></div>
                     <div class="field"><label><span>Max plan time (s)</span><input id="t-nav-maxtime" type="number" step="0.01" min="0" max="1" value="0.06" /></label></div>
+
+                    <div style="height:14px;"></div>
+                    <div class="badge" style="display:inline-block;">Dynamic obstacles</div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Half-life (s)</span><input id="t-nav-dyn-hl" type="number" step="0.5" min="0" max="120" value="6.0" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Block threshold</span><input id="t-nav-dyn-thresh" type="number" step="0.05" min="0.05" max="1" value="0.40" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Prune threshold</span><input id="t-nav-dyn-prune" type="number" step="0.01" min="0" max="0.5" value="0.05" /></label></div>
+
+                    <div style="height:14px;"></div>
+                    <div class="badge" style="display:inline-block;">Map persistence</div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Enable persistence</span><input id="t-nav-persist" type="checkbox" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Save period (s)</span><input id="t-nav-persist-period" type="number" step="0.5" min="0" max="300" value="5.0" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Save path</span><input id="t-nav-persist-path" type="text" value="nav_map_global.npz" /></label></div>
 
                     <div style="height:10px;"></div>
                     <div class="field">
@@ -558,14 +637,34 @@ fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(
         setNum('t-nav-turn', 'nav_turn_stop_deg');
         setNum('t-nav-goal', 'nav_goal_dist_m');
         setNum('t-nav-commit', 'nav_turn_commit_s');
+        const pidYawEl = document.getElementById('t-pid-yaw');
+        if (pidYawEl && typeof s.pid_yaw_enabled === 'boolean') pidYawEl.checked = s.pid_yaw_enabled;
+        setNum('t-pid-kp', 'pid_yaw_kp');
+        setNum('t-pid-ki', 'pid_yaw_ki');
+        setNum('t-pid-kd', 'pid_yaw_kd');
+        setNum('t-pid-out', 'pid_yaw_out_limit');
+        setNum('t-pid-ilim', 'pid_yaw_i_limit');
         const exploreEl = document.getElementById('t-nav-explore');
         if (exploreEl && typeof s.nav_explore_enabled === 'boolean') exploreEl.checked = s.nav_explore_enabled;
         setNum('t-nav-explore-replan', 'nav_explore_replan_s');
         setNum('t-nav-observe', 'nav_observe_radius_m');
         setNum('t-nav-frontier-scan', 'nav_explore_frontier_max_scan');
         setNum('t-nav-frontier-cand', 'nav_explore_frontier_candidates');
+        setNum('t-nav-goal-reached', 'nav_explore_goal_reached_m');
+        setNum('t-nav-prog-timeout', 'nav_explore_progress_timeout_s');
+        setNum('t-nav-prog-delta', 'nav_explore_progress_min_delta_m');
+        setNum('t-nav-visit-w', 'nav_explore_visit_weight');
+        setNum('t-nav-blacklist', 'nav_explore_blacklist_s');
         setNum('t-nav-maxexp', 'nav_plan_max_expansions');
         setNum('t-nav-maxtime', 'nav_plan_max_time_s');
+        setNum('t-nav-dyn-hl', 'nav_dyn_half_life_s');
+        setNum('t-nav-dyn-thresh', 'nav_dyn_thresh');
+        setNum('t-nav-dyn-prune', 'nav_dyn_prune_thresh');
+        const persistEl = document.getElementById('t-nav-persist');
+        if (persistEl && typeof s.nav_persist_enabled === 'boolean') persistEl.checked = s.nav_persist_enabled;
+        setNum('t-nav-persist-period', 'nav_persist_period_s');
+        const persistPathEl = document.getElementById('t-nav-persist-path');
+        if (persistPathEl && typeof s.nav_persist_path === 'string') persistPathEl.value = s.nav_persist_path;
         // IMU
         const imuToggle = document.getElementById('t-imu-enabled');
         if (imuToggle && typeof s.imu_enabled === 'boolean') imuToggle.checked = s.imu_enabled;
@@ -594,8 +693,105 @@ fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(
         setNum('t-rec-max', 'rec_max_attempts');
         const toggle = document.getElementById('smoothing-toggle');
         if (toggle && typeof s.smoothing === 'boolean') toggle.checked = s.smoothing;
+
+        // Camera stream settings
+        try {
+            const camDev = document.getElementById('cam-device');
+            const camRes = document.getElementById('cam-res');
+            const camFps = document.getElementById('cam-fps');
+            const camQ = document.getElementById('cam-q');
+            if (camDev && typeof s.cam_device === 'string') camDev.value = s.cam_device;
+            if (camFps && typeof s.cam_fps === 'number') camFps.value = s.cam_fps;
+            if (camQ && typeof s.cam_jpeg_quality === 'number') camQ.value = s.cam_jpeg_quality;
+            if (camRes && typeof s.cam_width === 'number' && typeof s.cam_height === 'number') {
+                const v = `${s.cam_width}x${s.cam_height}`;
+                // Only set if option exists; otherwise leave user's selection
+                if ([...camRes.options].some(o => o.value === v)) camRes.value = v;
+            }
+            refreshCameraCaps();
+            applyCameraStream(false);
+        } catch (e) {}
     }).catch(()=>{});
 }).catch(()=>{ setConnState(false); });
+
+
+function applyCameraStream(persist=true) {
+    const img = document.getElementById('video');
+    if (!img) return;
+    const dev = (document.getElementById('cam-device')?.value || '/dev/video0').trim();
+    const res = (document.getElementById('cam-res')?.value || '640x480').trim();
+    const fps = parseInt(document.getElementById('cam-fps')?.value || '20', 10);
+    const q = parseInt(document.getElementById('cam-q')?.value || '80', 10);
+    const parts = res.split('x');
+    const w = parseInt(parts[0] || '640', 10);
+    const h = parseInt(parts[1] || '480', 10);
+
+    // Update the stream URL (cache-bust so the browser reconnects)
+    const url = `/video_feed?device=${encodeURIComponent(dev)}&width=${encodeURIComponent(w)}&height=${encodeURIComponent(h)}&fps=${encodeURIComponent(fps)}&q=${encodeURIComponent(q)}&t=${Date.now()}`;
+    img.src = url;
+
+    if (!persist) return;
+    fetch('/settings', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ cam_device: dev, cam_width: w, cam_height: h, cam_fps: fps, cam_jpeg_quality: q })
+    }).catch(()=>{});
+}
+
+
+let cameraCapsCache = null;
+
+function updateFpsSuggestionsFromCaps() {
+    const list = document.getElementById('cam-fps-list');
+    const fpsEl = document.getElementById('cam-fps');
+    if (!list || !fpsEl) return;
+    list.innerHTML = '';
+    if (!cameraCapsCache || !Array.isArray(cameraCapsCache.sizes)) return;
+
+    const res = (document.getElementById('cam-res')?.value || '').trim();
+    const parts = res.split('x');
+    const w = parseInt(parts[0] || '0', 10);
+    const h = parseInt(parts[1] || '0', 10);
+    const match = cameraCapsCache.sizes.find(s => s.w === w && s.h === h);
+    const fpsList = (match && Array.isArray(match.fps)) ? match.fps : [];
+    for (const f of fpsList) {
+        const opt = document.createElement('option');
+        opt.value = String(Math.round(f));
+        list.appendChild(opt);
+    }
+}
+
+async function refreshCameraCaps() {
+    const dev = (document.getElementById('cam-device')?.value || '/dev/video0').trim();
+    const resEl = document.getElementById('cam-res');
+    if (!resEl) return;
+    try {
+        const r = await fetch(`/camera_caps?device=${encodeURIComponent(dev)}`);
+        if (!r.ok) return;
+        const caps = await r.json();
+        cameraCapsCache = caps;
+
+        if (caps && Array.isArray(caps.sizes) && caps.sizes.length) {
+            const current = resEl.value;
+            resEl.innerHTML = '';
+            for (const s of caps.sizes) {
+                if (!s || typeof s.w !== 'number' || typeof s.h !== 'number') continue;
+                const v = `${s.w}x${s.h}`;
+                const opt = document.createElement('option');
+                opt.value = v;
+                opt.textContent = `${s.w}×${s.h}`;
+                resEl.appendChild(opt);
+            }
+            // Preserve selection if possible
+            if ([...resEl.options].some(o => o.value === current)) resEl.value = current;
+        }
+
+        // Add FPS suggestions
+        updateFpsSuggestionsFromCaps();
+    } catch (e) {
+        // best-effort
+    }
+}
 
 // Navigation goal buttons
 document.getElementById('btn-nav-set').addEventListener('click', ()=>{
@@ -653,14 +849,35 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
         payload.nav_goal_dist_m = parseFloat(document.getElementById('t-nav-goal').value);
         payload.nav_turn_commit_s = parseFloat(document.getElementById('t-nav-commit').value);
 
+        // Yaw PID
+        payload.pid_yaw_enabled = !!document.getElementById('t-pid-yaw').checked;
+        payload.pid_yaw_kp = parseFloat(document.getElementById('t-pid-kp').value);
+        payload.pid_yaw_ki = parseFloat(document.getElementById('t-pid-ki').value);
+        payload.pid_yaw_kd = parseFloat(document.getElementById('t-pid-kd').value);
+        payload.pid_yaw_out_limit = parseFloat(document.getElementById('t-pid-out').value);
+        payload.pid_yaw_i_limit = parseFloat(document.getElementById('t-pid-ilim').value);
+
         // Exploration + budgets
         payload.nav_explore_enabled = !!document.getElementById('t-nav-explore').checked;
         payload.nav_explore_replan_s = parseFloat(document.getElementById('t-nav-explore-replan').value);
         payload.nav_observe_radius_m = parseFloat(document.getElementById('t-nav-observe').value);
         payload.nav_explore_frontier_max_scan = parseInt(document.getElementById('t-nav-frontier-scan').value, 10);
         payload.nav_explore_frontier_candidates = parseInt(document.getElementById('t-nav-frontier-cand').value, 10);
+        payload.nav_explore_goal_reached_m = parseFloat(document.getElementById('t-nav-goal-reached').value);
+        payload.nav_explore_progress_timeout_s = parseFloat(document.getElementById('t-nav-prog-timeout').value);
+        payload.nav_explore_progress_min_delta_m = parseFloat(document.getElementById('t-nav-prog-delta').value);
+        payload.nav_explore_visit_weight = parseFloat(document.getElementById('t-nav-visit-w').value);
+        payload.nav_explore_blacklist_s = parseFloat(document.getElementById('t-nav-blacklist').value);
         payload.nav_plan_max_expansions = parseInt(document.getElementById('t-nav-maxexp').value, 10);
         payload.nav_plan_max_time_s = parseFloat(document.getElementById('t-nav-maxtime').value);
+        payload.nav_dyn_half_life_s = parseFloat(document.getElementById('t-nav-dyn-hl').value);
+        payload.nav_dyn_thresh = parseFloat(document.getElementById('t-nav-dyn-thresh').value);
+        payload.nav_dyn_prune_thresh = parseFloat(document.getElementById('t-nav-dyn-prune').value);
+
+        // Map persistence
+        payload.nav_persist_enabled = !!document.getElementById('t-nav-persist').checked;
+        payload.nav_persist_period_s = parseFloat(document.getElementById('t-nav-persist-period').value);
+        payload.nav_persist_path = (document.getElementById('t-nav-persist-path').value || '').trim();
 
         // IMU settings (autonomy only)
         payload.imu_enabled = !!document.getElementById('t-imu-enabled').checked;
@@ -694,6 +911,19 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
     fetch('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
         .then(r=>r.json()).then(js=>{ console.log('settings updated', js); })
         .catch(()=>{ alert('Failed to apply tuning'); });
+});
+
+// Camera apply
+document.getElementById('cam-apply').addEventListener('click', ()=>{
+    applyCameraStream(true);
+});
+
+// Auto-refresh caps when device/res changes
+document.getElementById('cam-device').addEventListener('change', ()=>{
+    refreshCameraCaps();
+});
+document.getElementById('cam-res').addEventListener('change', ()=>{
+    updateFpsSuggestionsFromCaps();
 });
 
 // Gamepad support
