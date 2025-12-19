@@ -3,6 +3,7 @@ import time
 import threading
 import json
 from pathlib import Path
+import io
 
 from motor_control import MotorController
 
@@ -67,6 +68,18 @@ SETTINGS = {
     'imu_dlpf_cfg': 3,
     'imu_sample_div': 4,
     'imu_gyro_calib_seconds': 1.0,
+
+    # Navigation exploration (global world-frame)
+    # When enabled, Navigator will auto-pick frontier goals when no /nav_goal is set.
+    'nav_explore_enabled': False,
+    'nav_explore_replan_s': 2.0,
+    'nav_explore_frontier_max_scan': 8000,
+    'nav_explore_frontier_candidates': 50,
+    # Mark observed radius around robot for "known" vs "unknown" (meters)
+    'nav_observe_radius_m': 1.0,
+    # Planning budgets to prevent stalls
+    'nav_plan_max_expansions': 12000,
+    'nav_plan_max_time_s': 0.06,
 }
 
 SETTINGS_PATH = Path(__file__).with_name('settings.json')
@@ -200,6 +213,17 @@ def _apply_settings_ranges():
     SETTINGS['nav_turn_stop_deg'] = _clamp(SETTINGS.get('nav_turn_stop_deg', 30.0), 0.0, 180.0)
     SETTINGS['nav_goal_dist_m'] = _clamp(SETTINGS.get('nav_goal_dist_m', 1.2), 0.2, 5.0)
     SETTINGS['nav_turn_commit_s'] = _clamp(SETTINGS.get('nav_turn_commit_s', 0.55), 0.0, 3.0)
+
+    # Exploration
+    SETTINGS['nav_explore_enabled'] = bool(SETTINGS.get('nav_explore_enabled', False))
+    SETTINGS['nav_explore_replan_s'] = _clamp(SETTINGS.get('nav_explore_replan_s', 2.0), 0.2, 30.0)
+    SETTINGS['nav_explore_frontier_max_scan'] = _clamp_int(SETTINGS.get('nav_explore_frontier_max_scan', 8000), 500, 200000)
+    SETTINGS['nav_explore_frontier_candidates'] = _clamp_int(SETTINGS.get('nav_explore_frontier_candidates', 50), 1, 500)
+    SETTINGS['nav_observe_radius_m'] = _clamp(SETTINGS.get('nav_observe_radius_m', 1.0), 0.2, 10.0)
+
+    # Planning budgets
+    SETTINGS['nav_plan_max_expansions'] = _clamp_int(SETTINGS.get('nav_plan_max_expansions', 12000), 200, 500000)
+    SETTINGS['nav_plan_max_time_s'] = _clamp(SETTINGS.get('nav_plan_max_time_s', 0.06), 0.0, 1.0)
 
 
 _load_settings_from_disk()
@@ -414,6 +438,51 @@ def status():
             'nav_goal': NAV_GOAL,
             'decision': decision_debug,
         })
+
+
+@app.route('/debug/global_map.png')
+def debug_global_map_png():
+    """Render a lightweight global map PNG (seen vs occupied).
+
+    This is best-effort debug output using the most recent `/log` payload.
+    """
+    try:
+        import numpy as np
+        import cv2
+        from flask import Response
+
+        # Try to read optional raw arrays from log if present (not currently sent).
+        # Fallback: just render a blank image with whatever info we have.
+        # Note: global grids live inside Navigator; we don't have them here unless
+        # you later decide to stream them via /log.
+        img = np.zeros((240, 240, 3), dtype=np.uint8)
+        img[:] = (10, 10, 14)
+
+        txt = 'global map: (not streamed)'
+        try:
+            p = (latest_log or {}).get('perception', {}) if isinstance(latest_log, dict) else {}
+            nd = p.get('nav_debug') if isinstance(p, dict) else None
+            if isinstance(nd, dict):
+                plan = nd.get('plan')
+                front = nd.get('frontier')
+                eg = nd.get('explore_goal_world')
+                txt = f"plan={plan} frontier={front} explore_goal={eg}"
+        except Exception:
+            pass
+
+        cv2.putText(img, 'Navigator global map', (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 230), 1)
+        # Wrap long debug string
+        y = 48
+        for chunk in [txt[i:i+52] for i in range(0, len(txt), 52)]:
+            cv2.putText(img, chunk, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170, 170, 180), 1)
+            y += 18
+
+        ok, buf = cv2.imencode('.png', img)
+        if not ok:
+            return ('encode_failed', 500)
+        return Response(buf.tobytes(), mimetype='image/png')
+    except Exception:
+        return ('unavailable', 500)
 
 
 @app.route('/nav_goal', methods=['GET', 'POST', 'DELETE'])

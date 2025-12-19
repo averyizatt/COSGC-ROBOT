@@ -181,16 +181,20 @@ def main():
                 if isinstance(pose, dict) and 'x' in pose and 'y' in pose:
                     x0 = float(pose['x']); y0 = float(pose.get('y', 0.0))
                     yaw = float(pose.get('yaw', 0.0))
+                    explore_enabled = bool(settings_cache.get('nav_explore_enabled', False))
                     # Prefer a user-provided goal if present.
                     if isinstance(nav_goal_cache, dict) and 'x' in nav_goal_cache and 'y' in nav_goal_cache:
                         nav.set_goal(float(nav_goal_cache['x']), float(nav_goal_cache['y']))
                         perception['nav_goal'] = {'x': float(nav_goal_cache['x']), 'y': float(nav_goal_cache['y'])}
-                    else:
+                    elif not explore_enabled:
                         nav_goal_dist_m = float(settings_cache.get('nav_goal_dist_m', nav_goal_dist_m))
                         gx = x0 + nav_goal_dist_m * math.cos(yaw)
                         gy = y0 + nav_goal_dist_m * math.sin(yaw)
                         nav.set_goal(gx, gy)
                         perception['nav_goal'] = {'x': gx, 'y': gy}
+                    else:
+                        # Exploration mode: let Navigator auto-pick a frontier goal.
+                        perception['nav_goal'] = None
             except Exception:
                 pass
 

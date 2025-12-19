@@ -73,6 +73,14 @@ class OverlayDrawer:
         log = {
             'timestamp': float(perception.get('timestamp', 0.0)),
             'decision': decision,
+            'perception': {
+                'slam_pose': perception.get('slam_pose'),
+                'nav_goal': perception.get('nav_goal'),
+                'nav_target': perception.get('nav_target'),
+                'nav_debug': perception.get('nav_debug'),
+                'imu': perception.get('imu'),
+                'distance_cm': perception.get('distance_cm'),
+            },
             'obstacles': perception.get('obstacles', []),
             'boundary': perception.get('boundary', {}),
             'terrain': perception.get('terrain', {})
