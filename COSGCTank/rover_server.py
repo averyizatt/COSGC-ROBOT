@@ -7,7 +7,20 @@ from motor_control import MotorController
 app = Flask(__name__, template_folder="templates")
 
 # Motor controller (abstracted)
-motor = MotorController()
+# DRV8833 pinout (BCM):
+#   BIN1 (BN1)  -> GPIO 23
+#   BIN2 (BN2)  -> GPIO 18
+#   STBY/SLEEP  -> GPIO 4
+#   AIN2 (AN2)  -> GPIO 27
+#   AIN1 (AN1)  -> GPIO 17
+#
+# If forward/back are swapped on your wiring, toggle invert_left/invert_right.
+motor = MotorController(
+    pins={"AIN1": 17, "AIN2": 27, "BIN1": 23, "BIN2": 18, "STBY": 4},
+    invert_left=True,
+    invert_right=True,
+    pwm_mode='in_pins',
+)
 
 # Keepalive / watchdog state
 _last_keepalive = {}
