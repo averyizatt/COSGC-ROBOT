@@ -12,7 +12,12 @@ into steering advice.
 import math
 import numpy as np
 import heapq
-from . import dynamic
+
+# Allow this module to work both as a package import and as a script import.
+try:
+    from . import dynamic  # type: ignore
+except Exception:
+    import dynamic  # type: ignore
 
 
 class Navigator:
@@ -27,6 +32,46 @@ class Navigator:
         self.goal = None
         # dynamic obstacle tracker
         self.dynamic = dynamic.Manager(max_age=1.2, match_dist=0.8)
+
+        # Global map (world-frame) occupancy for maze-like planning.
+        # This is a coarse grid that accumulates obstacles over time.
+        self.global_enabled = True
+        self.global_size = 200  # cells across
+        self.global_res = self.resolution  # meters per cell
+        self.global_half = self.global_size // 2
+        self.global_occupancy = np.zeros((self.global_size, self.global_size), dtype=np.uint8)
+        # World coordinate that maps to the center cell of global map (origin anchor)
+        self.global_origin = None  # (x0, y0)
+
+    def _global_world_to_cell(self, x, y):
+        if self.global_origin is None:
+            return None
+        dx = x - self.global_origin[0]
+        dy = y - self.global_origin[1]
+        cx = int(round(dx / self.global_res)) + self.global_half
+        cy = int(round(dy / self.global_res)) + self.global_half
+        if 0 <= cx < self.global_size and 0 <= cy < self.global_size:
+            return (cx, cy)
+        return None
+
+    def _global_cell_to_world(self, cx, cy):
+        if self.global_origin is None:
+            return None
+        dx = (cx - self.global_half) * self.global_res
+        dy = (cy - self.global_half) * self.global_res
+        return (self.global_origin[0] + dx, self.global_origin[1] + dy)
+
+    def _global_mark_occupied(self, x, y, radius_cells=1):
+        c = self._global_world_to_cell(x, y)
+        if c is None:
+            return
+        cx, cy = c
+        r = int(max(0, radius_cells))
+        x0 = max(0, cx - r)
+        x1 = min(self.global_size - 1, cx + r)
+        y0 = max(0, cy - r)
+        y1 = min(self.global_size - 1, cy + r)
+        self.global_occupancy[y0:y1+1, x0:x1+1] = 1
 
     def world_to_cell(self, x, y, origin):
         """Convert world coords to grid cell indices. origin is the center world (x0,y0)."""
@@ -80,6 +125,10 @@ class Navigator:
         origin = (x0, y0)
         self.clear_grid()
 
+        # Initialize global map anchor at first valid pose.
+        if self.global_enabled and self.global_origin is None:
+            self.global_origin = (x0, y0)
+
         # record trajectory point
         self.trajectory.append((x0, y0))
         if len(self.trajectory) > 500:
@@ -102,6 +151,8 @@ class Navigator:
             cx, cy = self.world_to_cell(ox, oy, origin)
             if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
                 self.occupancy[cy, cx] = 1
+            if self.global_enabled:
+                self._global_mark_occupied(ox, oy, radius_cells=1)
 
         # dynamic obstacle detections (world coords) - update trackers and mark predicted positions
         dyn = perception.get('dynamic_detections')
@@ -116,6 +167,8 @@ class Navigator:
             cx, cy = self.world_to_cell(px, py, origin)
             if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
                 self.occupancy[cy, cx] = 1
+            if self.global_enabled:
+                self._global_mark_occupied(px, py, radius_cells=1)
 
         # also mark ultrasonic obstacle in front if provided
         d = perception.get('distance_cm')
@@ -127,13 +180,31 @@ class Navigator:
             cx, cy = self.world_to_cell(ox, oy, origin)
             if 0 <= cx < self.grid_size and 0 <= cy < self.grid_size:
                 self.occupancy[cy, cx] = 1
+            if self.global_enabled:
+                self._global_mark_occupied(ox, oy, radius_cells=1)
 
         # Plan path if we have a goal
         if self.goal is None:
             return None
-        start = self.world_to_cell(x0, y0, origin)
-        goal = self.world_to_cell(self.goal[0], self.goal[1], origin)
-        path = self._astar(start, goal)
+        # Choose planning grid: global when goal is set, local otherwise.
+        use_global = self.global_enabled and (self.goal is not None)
+        planner = (perception.get('settings', {}) or {}).get('nav_planner', 'astar')
+        if use_global and self.global_origin is not None:
+            start = self._global_world_to_cell(x0, y0)
+            goal = self._global_world_to_cell(self.goal[0], self.goal[1])
+            if start is None or goal is None:
+                return None
+            if str(planner).lower() == 'bfs':
+                path = self._bfs_global(start, goal)
+            else:
+                path = self._astar_global(start, goal)
+        else:
+            start = self.world_to_cell(x0, y0, origin)
+            goal = self.world_to_cell(self.goal[0], self.goal[1], origin)
+            if str(planner).lower() == 'bfs':
+                path = self._bfs(start, goal)
+            else:
+                path = self._astar(start, goal)
         if not path:
             return None
         # apply optional smoothing (simple moving average on the path)
@@ -142,8 +213,88 @@ class Navigator:
             path = self.smooth_path(path)
         # convert first path cell to world target
         next_cell = path[0]
+        if use_global:
+            w = self._global_cell_to_world(next_cell[0], next_cell[1])
+            if w is None:
+                return None
+            return w
         tx, ty = self.cell_to_world(next_cell[0], next_cell[1], origin)
         return (tx, ty)
+
+    def _astar_global(self, start, goal):
+        # A* on global occupancy grid
+        sx, sy = start
+        gx, gy = goal
+        if self.global_occupancy[sy, sx] == 1 or self.global_occupancy[gy, gx] == 1:
+            return None
+        closed = set()
+        came_from = {}
+        gscore = {start: 0}
+        fscore = {start: math.hypot(start[0]-goal[0], start[1]-goal[1])}
+        heap = [(fscore[start], start)]
+        while heap:
+            _, current = heapq.heappop(heap)
+            if current == goal:
+                path = []
+                node = current
+                while node != start:
+                    path.append(node)
+                    node = came_from[node]
+                path.reverse()
+                return path
+            closed.add(current)
+            x, y = current
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1)]:
+                nb = (x+dx, y+dy)
+                nx, ny = nb
+                if not (0 <= nx < self.global_size and 0 <= ny < self.global_size):
+                    continue
+                if self.global_occupancy[ny, nx] == 1:
+                    continue
+                tentative = gscore[current] + math.hypot(dx, dy)
+                if nb in closed and tentative >= gscore.get(nb, 1e9):
+                    continue
+                if tentative < gscore.get(nb, 1e9):
+                    came_from[nb] = current
+                    gscore[nb] = tentative
+                    fscore[nb] = tentative + math.hypot(nx-goal[0], ny-goal[1])
+                    heapq.heappush(heap, (fscore[nb], nb))
+        return None
+
+    def _bfs_global(self, start, goal):
+        # BFS on global occupancy grid (4-neighborhood)
+        sx, sy = start
+        gx, gy = goal
+        if self.global_occupancy[sy, sx] == 1 or self.global_occupancy[gy, gx] == 1:
+            return None
+        from collections import deque
+        q = deque([start])
+        came_from = {start: None}
+        while q:
+            cur = q.popleft()
+            if cur == goal:
+                break
+            x, y = cur
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nb = (x+dx, y+dy)
+                nx, ny = nb
+                if not (0 <= nx < self.global_size and 0 <= ny < self.global_size):
+                    continue
+                if nb in came_from:
+                    continue
+                if self.global_occupancy[ny, nx] == 1:
+                    continue
+                came_from[nb] = cur
+                q.append(nb)
+        if goal not in came_from:
+            return None
+        path = []
+        node = goal
+        while node is not None and node != start:
+            path.append(node)
+            node = came_from[node]
+        path.reverse()
+        return path
 
     def smooth_path(self, path, window=3):
         """Simple smoothing: apply a sliding window average to the path cell list.
@@ -217,3 +368,52 @@ class Navigator:
                     fscore[nb] = tentative + self._heuristic(nb, goal)
                     heapq.heappush(heap, (fscore[nb], nb))
         return None
+
+    # ---------- BFS implementation ----------
+    def _bfs(self, start, goal):
+        """Breadth-first search on the occupancy grid.
+
+        Note: BFS finds the shortest path in number of steps (not weighted distance).
+        We use 4-neighborhood for more stable maze behavior.
+        """
+        sx, sy = start
+        gx, gy = goal
+        if not (0 <= sx < self.grid_size and 0 <= sy < self.grid_size):
+            return None
+        if not (0 <= gx < self.grid_size and 0 <= gy < self.grid_size):
+            return None
+        if self.occupancy[sy, sx] == 1 or self.occupancy[gy, gx] == 1:
+            return None
+
+        from collections import deque
+
+        q = deque([start])
+        came_from = {start: None}
+        while q:
+            cur = q.popleft()
+            if cur == goal:
+                break
+            x, y = cur
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nb = (x + dx, y + dy)
+                nx, ny = nb
+                if not (0 <= nx < self.grid_size and 0 <= ny < self.grid_size):
+                    continue
+                if nb in came_from:
+                    continue
+                if self.occupancy[ny, nx] == 1:
+                    continue
+                came_from[nb] = cur
+                q.append(nb)
+
+        if goal not in came_from:
+            return None
+
+        # reconstruct path (excluding start)
+        path = []
+        node = goal
+        while node is not None and node != start:
+            path.append(node)
+            node = came_from[node]
+        path.reverse()
+        return path

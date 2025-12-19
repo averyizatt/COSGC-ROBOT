@@ -41,6 +41,9 @@ def main():
     from navigator import Navigator
     from scale_estimator import ScaleEstimator
     nav = Navigator(grid_size=40, resolution=0.2)
+    # Default local navigation behavior: keep a short-horizon goal ahead.
+    # This makes the planner generate a corridor-following waypoint even without a global map.
+    nav_goal_dist_m = 1.2
     scale_est = ScaleEstimator(window=80)
 
     frame_iter = provider.frames()
@@ -49,6 +52,9 @@ def main():
     # settings cache (poll /settings periodically)
     settings_cache = {'smoothing': True}
     settings_last = 0.0
+
+    nav_goal_cache = None
+    nav_goal_last = 0.0
 
     # IMU (MPU-6050 / GY-521)
     imu = None
@@ -90,6 +96,16 @@ def main():
             except Exception:
                 pass
             perception['settings'] = settings_cache
+
+            # fetch navigation goal (if set) at most twice per second
+            try:
+                if time.time() - nav_goal_last > 0.5:
+                    r = requests.get('http://127.0.0.1:5000/nav_goal', timeout=0.25)
+                    if r.status_code == 200:
+                        nav_goal_cache = (r.json() or {}).get('nav_goal')
+                    nav_goal_last = time.time()
+            except Exception:
+                pass
 
             # IMU setup/use (best-effort)
             try:
@@ -146,6 +162,69 @@ def main():
             except Exception:
                 pass
 
+            # poll SLAM bridge for current pose (if running)
+            try:
+                import requests as _req
+                resp = _req.get('http://127.0.0.1:5001/pose', timeout=0.05)
+                if resp.status_code == 200:
+                    perception['slam_pose'] = resp.json().get('pose')
+                else:
+                    perception['slam_pose'] = None
+            except Exception:
+                perception['slam_pose'] = None
+
+            # Set a short-horizon goal ahead of the rover when SLAM pose is available.
+            # This is a local planner use-case (not global maze solving), but enables BFS/A* to
+            # route around locally marked obstacles consistently across all autonomous modes.
+            try:
+                pose = perception.get('slam_pose')
+                if isinstance(pose, dict) and 'x' in pose and 'y' in pose:
+                    x0 = float(pose['x']); y0 = float(pose.get('y', 0.0))
+                    yaw = float(pose.get('yaw', 0.0))
+                    # Prefer a user-provided goal if present.
+                    if isinstance(nav_goal_cache, dict) and 'x' in nav_goal_cache and 'y' in nav_goal_cache:
+                        nav.set_goal(float(nav_goal_cache['x']), float(nav_goal_cache['y']))
+                        perception['nav_goal'] = {'x': float(nav_goal_cache['x']), 'y': float(nav_goal_cache['y'])}
+                    else:
+                        nav_goal_dist_m = float(settings_cache.get('nav_goal_dist_m', nav_goal_dist_m))
+                        gx = x0 + nav_goal_dist_m * math.cos(yaw)
+                        gy = y0 + nav_goal_dist_m * math.sin(yaw)
+                        nav.set_goal(gx, gy)
+                        perception['nav_goal'] = {'x': gx, 'y': gy}
+            except Exception:
+                pass
+
+            # build dynamic detections list (estimate world positions from obstacle boxes)
+            dyn_dets = []
+            try:
+                pose = perception.get('slam_pose')
+                if pose is not None and 'x' in pose and 'y' in pose:
+                    x0 = float(pose['x']); y0 = float(pose.get('y', 0.0))
+                    yaw = float(pose.get('yaw', 0.0))
+                    for obj in obstacles:
+                        box = obj.get('box', [0,0,0,0])
+                        ymin = float(box[0])
+                        est_dist = 0.3 + (1.0 - min(max(ymin, 0.0), 1.0)) * 3.2
+                        center_x = (box[1] + box[3]) / 2.0
+                        angle_image = (center_x - 0.5) * (math.radians(70))
+                        ox = x0 + est_dist * math.cos(yaw + angle_image)
+                        oy = y0 + est_dist * math.sin(yaw + angle_image)
+                        dyn_dets.append((ox, oy))
+            except Exception:
+                dyn_dets = []
+            perception['dynamic_detections'] = dyn_dets
+
+            # Provide perception to navigator and get navigation target
+            try:
+                nav_target = nav.update(perception)
+            except Exception:
+                nav_target = None
+
+            if nav_target is not None:
+                perception['nav_target'] = {'x': nav_target[0], 'y': nav_target[1]}
+            else:
+                perception['nav_target'] = None
+
             decision = decider.decide(perception)
 
             # execute mapped motor action
@@ -179,47 +258,6 @@ def main():
             # send log asynchronously (best-effort)
             log = overlay.export_log(perception, decision)
             send_log_to_server(log)
-            # poll SLAM bridge for current pose (if running)
-            try:
-                import requests as _req
-                resp = _req.get('http://127.0.0.1:5001/pose', timeout=0.05)
-                if resp.status_code == 200:
-                    perception['slam_pose'] = resp.json().get('pose')
-                else:
-                    perception['slam_pose'] = None
-            except Exception:
-                perception['slam_pose'] = None
-
-            # build dynamic detections list (estimate world positions from obstacle boxes)
-            dyn_dets = []
-            try:
-                pose = perception.get('slam_pose')
-                if pose is not None and 'x' in pose and 'y' in pose:
-                    x0 = float(pose['x']); y0 = float(pose.get('y', 0.0))
-                    yaw = float(pose.get('yaw', 0.0))
-                    for obj in obstacles:
-                        box = obj.get('box', [0,0,0,0])
-                        ymin = float(box[0])
-                        est_dist = 0.3 + (1.0 - min(max(ymin, 0.0), 1.0)) * 3.2
-                        center_x = (box[1] + box[3]) / 2.0
-                        angle_image = (center_x - 0.5) * (math.radians(70))
-                        ox = x0 + est_dist * math.cos(yaw + angle_image)
-                        oy = y0 + est_dist * math.sin(yaw + angle_image)
-                        dyn_dets.append((ox, oy))
-            except Exception:
-                dyn_dets = []
-            perception['dynamic_detections'] = dyn_dets
-
-            # Provide perception to navigator and get navigation target
-            try:
-                nav_target = nav.update(perception)
-            except Exception:
-                nav_target = None
-
-            # If the navigation module returned a target, expose in decision dict
-            if nav_target is not None:
-                # include navigation suggestion for downstream use
-                decision['nav_target'] = {'x': nav_target[0], 'y': nav_target[1]}
 
             # Try to compute a scale sample if slam pose delta and measured movement exists
             try:

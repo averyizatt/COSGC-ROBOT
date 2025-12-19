@@ -194,6 +194,41 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
 
                     <div style="height:10px;"></div>
 
+                    <div class="badge" style="display:inline-block;">Navigation</div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Planner</span>
+                        <select id="t-nav-planner" style="width:140px;">
+                            <option value="astar">A*</option>
+                            <option value="bfs">BFS</option>
+                        </select>
+                    </label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Heading aware</span><input id="t-nav-heading" type="checkbox" checked /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Adjust threshold (deg)</span><input id="t-nav-adjust" type="number" step="1" min="0" max="90" value="10" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Turn threshold (deg)</span><input id="t-nav-turn" type="number" step="1" min="0" max="180" value="30" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Goal distance (m)</span><input id="t-nav-goal" type="number" step="0.1" min="0.2" max="5" value="1.2" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Turn commit (s)</span><input id="t-nav-commit" type="number" step="0.05" min="0" max="3" value="0.55" /></label></div>
+
+                    <div style="height:10px;"></div>
+                    <div class="field">
+                        <label><span>Nav goal X (m)</span><input id="t-nav-x" type="number" step="0.1" value="0" /></label>
+                    </div>
+                    <div style="height:10px;"></div>
+                    <div class="field">
+                        <label><span>Nav goal Y (m)</span><input id="t-nav-y" type="number" step="0.1" value="0" /></label>
+                    </div>
+                    <div style="height:10px;"></div>
+                    <div class="grid-2">
+                        <button class="btn" id="btn-nav-set">Set goal</button>
+                        <button class="btn" id="btn-nav-clear">Clear goal</button>
+                    </div>
+
+                    <div style="height:10px;"></div>
+
                     <div class="field">
                         <label>
                             <span>IMU enabled (MPU-6050)</span>
@@ -212,6 +247,36 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
                     <div class="field"><label><span>Sample div (0-255)</span><input id="t-imu-div" type="number" step="1" min="0" max="255" value="4" /></label></div>
                     <div style="height:10px;"></div>
                     <div class="field"><label><span>Gyro calib seconds</span><input id="t-imu-calib" type="number" step="0.1" min="0.2" max="10" value="1.0" /></label></div>
+
+                    <div style="height:14px;"></div>
+                    <div class="badge" style="display:inline-block;">IMU decision safety</div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Tilt slow roll (deg)</span><input id="t-imu-roll-slow" type="number" step="0.5" min="0" max="60" value="18" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Tilt slow pitch (deg)</span><input id="t-imu-pitch-slow" type="number" step="0.5" min="0" max="60" value="18" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Tilt stop roll (deg)</span><input id="t-imu-roll-stop" type="number" step="0.5" min="0" max="80" value="28" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Tilt stop pitch (deg)</span><input id="t-imu-pitch-stop" type="number" step="0.5" min="0" max="80" value="28" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Gyro jolt threshold (rad/s)</span><input id="t-imu-jolt" type="number" step="0.1" min="0.1" max="30" value="3.5" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Jolt cooldown (s)</span><input id="t-imu-jolt-cd" type="number" step="0.1" min="0" max="10" value="1.0" /></label></div>
+
+                    <div style="height:14px;"></div>
+                    <div class="badge" style="display:inline-block;">Recovery (stuck escape)</div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Enable recovery</span><input id="t-rec-enabled" type="checkbox" checked /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Reverse time (s)</span><input id="t-rec-rev" type="number" step="0.05" min="0.05" max="2" value="0.55" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Turn time (s)</span><input id="t-rec-turn" type="number" step="0.05" min="0.05" max="3" value="0.65" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Forward time (s)</span><input id="t-rec-fwd" type="number" step="0.05" min="0.05" max="3" value="0.70" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Cooldown (s)</span><input id="t-rec-cd" type="number" step="0.1" min="0" max="10" value="1.0" /></label></div>
+                    <div style="height:10px;"></div>
+                    <div class="field"><label><span>Max attempts</span><input id="t-rec-max" type="number" step="1" min="0" max="20" value="4" /></label></div>
                 </div>
 
                 <div class="grid-2">
@@ -431,6 +496,11 @@ setInterval(()=>{
 // initial status probe
 fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); setModeUI(js.mode||'rc');
     setImuStatus(js.imu);
+    // populate nav goal inputs if present
+    try {
+        if (js.nav_goal && typeof js.nav_goal.x === 'number') document.getElementById('t-nav-x').value = js.nav_goal.x;
+        if (js.nav_goal && typeof js.nav_goal.y === 'number') document.getElementById('t-nav-y').value = js.nav_goal.y;
+    } catch (e) {}
     // load settings from server to populate tuning UI (survives reboot)
     fetch('/settings').then(r=>r.json()).then(s=>{
         // RC
@@ -458,6 +528,15 @@ fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(
         setNum('t-autospeed-slow', 'auto_speed_slow');
         setNum('t-autospeed-turn', 'auto_speed_turn');
         setNum('t-autospeed-stuck', 'auto_speed_stuck');
+        // Navigation
+        const plannerEl = document.getElementById('t-nav-planner');
+        if (plannerEl && typeof s.nav_planner === 'string') plannerEl.value = s.nav_planner;
+        const headingEl = document.getElementById('t-nav-heading');
+        if (headingEl && typeof s.nav_heading_enabled === 'boolean') headingEl.checked = s.nav_heading_enabled;
+        setNum('t-nav-adjust', 'nav_turn_adjust_deg');
+        setNum('t-nav-turn', 'nav_turn_stop_deg');
+        setNum('t-nav-goal', 'nav_goal_dist_m');
+        setNum('t-nav-commit', 'nav_turn_commit_s');
         // IMU
         const imuToggle = document.getElementById('t-imu-enabled');
         if (imuToggle && typeof s.imu_enabled === 'boolean') imuToggle.checked = s.imu_enabled;
@@ -469,10 +548,41 @@ fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(
         setNum('t-imu-dlpf', 'imu_dlpf_cfg');
         setNum('t-imu-div', 'imu_sample_div');
         setNum('t-imu-calib', 'imu_gyro_calib_seconds');
+        setNum('t-imu-roll-slow', 'dec_imu_roll_slow_deg');
+        setNum('t-imu-pitch-slow', 'dec_imu_pitch_slow_deg');
+        setNum('t-imu-roll-stop', 'dec_imu_roll_stop_deg');
+        setNum('t-imu-pitch-stop', 'dec_imu_pitch_stop_deg');
+        setNum('t-imu-jolt', 'dec_imu_gyro_jolt_rps');
+        setNum('t-imu-jolt-cd', 'dec_imu_jolt_cooldown_s');
+
+        // Recovery
+        const recToggle = document.getElementById('t-rec-enabled');
+        if (recToggle && typeof s.rec_enabled === 'boolean') recToggle.checked = s.rec_enabled;
+        setNum('t-rec-rev', 'rec_reverse_s');
+        setNum('t-rec-turn', 'rec_turn_s');
+        setNum('t-rec-fwd', 'rec_forward_s');
+        setNum('t-rec-cd', 'rec_cooldown_s');
+        setNum('t-rec-max', 'rec_max_attempts');
         const toggle = document.getElementById('smoothing-toggle');
         if (toggle && typeof s.smoothing === 'boolean') toggle.checked = s.smoothing;
     }).catch(()=>{});
 }).catch(()=>{ setConnState(false); });
+
+// Navigation goal buttons
+document.getElementById('btn-nav-set').addEventListener('click', ()=>{
+    if (currentMode === 'rc') { alert('Switch to an autonomous mode to set goal'); return; }
+    const x = parseFloat(document.getElementById('t-nav-x').value);
+    const y = parseFloat(document.getElementById('t-nav-y').value);
+    fetch('/nav_goal', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({x, y})})
+        .then(r=>r.json()).then(js=>{ console.log('nav_goal set', js); })
+        .catch(()=>{ alert('Failed to set nav goal'); });
+});
+
+document.getElementById('btn-nav-clear').addEventListener('click', ()=>{
+    fetch('/nav_goal', {method:'DELETE'})
+        .then(r=>r.json()).then(js=>{ console.log('nav_goal cleared', js); })
+        .catch(()=>{ alert('Failed to clear nav goal'); });
+});
 
 // smoothing toggle handler
 document.getElementById('smoothing-toggle').addEventListener('change', (ev)=>{
@@ -506,6 +616,14 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
         payload.auto_speed_turn = parseFloat(document.getElementById('t-autospeed-turn').value);
         payload.auto_speed_stuck = parseFloat(document.getElementById('t-autospeed-stuck').value);
 
+        // Navigation
+        payload.nav_planner = (document.getElementById('t-nav-planner').value || 'astar');
+        payload.nav_heading_enabled = !!document.getElementById('t-nav-heading').checked;
+        payload.nav_turn_adjust_deg = parseFloat(document.getElementById('t-nav-adjust').value);
+        payload.nav_turn_stop_deg = parseFloat(document.getElementById('t-nav-turn').value);
+        payload.nav_goal_dist_m = parseFloat(document.getElementById('t-nav-goal').value);
+        payload.nav_turn_commit_s = parseFloat(document.getElementById('t-nav-commit').value);
+
         // IMU settings (autonomy only)
         payload.imu_enabled = !!document.getElementById('t-imu-enabled').checked;
         payload.imu_i2c_bus = parseInt(document.getElementById('t-imu-bus').value, 10);
@@ -519,6 +637,21 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
         payload.imu_dlpf_cfg = parseInt(document.getElementById('t-imu-dlpf').value, 10);
         payload.imu_sample_div = parseInt(document.getElementById('t-imu-div').value, 10);
         payload.imu_gyro_calib_seconds = parseFloat(document.getElementById('t-imu-calib').value);
+
+        payload.dec_imu_roll_slow_deg = parseFloat(document.getElementById('t-imu-roll-slow').value);
+        payload.dec_imu_pitch_slow_deg = parseFloat(document.getElementById('t-imu-pitch-slow').value);
+        payload.dec_imu_roll_stop_deg = parseFloat(document.getElementById('t-imu-roll-stop').value);
+        payload.dec_imu_pitch_stop_deg = parseFloat(document.getElementById('t-imu-pitch-stop').value);
+        payload.dec_imu_gyro_jolt_rps = parseFloat(document.getElementById('t-imu-jolt').value);
+        payload.dec_imu_jolt_cooldown_s = parseFloat(document.getElementById('t-imu-jolt-cd').value);
+
+        // Recovery
+        payload.rec_enabled = !!document.getElementById('t-rec-enabled').checked;
+        payload.rec_reverse_s = parseFloat(document.getElementById('t-rec-rev').value);
+        payload.rec_turn_s = parseFloat(document.getElementById('t-rec-turn').value);
+        payload.rec_forward_s = parseFloat(document.getElementById('t-rec-fwd').value);
+        payload.rec_cooldown_s = parseFloat(document.getElementById('t-rec-cd').value);
+        payload.rec_max_attempts = parseInt(document.getElementById('t-rec-max').value, 10);
     }
     fetch('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
         .then(r=>r.json()).then(js=>{ console.log('settings updated', js); })

@@ -31,6 +31,9 @@ _active_actions = set()
 _e_stop = False
 # Mode: 'rc' (remote control) or 'autonomous'
 MODE = 'rc'
+
+# Optional navigation goal (world coordinates). When set, autonomy can plan toward it.
+NAV_GOAL = None  # {'x': float, 'y': float}
 # runtime settings (tunable from web UI)
 SETTINGS = {
     'smoothing': True,
@@ -152,6 +155,22 @@ def _apply_settings_ranges():
     SETTINGS['dec_stuck_dx_m'] = _clamp(SETTINGS.get('dec_stuck_dx_m', 0.02), 0.0, 1.0)
     SETTINGS['dec_stuck_frames'] = _clamp_int(SETTINGS.get('dec_stuck_frames', 3), 1, 50)
 
+    # IMU decision tunables
+    SETTINGS['dec_imu_roll_slow_deg'] = _clamp(SETTINGS.get('dec_imu_roll_slow_deg', 18.0), 0.0, 60.0)
+    SETTINGS['dec_imu_pitch_slow_deg'] = _clamp(SETTINGS.get('dec_imu_pitch_slow_deg', 18.0), 0.0, 60.0)
+    SETTINGS['dec_imu_roll_stop_deg'] = _clamp(SETTINGS.get('dec_imu_roll_stop_deg', 28.0), 0.0, 80.0)
+    SETTINGS['dec_imu_pitch_stop_deg'] = _clamp(SETTINGS.get('dec_imu_pitch_stop_deg', 28.0), 0.0, 80.0)
+    SETTINGS['dec_imu_gyro_jolt_rps'] = _clamp(SETTINGS.get('dec_imu_gyro_jolt_rps', 3.5), 0.1, 30.0)
+    SETTINGS['dec_imu_jolt_cooldown_s'] = _clamp(SETTINGS.get('dec_imu_jolt_cooldown_s', 1.0), 0.0, 10.0)
+
+    # Recovery / escape state machine
+    SETTINGS['rec_enabled'] = bool(SETTINGS.get('rec_enabled', True))
+    SETTINGS['rec_reverse_s'] = _clamp(SETTINGS.get('rec_reverse_s', 0.55), 0.05, 2.0)
+    SETTINGS['rec_turn_s'] = _clamp(SETTINGS.get('rec_turn_s', 0.65), 0.05, 3.0)
+    SETTINGS['rec_forward_s'] = _clamp(SETTINGS.get('rec_forward_s', 0.70), 0.05, 3.0)
+    SETTINGS['rec_cooldown_s'] = _clamp(SETTINGS.get('rec_cooldown_s', 1.0), 0.0, 10.0)
+    SETTINGS['rec_max_attempts'] = _clamp_int(SETTINGS.get('rec_max_attempts', 4), 0, 20)
+
     # Autonomy speed policy
     SETTINGS['auto_speed'] = _clamp(SETTINGS.get('auto_speed', 0.6), 0.0, 1.0)
     SETTINGS['auto_speed_slow'] = _clamp(SETTINGS.get('auto_speed_slow', 0.35), 0.0, 1.0)
@@ -167,6 +186,20 @@ def _apply_settings_ranges():
     SETTINGS['imu_dlpf_cfg'] = _clamp_int(SETTINGS.get('imu_dlpf_cfg', 3), 0, 6)
     SETTINGS['imu_sample_div'] = _clamp_int(SETTINGS.get('imu_sample_div', 4), 0, 255)
     SETTINGS['imu_gyro_calib_seconds'] = _clamp(SETTINGS.get('imu_gyro_calib_seconds', 1.0), 0.2, 10.0)
+
+    # Navigation / planning
+    # planner: 'astar' (default) or 'bfs'
+    try:
+        SETTINGS['nav_planner'] = str(SETTINGS.get('nav_planner', 'astar')).lower()
+    except Exception:
+        SETTINGS['nav_planner'] = 'astar'
+    if SETTINGS['nav_planner'] not in ('astar', 'bfs'):
+        SETTINGS['nav_planner'] = 'astar'
+    SETTINGS['nav_heading_enabled'] = bool(SETTINGS.get('nav_heading_enabled', True))
+    SETTINGS['nav_turn_adjust_deg'] = _clamp(SETTINGS.get('nav_turn_adjust_deg', 10.0), 0.0, 90.0)
+    SETTINGS['nav_turn_stop_deg'] = _clamp(SETTINGS.get('nav_turn_stop_deg', 30.0), 0.0, 180.0)
+    SETTINGS['nav_goal_dist_m'] = _clamp(SETTINGS.get('nav_goal_dist_m', 1.2), 0.2, 5.0)
+    SETTINGS['nav_turn_commit_s'] = _clamp(SETTINGS.get('nav_turn_commit_s', 0.55), 0.0, 3.0)
 
 
 _load_settings_from_disk()
@@ -332,6 +365,43 @@ def status():
                 imu_summary = {'connected': False, 'age_s': max(0.0, time.time() - latest_log_ts) if latest_log_ts else None}
         except Exception:
             imu_summary = None
+
+        nav_summary = None
+        try:
+            nav_summary = {
+                'planner': SETTINGS.get('nav_planner', 'astar'),
+                'heading_enabled': bool(SETTINGS.get('nav_heading_enabled', True)),
+                'goal_dist_m': float(SETTINGS.get('nav_goal_dist_m', 1.2)),
+                'turn_adjust_deg': float(SETTINGS.get('nav_turn_adjust_deg', 10.0)),
+                'turn_stop_deg': float(SETTINGS.get('nav_turn_stop_deg', 30.0)),
+            }
+        except Exception:
+            nav_summary = None
+
+        nav_debug = None
+        try:
+            p = (latest_log or {}).get('perception', {}) if isinstance(latest_log, dict) else {}
+            if isinstance(p, dict):
+                nav_debug = p.get('nav_debug')
+        except Exception:
+            nav_debug = None
+
+        decision_debug = None
+        try:
+            if isinstance(latest_log, dict):
+                d = latest_log.get('decision')
+                if isinstance(d, dict):
+                    # keep it small; include common recovery/commit fields
+                    decision_debug = {
+                        'command': d.get('command'),
+                        'reason': d.get('reason'),
+                        'stuck': d.get('stuck'),
+                        'recovery': d.get('recovery'),
+                        'recovery_attempt': d.get('recovery_attempt'),
+                        'nav_turn_commit_remaining_s': d.get('nav_turn_commit_remaining_s'),
+                    }
+        except Exception:
+            decision_debug = None
         return jsonify({
             'active_actions': list(_active_actions),
             'e_stop': bool(_e_stop),
@@ -339,7 +409,35 @@ def status():
             'smoothing': bool(SETTINGS.get('smoothing', False)),
             'settings': SETTINGS,
             'imu': imu_summary,
+            'nav': nav_summary,
+            'nav_debug': nav_debug,
+            'nav_goal': NAV_GOAL,
+            'decision': decision_debug,
         })
+
+
+@app.route('/nav_goal', methods=['GET', 'POST', 'DELETE'])
+def nav_goal():
+    """Get/set/clear navigation goal.
+
+    POST body: {"x": <float>, "y": <float>}
+    DELETE clears.
+    """
+    global NAV_GOAL
+    if request.method == 'GET':
+        return jsonify({'nav_goal': NAV_GOAL})
+    if request.method == 'DELETE':
+        NAV_GOAL = None
+        return jsonify({'nav_goal': NAV_GOAL})
+
+    data = request.get_json(silent=True) or {}
+    try:
+        x = float(data.get('x'))
+        y = float(data.get('y'))
+    except Exception:
+        return jsonify({'error': 'bad_goal'}), 400
+    NAV_GOAL = {'x': x, 'y': y}
+    return jsonify({'nav_goal': NAV_GOAL})
 
 
 @app.route('/emergency_stop', methods=['POST'])
