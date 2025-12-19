@@ -80,6 +80,11 @@ SETTINGS = {
     # Planning budgets to prevent stalls
     'nav_plan_max_expansions': 12000,
     'nav_plan_max_time_s': 0.06,
+
+    # Dynamic obstacle layer (decays over time)
+    'nav_dyn_half_life_s': 6.0,
+    'nav_dyn_thresh': 0.40,
+    'nav_dyn_prune_thresh': 0.05,
 }
 
 SETTINGS_PATH = Path(__file__).with_name('settings.json')
@@ -224,6 +229,11 @@ def _apply_settings_ranges():
     # Planning budgets
     SETTINGS['nav_plan_max_expansions'] = _clamp_int(SETTINGS.get('nav_plan_max_expansions', 12000), 200, 500000)
     SETTINGS['nav_plan_max_time_s'] = _clamp(SETTINGS.get('nav_plan_max_time_s', 0.06), 0.0, 1.0)
+
+    # Dynamic occupancy decay
+    SETTINGS['nav_dyn_half_life_s'] = _clamp(SETTINGS.get('nav_dyn_half_life_s', 6.0), 0.0, 120.0)
+    SETTINGS['nav_dyn_thresh'] = _clamp(SETTINGS.get('nav_dyn_thresh', 0.40), 0.05, 1.0)
+    SETTINGS['nav_dyn_prune_thresh'] = _clamp(SETTINGS.get('nav_dyn_prune_thresh', 0.05), 0.0, 0.5)
 
 
 _load_settings_from_disk()
