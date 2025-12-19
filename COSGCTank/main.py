@@ -11,6 +11,12 @@ import time
 import requests
 import math
 
+try:
+    from power_monitor import PowerMonitor, PowerMonitorSettings
+except Exception:
+    PowerMonitor = None  # type: ignore
+    PowerMonitorSettings = None  # type: ignore
+
 SERVER_URL = "http://127.0.0.1:5000/log"   # default to local Flask server
 
 
@@ -60,6 +66,11 @@ def main():
     imu = None
     imu_last_calib = 0.0
 
+    # Power/current monitor (INA219-style; optional)
+    pmon = None
+    pmon_last_cfg = None
+    pmon_last_read = 0.0
+
     try:
         for data in frame_iter:
             frame = data["frame"]
@@ -96,6 +107,60 @@ def main():
             except Exception:
                 pass
             perception['settings'] = settings_cache
+
+            # Power/current sensing (best-effort, optional)
+            power = None
+            try:
+                enabled = bool(settings_cache.get('power_enabled', False))
+            except Exception:
+                enabled = False
+            if enabled and PowerMonitor is not None:
+                try:
+                    cfg = {
+                        'enabled': True,
+                        'i2c_bus': int(settings_cache.get('power_i2c_bus', 1)),
+                        'motor_left_addr': int(settings_cache.get('power_motor_left_addr', 0x40)),
+                        'motor_right_addr': int(settings_cache.get('power_motor_right_addr', 0x43)),
+                        'system_addr': int(settings_cache.get('power_system_addr', 0x41)),
+                        'motor_left_shunt_ohm': float(settings_cache.get('power_motor_left_shunt_ohm', 0.1)),
+                        'motor_right_shunt_ohm': float(settings_cache.get('power_motor_right_shunt_ohm', 0.1)),
+                        'system_shunt_ohm': float(settings_cache.get('power_system_shunt_ohm', 0.1)),
+                    }
+                except Exception:
+                    cfg = None
+
+                # (Re)create if needed
+                if pmon is None and cfg is not None:
+                    try:
+                        pmon = PowerMonitor(PowerMonitorSettings(**cfg))
+                        pmon_last_cfg = dict(cfg)
+                    except Exception:
+                        pmon = None
+                        pmon_last_cfg = None
+                elif pmon is not None and cfg is not None and pmon_last_cfg is not None and cfg != pmon_last_cfg:
+                    try:
+                        pmon.update_settings(PowerMonitorSettings(**cfg))
+                        pmon_last_cfg = dict(cfg)
+                    except Exception:
+                        pass
+
+                # Read at most at the configured poll rate
+                try:
+                    poll_s = float(settings_cache.get('power_poll_s', 0.25))
+                except Exception:
+                    poll_s = 0.25
+                poll_s = max(0.05, min(5.0, poll_s))
+                if pmon is not None and (time.time() - pmon_last_read) >= poll_s:
+                    try:
+                        power = pmon.read()
+                    except Exception:
+                        power = None
+                    pmon_last_read = time.time()
+            else:
+                pmon = None
+                pmon_last_cfg = None
+
+            perception['power'] = power
 
             # fetch navigation goal (if set) at most twice per second
             try:

@@ -80,6 +80,7 @@ class OverlayDrawer:
                 'nav_debug': perception.get('nav_debug'),
                 'imu': perception.get('imu'),
                 'distance_cm': perception.get('distance_cm'),
+                'power': perception.get('power'),
             },
             'obstacles': perception.get('obstacles', []),
             'boundary': perception.get('boundary', {}),

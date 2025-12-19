@@ -44,6 +44,11 @@ _autonomy_stop = threading.Event()
 _autonomy_lock = threading.Lock()
 _autonomy_last_error = None
 
+_power_monitor = None
+_power_lock = threading.Lock()
+_power_latest = None
+_power_latest_ts = None
+
 
 def _get_video_provider(device_idx, width, height, fps):
     global _video_provider, _video_provider_key
@@ -198,12 +203,20 @@ def _autonomy_loop():
                 except Exception:
                     dist_cm = None
 
+            power = None
+            try:
+                with _power_lock:
+                    power = _power_latest
+            except Exception:
+                power = None
+
             perception = {
                 'timestamp': ts,
                 'obstacles': obstacles,
                 'boundary': boundary_info,
                 'terrain': terrain_info,
                 'distance_cm': dist_cm,
+                'power': power,
                 'settings': settings_snapshot,
                 # placeholders (keeps UI/status code happy)
                 'imu': None,
@@ -415,6 +428,18 @@ SETTINGS = {
     'dec_ultra_turn_cm': 30.0,
     'dec_stuck_dx_m': 0.02,
     'dec_stuck_frames': 3,
+
+    # Current-aware decision making (requires power_enabled + working I2C reads)
+    # These defaults are conservative; tune to your drivetrain.
+    'dec_current_enabled': True,
+    # If total motor current stays above this while trying to move, assume stall/stuck.
+    'dec_current_motor_stall_a': 4.0,
+    'dec_current_stall_frames': 3,
+    # Hard limits: immediately stop+reverse when exceeded.
+    'dec_current_motor_over_a': 7.0,
+    'dec_current_system_over_a': 10.0,
+    # Cooldown after an overcurrent trip.
+    'dec_current_over_cooldown_s': 1.0,
     # RC tuning
     'rc_speed': 0.6,
     'rc_turn_gain': 1.0,
@@ -481,6 +506,21 @@ SETTINGS = {
     'cam_height': 480,
     'cam_fps': 20,
     'cam_jpeg_quality': 80,
+
+    # Power / current sensing (I2C)
+    # Two motor current channels plus an overall power channel.
+    # Defaults assume INA219-style sensors at 0x40/0x43 and a system channel at 0x41.
+    'power_enabled': False,
+    'power_i2c_bus': 1,
+    'power_motor_left_addr': 0x40,
+    'power_motor_right_addr': 0x43,
+    'power_system_addr': 0x41,
+    # Shunt resistors in ohms (set these to match your hardware)
+    'power_motor_left_shunt_ohm': 0.1,
+    'power_motor_right_shunt_ohm': 0.1,
+    'power_system_shunt_ohm': 0.1,
+    # Poll interval (seconds)
+    'power_poll_s': 0.25,
 }
 
 SETTINGS_PATH = Path(__file__).with_name('settings.json')
@@ -568,6 +608,14 @@ def _apply_settings_ranges():
     SETTINGS['dec_ultra_turn_cm'] = _clamp(SETTINGS.get('dec_ultra_turn_cm', 30.0), 5.0, 300.0)
     SETTINGS['dec_stuck_dx_m'] = _clamp(SETTINGS.get('dec_stuck_dx_m', 0.02), 0.0, 1.0)
     SETTINGS['dec_stuck_frames'] = _clamp_int(SETTINGS.get('dec_stuck_frames', 3), 1, 50)
+
+    # Current-aware decisions
+    SETTINGS['dec_current_enabled'] = bool(SETTINGS.get('dec_current_enabled', True))
+    SETTINGS['dec_current_motor_stall_a'] = _clamp(SETTINGS.get('dec_current_motor_stall_a', 4.0), 0.0, 200.0)
+    SETTINGS['dec_current_stall_frames'] = _clamp_int(SETTINGS.get('dec_current_stall_frames', 3), 1, 200)
+    SETTINGS['dec_current_motor_over_a'] = _clamp(SETTINGS.get('dec_current_motor_over_a', 7.0), 0.0, 400.0)
+    SETTINGS['dec_current_system_over_a'] = _clamp(SETTINGS.get('dec_current_system_over_a', 10.0), 0.0, 400.0)
+    SETTINGS['dec_current_over_cooldown_s'] = _clamp(SETTINGS.get('dec_current_over_cooldown_s', 1.0), 0.0, 10.0)
 
     # IMU decision tunables
     SETTINGS['dec_imu_roll_slow_deg'] = _clamp(SETTINGS.get('dec_imu_roll_slow_deg', 18.0), 0.0, 60.0)
@@ -662,6 +710,17 @@ def _apply_settings_ranges():
     SETTINGS['cam_fps'] = _clamp_int(SETTINGS.get('cam_fps', 20), 1, 60)
     SETTINGS['cam_jpeg_quality'] = _clamp_int(SETTINGS.get('cam_jpeg_quality', 80), 20, 95)
 
+    # Power/current sensing
+    SETTINGS['power_enabled'] = bool(SETTINGS.get('power_enabled', False))
+    SETTINGS['power_i2c_bus'] = _clamp_int(SETTINGS.get('power_i2c_bus', 1), 0, 10)
+    SETTINGS['power_motor_left_addr'] = _clamp_int(SETTINGS.get('power_motor_left_addr', 0x40), 0x08, 0x77)
+    SETTINGS['power_motor_right_addr'] = _clamp_int(SETTINGS.get('power_motor_right_addr', 0x43), 0x08, 0x77)
+    SETTINGS['power_system_addr'] = _clamp_int(SETTINGS.get('power_system_addr', 0x41), 0x08, 0x77)
+    SETTINGS['power_motor_left_shunt_ohm'] = _clamp(SETTINGS.get('power_motor_left_shunt_ohm', 0.1), 0.001, 5.0)
+    SETTINGS['power_motor_right_shunt_ohm'] = _clamp(SETTINGS.get('power_motor_right_shunt_ohm', 0.1), 0.001, 5.0)
+    SETTINGS['power_system_shunt_ohm'] = _clamp(SETTINGS.get('power_system_shunt_ohm', 0.1), 0.001, 5.0)
+    SETTINGS['power_poll_s'] = _clamp(SETTINGS.get('power_poll_s', 0.25), 0.05, 5.0)
+
 
 _load_settings_from_disk()
 _apply_settings_ranges()
@@ -690,6 +749,106 @@ def _watchdog_loop():
 # start watchdog thread
 _watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
 _watchdog_thread.start()
+
+
+def _power_poll_loop():
+    """Poll I2C power/current sensors best-effort.
+
+    Runs continuously; when disabled it just sleeps.
+    """
+    global _power_monitor, _power_latest, _power_latest_ts
+    # Lazy import so dev machines don't require anything beyond requirements.txt
+    try:
+        from power_monitor import PowerMonitor, PowerMonitorSettings
+    except Exception:
+        PowerMonitor = None  # type: ignore
+        PowerMonitorSettings = None  # type: ignore
+
+    last_cfg = None
+    while True:
+        try:
+            poll_s = float(SETTINGS.get('power_poll_s', 0.25))
+        except Exception:
+            poll_s = 0.25
+        poll_s = max(0.05, min(5.0, poll_s))
+
+        try:
+            enabled = bool(SETTINGS.get('power_enabled', False))
+        except Exception:
+            enabled = False
+
+        if not enabled or PowerMonitor is None:
+            time.sleep(max(0.2, poll_s))
+            continue
+
+        try:
+            cfg = {
+                'enabled': True,
+                'i2c_bus': int(SETTINGS.get('power_i2c_bus', 1)),
+                'motor_left_addr': int(SETTINGS.get('power_motor_left_addr', 0x40)),
+                'motor_right_addr': int(SETTINGS.get('power_motor_right_addr', 0x43)),
+                'system_addr': int(SETTINGS.get('power_system_addr', 0x41)),
+                'motor_left_shunt_ohm': float(SETTINGS.get('power_motor_left_shunt_ohm', 0.1)),
+                'motor_right_shunt_ohm': float(SETTINGS.get('power_motor_right_shunt_ohm', 0.1)),
+                'system_shunt_ohm': float(SETTINGS.get('power_system_shunt_ohm', 0.1)),
+            }
+        except Exception:
+            cfg = None
+
+        with _power_lock:
+            if _power_monitor is None:
+                try:
+                    s = PowerMonitorSettings(
+                        enabled=True,
+                        i2c_bus=cfg['i2c_bus'],
+                        motor_left_addr=cfg['motor_left_addr'],
+                        motor_right_addr=cfg['motor_right_addr'],
+                        system_addr=cfg['system_addr'],
+                        motor_left_shunt_ohm=cfg['motor_left_shunt_ohm'],
+                        motor_right_shunt_ohm=cfg['motor_right_shunt_ohm'],
+                        system_shunt_ohm=cfg['system_shunt_ohm'],
+                    )
+                    _power_monitor = PowerMonitor(s)
+                    last_cfg = dict(cfg)
+                except Exception:
+                    _power_monitor = None
+                    last_cfg = None
+
+            elif cfg is not None and last_cfg is not None and cfg != last_cfg:
+                try:
+                    s = PowerMonitorSettings(
+                        enabled=True,
+                        i2c_bus=cfg['i2c_bus'],
+                        motor_left_addr=cfg['motor_left_addr'],
+                        motor_right_addr=cfg['motor_right_addr'],
+                        system_addr=cfg['system_addr'],
+                        motor_left_shunt_ohm=cfg['motor_left_shunt_ohm'],
+                        motor_right_shunt_ohm=cfg['motor_right_shunt_ohm'],
+                        system_shunt_ohm=cfg['system_shunt_ohm'],
+                    )
+                    _power_monitor.update_settings(s)
+                    last_cfg = dict(cfg)
+                except Exception:
+                    pass
+
+            mon = _power_monitor
+
+        # Read outside lock
+        try:
+            reading = mon.read() if mon is not None else None
+        except Exception:
+            reading = None
+
+        if reading is not None:
+            with _power_lock:
+                _power_latest = reading
+                _power_latest_ts = time.time()
+
+        time.sleep(poll_s)
+
+
+_power_thread = threading.Thread(target=_power_poll_loop, daemon=True)
+_power_thread.start()
 
 # ---------------- MOTOR ROUTES ---------------- #
 
@@ -779,8 +938,19 @@ def command(action):
             motor.turn_right(); ok = True
             _active_actions.add('r'); _last_keepalive['r'] = time.time()
         elif action == "s":
+            # Soft stop should work in any mode: stop motion and return to RC.
             motor.stop(); ok = True
             _active_actions.clear(); _last_keepalive.clear()
+            if MODE != 'rc':
+                # Force RC mode so the UI can recover manual control.
+                # Autonomy loop will be stopped outside the lock.
+                globals()['MODE'] = 'rc'
+    # If STOP forced a mode change, stop autonomy loop now.
+    try:
+        if action == 's' and MODE == 'rc':
+            _stop_autonomy()
+    except Exception:
+        pass
     return ("OK", 200) if ok else ("Unknown action", 400)
 
 
@@ -864,6 +1034,12 @@ def keepalive():
 @app.route('/status')
 def status():
     with _keepalive_lock:
+        power_copy = None
+        try:
+            with _power_lock:
+                power_copy = _power_latest
+        except Exception:
+            power_copy = None
         # best-effort IMU summary from the last autonomy log (if running)
         imu_summary = None
         try:
@@ -938,6 +1114,7 @@ def status():
             'nav_debug': nav_debug,
             'nav_goal': NAV_GOAL,
             'decision': decision_debug,
+            'power': power_copy,
         })
 
 
@@ -1013,8 +1190,14 @@ def nav_goal():
 @app.route('/emergency_stop', methods=['POST'])
 def emergency_stop():
     global _e_stop
+    # E-stop should always be recoverable from the UI without restarting.
+    # We force RC mode so manual controls can be re-enabled after clearing.
     with _keepalive_lock:
         _e_stop = True
+        try:
+            globals()['MODE'] = 'rc'
+        except Exception:
+            pass
         try:
             # prefer safe_stop if available
             if hasattr(motor, 'safe_stop'):
@@ -1025,7 +1208,13 @@ def emergency_stop():
             pass
         _active_actions.clear()
         _last_keepalive.clear()
-    return jsonify({'status': 'e_stop_set'})
+
+    try:
+        _stop_autonomy()
+    except Exception:
+        pass
+
+    return jsonify({'status': 'e_stop_set', 'mode': MODE})
 
 
 @app.route('/clear_emergency', methods=['POST'])
@@ -1033,7 +1222,14 @@ def clear_emergency():
     global _e_stop
     with _keepalive_lock:
         _e_stop = False
-    return jsonify({'status': 'e_stop_cleared'})
+        # Clear any stale RC keepalive state.
+        _active_actions.clear()
+        _last_keepalive.clear()
+        try:
+            motor.stop()
+        except Exception:
+            pass
+    return jsonify({'status': 'e_stop_cleared', 'mode': MODE})
 
 
 @app.route('/mode', methods=['GET', 'POST'])

@@ -571,6 +571,16 @@ function setModeUI(mode) {
     currentMode = mode;
     const sel = document.getElementById('mode-select');
     if (sel && sel.value !== mode) sel.value = mode;
+
+    // Returning to RC should recover manual controls even if we had a few transient
+    // keepalive failures (e.g. server restart, mode mismatch, e-stop).
+    if (mode === 'rc') {
+        disconnected = false;
+        try {
+            Object.keys(failureCounts).forEach(k => { failureCounts[k] = 0; });
+        } catch (e) {}
+    }
+
     const disable = (mode !== 'rc');
     const autoPanel = document.getElementById('autonomy-settings');
     if (autoPanel) {
@@ -591,8 +601,21 @@ async function postKeepalive(action, state) {
             method: 'POST', headers: {'Content-Type':'application/json'},
             body: JSON.stringify({action: action, state: state})
         });
-        if (!res.ok) throw new Error('bad');
+
+        if (!res.ok) {
+            // 409: not in RC mode; 423: E-stop active.
+            // These mean "connected but command rejected", so don't mark disconnected.
+            if (res.status === 409 || res.status === 423) {
+                setConnState(true);
+                disconnected = false;
+                failureCounts[action] = 0;
+                return false;
+            }
+            throw new Error('bad');
+        }
+
         setConnState(true);
+        disconnected = false;
         failureCounts[action] = 0;
         return true;
     } catch (e) {
@@ -680,10 +703,13 @@ document.getElementById('mode-select').addEventListener('change', (ev)=>{
 });
 
 // STOP = soft stop (non e-stop)
-document.getElementById('btn-stop').addEventListener('click', ()=>{ fetch('/cmd/s').catch(()=>{}); });
+document.getElementById('btn-stop').addEventListener('click', ()=>{
+    // Soft stop should halt motion even in autonomous. Server will also return to RC.
+    fetch('/cmd/s').then(()=>fetch('/status').then(r=>r.json()).then(js=>{ setModeUI(js.mode||'rc'); setActiveList(js.active_actions||[]); })).catch(()=>{});
+});
 // E-stop buttons
-document.getElementById('btn-estop').addEventListener('click', ()=>{ fetch('/emergency_stop',{method:'POST'}).catch(()=>{}); });
-document.getElementById('btn-clear-estop').addEventListener('click', ()=>{ fetch('/clear_emergency',{method:'POST'}).catch(()=>{}); });
+document.getElementById('btn-estop').addEventListener('click', ()=>{ fetch('/emergency_stop',{method:'POST'}).then(()=>fetch('/status').then(r=>r.json()).then(js=>{ setModeUI(js.mode||'rc'); setEStop(js.e_stop); })).catch(()=>{}); });
+document.getElementById('btn-clear-estop').addEventListener('click', ()=>{ fetch('/clear_emergency',{method:'POST'}).then(()=>fetch('/status').then(r=>r.json()).then(js=>{ setModeUI(js.mode||'rc'); setEStop(js.e_stop); })).catch(()=>{}); });
 
 function setButtonActive(action, on) {
     const map = {'f':'btn-forward','b':'btn-back','l':'btn-left','r':'btn-right'};

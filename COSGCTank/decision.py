@@ -22,6 +22,10 @@ class DecisionMaker:
         self.no_progress_count = 0
         self.stuck_threshold = 3  # number of consecutive frames with no progress
 
+        # Current-aware stall detection (power monitor)
+        self._current_stall_count = 0
+        self._current_last_trip_ts = 0.0
+
         # turn commitment state (helps avoid getting turned around in maze-like corridors)
         self._turn_lock_cmd = None
         self._turn_lock_until = 0.0
@@ -103,6 +107,44 @@ class DecisionMaker:
                 dir_cmd = 'TURN_RIGHT' if left >= right else 'TURN_LEFT'
                 return {"command": dir_cmd, "reason": f"Obstacle by distance ({distance:.1f}cm)"}
 
+        # Current / overcurrent safety (requires power monitor)
+        # If current is too high, assume jam/stall and do immediate stop+reverse.
+        try:
+            s = perception.get('settings', {}) if isinstance(perception, dict) else {}
+            cur_enabled = bool(s.get('dec_current_enabled', True))
+        except Exception:
+            cur_enabled = True
+        if cur_enabled:
+            total_a, left_a, right_a, system_a = self._extract_currents(perception)
+            try:
+                motor_over_a = float(s.get('dec_current_motor_over_a', 7.0))
+                system_over_a = float(s.get('dec_current_system_over_a', 10.0))
+                cooldown_s = float(s.get('dec_current_over_cooldown_s', 1.0))
+            except Exception:
+                motor_over_a, system_over_a, cooldown_s = 7.0, 10.0, 1.0
+
+            motor_peak = None
+            try:
+                vals = [v for v in (left_a, right_a, total_a) if isinstance(v, (int, float))]
+                motor_peak = max(vals) if vals else None
+            except Exception:
+                motor_peak = None
+
+            trip = False
+            if isinstance(system_a, (int, float)) and system_a >= system_over_a:
+                trip = True
+                why = f"System overcurrent ({float(system_a):.2f}A)"
+            elif isinstance(motor_peak, (int, float)) and motor_peak >= motor_over_a:
+                trip = True
+                why = f"Motor overcurrent ({float(motor_peak):.2f}A)"
+            else:
+                why = None
+
+            now_ts = time.time()
+            if trip and (now_ts - float(getattr(self, '_current_last_trip_ts', 0.0))) >= max(0.0, cooldown_s):
+                self._current_last_trip_ts = now_ts
+                return {"command": "STOP_REVERSE", "reason": why or "Overcurrent"}
+
         # Obstacle close - immediate steering or stop depending on vertical position
         obstacles = perception.get("obstacles", [])
         for obj in obstacles:
@@ -125,13 +167,79 @@ class DecisionMaker:
 
         return None
 
+    def _extract_currents(self, perception):
+        """Extract current readings from perception['power'].
+
+        Returns: (total_motor_a, left_a, right_a, system_a) where each may be None.
+        """
+        total_a = left_a = right_a = system_a = None
+        try:
+            p = perception.get('power') if isinstance(perception, dict) else None
+            if not isinstance(p, dict):
+                return (None, None, None, None)
+
+            def _get_i(d):
+                if not isinstance(d, dict):
+                    return None
+                v = d.get('current_a')
+                return float(v) if isinstance(v, (int, float)) else None
+
+            left_a = _get_i(p.get('motor_left'))
+            right_a = _get_i(p.get('motor_right'))
+            system_a = _get_i(p.get('system'))
+            vtot = p.get('total_motor_current_a')
+            total_a = float(vtot) if isinstance(vtot, (int, float)) else None
+            if total_a is None and isinstance(left_a, (int, float)) and isinstance(right_a, (int, float)):
+                total_a = float(left_a + right_a)
+        except Exception:
+            return (None, None, None, None)
+        return (total_a, left_a, right_a, system_a)
+
     def _detect_stuck(self, perception, command):
-        # Use SLAM pose to detect lack of forward progress when commanded to move
+        # Use SLAM pose (when available) and/or motor current to detect lack of progress.
+        s = perception.get('settings', {}) if isinstance(perception, dict) else {}
+        try:
+            dx_thresh = float(s.get('dec_stuck_dx_m', 0.02))
+        except Exception:
+            dx_thresh = 0.02
+        dx_thresh = max(0.0, min(1.0, dx_thresh))
+
+        # Current-based stall heuristic
+        try:
+            cur_enabled = bool(s.get('dec_current_enabled', True))
+        except Exception:
+            cur_enabled = True
+        try:
+            stall_a = float(s.get('dec_current_motor_stall_a', 4.0))
+            stall_frames = int(s.get('dec_current_stall_frames', self.stuck_threshold))
+        except Exception:
+            stall_a, stall_frames = 4.0, self.stuck_threshold
+        stall_frames = max(1, stall_frames)
+
+        moving_cmd = command in ('FORWARD', 'SLOW', 'TURN_LEFT', 'TURN_RIGHT', 'ADJUST_LEFT', 'ADJUST_RIGHT')
+        total_a, left_a, right_a, system_a = self._extract_currents(perception)
+        motor_a = None
+        try:
+            vals = [v for v in (total_a, left_a, right_a) if isinstance(v, (int, float))]
+            motor_a = max(vals) if vals else None
+        except Exception:
+            motor_a = None
+        if not moving_cmd:
+            self._current_stall_count = 0
+
+        if cur_enabled and moving_cmd and isinstance(motor_a, (int, float)) and motor_a >= stall_a:
+            self._current_stall_count += 1
+        else:
+            self._current_stall_count = 0
+
+        # If we don't have pose, fall back to current-only stall detection.
         pose = perception.get('slam_pose')
         if pose is None:
-            # can't determine; reset counters
             self.prev_pose = None
             self.no_progress_count = 0
+            if cur_enabled and moving_cmd and self._current_stall_count >= stall_frames:
+                self._current_stall_count = 0
+                return True
             return False
         x, y = None, None
         if isinstance(pose, dict) and 'x' in pose and 'y' in pose:
@@ -149,13 +257,18 @@ class DecisionMaker:
         dx = ((x - self.prev_pose[0])**2 + (y - self.prev_pose[1])**2)**0.5
         self.prev_pose = (x, y)
         # if commanded forward but very small movement, increment
-        if command in ('FORWARD', 'SLOW') and dx < 0.02:
+        if command in ('FORWARD', 'SLOW') and dx < dx_thresh:
             self.no_progress_count += 1
             if self.no_progress_count >= self.stuck_threshold:
                 self.no_progress_count = 0
                 return True
         else:
             self.no_progress_count = 0
+
+        # Current-based stall can also trigger stuck detection (even if pose is noisy).
+        if cur_enabled and moving_cmd and self._current_stall_count >= stall_frames:
+            self._current_stall_count = 0
+            return True
         return False
 
     def _choose_by_boundary(self, perception):
