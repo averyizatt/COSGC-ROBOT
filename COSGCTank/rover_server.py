@@ -39,6 +39,12 @@ _video_provider = None
 _video_provider_key = None
 
 
+_autonomy_thread = None
+_autonomy_stop = threading.Event()
+_autonomy_lock = threading.Lock()
+_autonomy_last_error = None
+
+
 def _get_video_provider(device_idx, width, height, fps):
     global _video_provider, _video_provider_key
     key = (int(device_idx), int(width), int(height), int(fps))
@@ -55,6 +61,236 @@ def _get_video_provider(device_idx, width, height, fps):
         except Exception:
             pass
     return _video_provider
+
+
+def _contour_obstacles(frame_rgb, settings=None):
+    """Contour-only obstacle detector (no TFLite dependency).
+
+    Returns normalized boxes compatible with DecisionMaker.
+    """
+    if frame_rgb is None:
+        return []
+    try:
+        s = settings or {}
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        blur = cv2.bilateralFilter(gray, d=5, sigmaColor=75, sigmaSpace=75)
+        th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 11, 2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        h, w = frame_rgb.shape[:2]
+        dets = []
+        min_area = float(s.get('det_contour_min_area', 400))
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+            x, y, cw, ch = cv2.boundingRect(cnt)
+            ymin = y / h
+            xmin = x / w
+            ymax = (y + ch) / h
+            xmax = (x + cw) / w
+            score = min(1.0, (area / (w * h)) * 10.0)
+            dets.append({'box': [float(ymin), float(xmin), float(ymax), float(xmax)], 'class': 0, 'score': float(max(0.35, score)), 'label': 'contour'})
+        dets.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+        return dets
+    except Exception:
+        return []
+
+
+def _autonomy_loop():
+    """Background autonomy loop driven by MODE.
+
+    Runs when MODE != 'rc'. Uses the shared camera provider + SETTINGS and
+    commands the server's global MotorController.
+    """
+    global latest_log, latest_log_ts, _autonomy_last_error
+    _autonomy_last_error = None
+
+    # Lazy imports: keep server start fast and allow partial installs.
+    try:
+        from boundaries import BoundaryDetector
+        from terrain import TerrainAnalyzer
+        from decision import DecisionMaker
+        from overlay import OverlayDrawer
+    except Exception as e:
+        _autonomy_last_error = f"import_failed:{type(e).__name__}:{e}"
+        return
+
+    # Optional: full model detector
+    det = None
+    try:
+        from detector import ObstacleDetector
+        det = ObstacleDetector(settings=SETTINGS)
+    except Exception:
+        det = None
+
+    bounds = BoundaryDetector()
+    terrain = TerrainAnalyzer()
+    decider = DecisionMaker()
+    overlay = OverlayDrawer()
+
+    # Optional ultrasonic
+    us = None
+    try:
+        from ultrasonic import Ultrasonic
+        us = Ultrasonic(trig_pin=24, echo_pin=25)
+    except Exception:
+        us = None
+
+    last_motor_cmd = None
+
+    while not _autonomy_stop.is_set():
+        try:
+            with _keepalive_lock:
+                mode_now = MODE
+                estop_now = bool(_e_stop)
+
+            if mode_now == 'rc' or estop_now:
+                # Ensure we aren't moving while disabled.
+                try:
+                    if last_motor_cmd is not None:
+                        motor.stop()
+                        last_motor_cmd = None
+                except Exception:
+                    pass
+                time.sleep(0.1)
+                continue
+
+            # Snapshot settings for consistency in this iteration.
+            try:
+                settings_snapshot = dict(SETTINGS)
+            except Exception:
+                settings_snapshot = SETTINGS
+
+            dev_idx = _parse_camera_device(settings_snapshot.get('cam_device', '/dev/video0'))
+            width = int(settings_snapshot.get('cam_width', 640))
+            height = int(settings_snapshot.get('cam_height', 480))
+            fps = int(settings_snapshot.get('cam_fps', 20))
+
+            provider = _get_video_provider(dev_idx, width, height, fps)
+            data = provider.get_frame()
+            if data is None:
+                time.sleep(0.05)
+                continue
+            frame = data.get('frame')
+            ts = float(data.get('timestamp', time.time()))
+
+            if det is not None:
+                try:
+                    det.settings = settings_snapshot
+                except Exception:
+                    pass
+
+            try:
+                obstacles = det.detect(frame) if det is not None else _contour_obstacles(frame, settings_snapshot)
+            except Exception:
+                obstacles = _contour_obstacles(frame, settings_snapshot)
+
+            boundary_info = bounds.detect(frame)
+            terrain_info = terrain.analyze(frame)
+
+            dist_cm = None
+            if us is not None:
+                try:
+                    dist_cm = us.read_distance_cm(samples=3)
+                except Exception:
+                    dist_cm = None
+
+            perception = {
+                'timestamp': ts,
+                'obstacles': obstacles,
+                'boundary': boundary_info,
+                'terrain': terrain_info,
+                'distance_cm': dist_cm,
+                'settings': settings_snapshot,
+                # placeholders (keeps UI/status code happy)
+                'imu': None,
+                'slam_pose': None,
+                'nav_goal': None,
+                'nav_target': None,
+                'nav_debug': None,
+            }
+
+            decision = decider.decide(perception)
+
+            # Execute motor action
+            action, params = decider.map_to_motor(decision.get('command'), speed=decision.get('speed'))
+            try:
+                if hasattr(motor, action):
+                    try:
+                        getattr(motor, action)(**(params or {}))
+                    except TypeError:
+                        getattr(motor, action)()
+                    last_motor_cmd = action
+            except Exception:
+                # fail safe
+                try:
+                    motor.stop()
+                except Exception:
+                    pass
+                last_motor_cmd = None
+
+            # Update UI/debug log buffer (same structure as /log expects)
+            try:
+                latest_log = overlay.export_log(perception, decision)
+                latest_log_ts = time.time()
+            except Exception:
+                pass
+
+            # Lightweight status marker
+            try:
+                with _keepalive_lock:
+                    _active_actions.clear()
+                    # Represent autonomy command with same letters used by RC display.
+                    cmd = decision.get('command')
+                    if cmd in ('FORWARD', 'SLOW'):
+                        _active_actions.add('f')
+                    elif cmd in ('TURN_LEFT', 'ADJUST_LEFT'):
+                        _active_actions.add('l')
+                    elif cmd in ('TURN_RIGHT', 'ADJUST_RIGHT'):
+                        _active_actions.add('r')
+                    elif cmd == 'STOP_REVERSE':
+                        _active_actions.add('b')
+            except Exception:
+                pass
+
+            # Pace loop roughly; camera read itself is the limiter.
+            time.sleep(0.01)
+
+        except Exception as e:
+            _autonomy_last_error = f"loop_error:{type(e).__name__}:{e}"
+            try:
+                motor.stop()
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+
+def _start_autonomy_if_needed():
+    global _autonomy_thread
+    with _autonomy_lock:
+        if _autonomy_thread is not None and _autonomy_thread.is_alive():
+            return
+        _autonomy_stop.clear()
+        _autonomy_thread = threading.Thread(target=_autonomy_loop, daemon=True)
+        _autonomy_thread.start()
+
+
+def _stop_autonomy():
+    global _autonomy_thread
+    with _autonomy_lock:
+        _autonomy_stop.set()
+        try:
+            motor.stop()
+        except Exception:
+            pass
+        try:
+            with _keepalive_lock:
+                _active_actions.clear()
+        except Exception:
+            pass
 
 
 def _camera_caps_v4l2(device: str):
@@ -692,6 +928,9 @@ def status():
             'active_actions': list(_active_actions),
             'e_stop': bool(_e_stop),
             'mode': MODE,
+            'autonomy_running': bool(_autonomy_thread is not None and _autonomy_thread.is_alive()),
+            'autonomy_error': _autonomy_last_error,
+            'log_age_s': (max(0.0, time.time() - latest_log_ts) if latest_log_ts else None),
             'smoothing': bool(SETTINGS.get('smoothing', False)),
             'settings': SETTINGS,
             'imu': imu_summary,
@@ -801,8 +1040,8 @@ def clear_emergency():
 def mode():
     """GET returns current mode. POST JSON {mode: 'rc'|'autonomous'} to switch.
 
-    The server only tracks the desired mode. The autonomous stack (main loop / SLAM)
-    should poll this endpoint or otherwise be notified to start/stop its pipelines.
+    When switching to a non-RC mode, the server starts a background autonomy loop.
+    Switching back to RC stops the loop and stops the motors.
     """
     global MODE
     if request.method == 'GET':
@@ -813,13 +1052,20 @@ def mode():
         return jsonify({'error': 'invalid mode'}), 400
     with _keepalive_lock:
         MODE = m
-        # if leaving RC, ensure motors are stopped
-        if MODE != 'rc':
-            try:
-                motor.stop()
-            except Exception:
-                pass
-            _active_actions.clear(); _last_keepalive.clear()
+        # Always clear RC keepalive state when changing modes.
+        _active_actions.clear(); _last_keepalive.clear()
+
+        # Ensure motors are stopped on any mode change.
+        try:
+            motor.stop()
+        except Exception:
+            pass
+
+    # Start/stop autonomy loop outside lock.
+    if MODE == 'rc':
+        _stop_autonomy()
+    else:
+        _start_autonomy_if_needed()
     return jsonify({'mode': MODE})
 
 
