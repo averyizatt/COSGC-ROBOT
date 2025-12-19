@@ -13,10 +13,15 @@ class OverlayDrawer:
 
             label = obj.get('label', str(obj.get('class')))
             score = obj.get('score', 0.0)
+            rock = obj.get('rock_score', None)
             # contour detections in orange; model detections in green
             color = (0, 200, 255) if label == 'contour' else (0, 255, 0)
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-            cv2.putText(frame, f"{label} {score:.2f}",
+            if rock is None:
+                txt = f"{label} {score:.2f}"
+            else:
+                txt = f"{label} {score:.2f} rock={float(rock):.2f}"
+            cv2.putText(frame, txt,
                         (xmin, ymin - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         return frame

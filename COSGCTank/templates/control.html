@@ -231,6 +231,7 @@ tuning.innerHTML = `
     <label>Detector gamma <input id="t-gamma" type="number" step="0.05" min="0.5" max="1.5" value="0.9"></label><br>
     <label>Contour min area <input id="t-area" type="number" step="50" min="50" max="5000" value="400"></label><br>
     <label>Obstacle stop ymin <input id="t-ymin" type="number" step="0.02" min="0" max="1" value="0.35"></label><br>
+    <label>Rock score threshold <input id="t-rockthr" type="number" step="0.05" min="0" max="1" value="0.45"></label><br>
     <label>RC speed <input id="t-rcspeed" type="range" min="0.2" max="1.0" step="0.05" value="0.6"></label> <span id="t-rcspeed-val">0.6</span><br>
     <button id="t-apply">Apply</button>
 `;
@@ -245,6 +246,7 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
         det_gamma: parseFloat(document.getElementById('t-gamma').value),
         det_contour_min_area: parseInt(document.getElementById('t-area').value, 10),
         dec_obstacle_stop_ymin: parseFloat(document.getElementById('t-ymin').value),
+        det_rock_score_threshold: parseFloat(document.getElementById('t-rockthr').value),
         rc_speed: parseFloat(document.getElementById('t-rcspeed').value)
     };
     fetch('/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)})
