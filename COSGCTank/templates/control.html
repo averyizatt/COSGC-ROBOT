@@ -1,43 +1,179 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Rover Control</title>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>COSGC Rover Control</title>
 <style>
-body { background: black; color: white; text-align: center; }
-video { width: 80vw; border: 3px solid white; }
+:root {
+    --bg: #0b0f17;
+    --panel: rgba(255,255,255,0.06);
+    --panel2: rgba(255,255,255,0.09);
+    --text: #e9eefc;
+    --muted: rgba(233,238,252,0.75);
+    --border: rgba(233,238,252,0.14);
+    --shadow: 0 10px 28px rgba(0,0,0,0.45);
+    --green: #1fda7a;
+    --yellow: #f5c84c;
+    --red: #ff4d4f;
+    --blue: #4da3ff;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial;
+    background: radial-gradient(1200px 700px at 20% 0%, rgba(77,163,255,0.18), transparent 60%),
+                radial-gradient(900px 600px at 90% 15%, rgba(31,218,122,0.12), transparent 55%),
+                var(--bg);
+    color: var(--text);
+}
+
+.container { max-width: 1120px; margin: 0 auto; padding: 18px 16px 28px; }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.title { display: flex; align-items: baseline; gap: 10px; }
+.title h1 { margin: 0; font-size: 22px; letter-spacing: 0.2px; }
+.badge { font-size: 12px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; background: rgba(255,255,255,0.04); color: var(--muted); }
+.meta { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pill { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 999px; border: 1px solid var(--border); background: rgba(0,0,0,0.12); font-size: 13px; }
+.dot { width: 9px; height: 9px; border-radius: 999px; background: var(--yellow); box-shadow: 0 0 0 3px rgba(245,200,76,0.16); }
+.dot.ok { background: var(--green); box-shadow: 0 0 0 3px rgba(31,218,122,0.16); }
+.dot.bad { background: var(--red); box-shadow: 0 0 0 3px rgba(255,77,79,0.16); }
+.pill strong { font-weight: 650; }
+.pill span { color: var(--muted); }
+
+.row { display: grid; grid-template-columns: 1.55fr 1fr; gap: 14px; }
+@media (max-width: 920px) { .row { grid-template-columns: 1fr; } }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
+.card-h { padding: 12px 14px; border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.03); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.card-b { padding: 14px; }
+
+.video { width: 100%; aspect-ratio: 16 / 9; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 12px; }
+
+select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: rgba(0,0,0,0.18); color: var(--text); }
+
+.controls { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 12px; }
+
+.btn { user-select: none; border-radius: 12px; border: 1px solid var(--border); background: rgba(255,255,255,0.06); color: var(--text); padding: 12px 10px; cursor: pointer; transition: transform 0.04s ease, background 0.15s ease, border-color 0.15s ease; }
+.btn:hover { background: rgba(255,255,255,0.09); border-color: rgba(233,238,252,0.22); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: 0.45; cursor: not-allowed; }
+.btn.primary { border-color: rgba(77,163,255,0.35); background: rgba(77,163,255,0.12); }
+.btn.primary:hover { background: rgba(77,163,255,0.16); }
+.btn.stop { border-color: rgba(255,77,79,0.45); background: rgba(255,77,79,0.12); font-weight: 750; }
+.btn.stop:hover { background: rgba(255,77,79,0.16); }
+.btn.active { border-color: rgba(31,218,122,0.55); background: rgba(31,218,122,0.16); }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 520px) { .grid-2 { grid-template-columns: 1fr; } }
+
+.hint { margin-top: 10px; color: var(--muted); font-size: 13px; line-height: 1.35; }
+.field { background: rgba(255,255,255,0.04); border: 1px solid var(--border); border-radius: 12px; padding: 10px; }
+.field label { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.field label span { color: var(--muted); font-size: 13px; }
+.field input[type="number"] { width: 120px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: rgba(0,0,0,0.18); color: var(--text); }
+.field input[type="range"] { width: 100%; }
+.val { font-variant-numeric: tabular-nums; color: var(--muted); }
 </style>
 </head>
 <body>
 
-<h1>Live Rover Control</h1>
-
-<video id="video" src="http://YOUR_PI_IP:8554" autoplay playsinline></video>
-
-<div style="margin-top:12px;">
-    <button id="btn-forward">Forward (W)</button>
-    <button id="btn-left">Left (A)</button>
-    <button id="btn-stop">STOP</button>
-    <button id="btn-right">Right (D)</button>
-    <button id="btn-back">Back (S)</button>
-</div>
-
-<div style="margin-top:10px;">
-    <span id="conn" style="padding:6px;border-radius:6px;background:#550;">Connecting...</span>
-    <span id="e-stop" style="margin-left:8px;padding:6px;border-radius:6px;background:#333;">E-STOP: OFF</span>
-    <div style="margin-top:6px;">
-        Active: <span id="active-list">none</span>
+<div class="container">
+    <div class="header">
+        <div class="title">
+            <h1>COSGC Rover Control</h1>
+            <span class="badge">Hold-to-drive • RC/Autonomy • Live tuning</span>
+        </div>
+        <div class="meta">
+            <span class="pill"><span class="dot" id="conn-dot"></span><strong id="conn">Connecting…</strong></span>
+            <span class="pill"><span class="dot" id="estop-dot" style="background: rgba(233,238,252,0.25);"></span><strong id="e-stop">E‑STOP: OFF</strong></span>
+            <span class="pill"><strong>Active</strong><span id="active-list">none</span></span>
+            <span class="pill"><span class="dot" id="gp-dot" style="background: rgba(233,238,252,0.25);"></span><strong>Gamepad</strong><span id="gp-status">Not connected</span></span>
+        </div>
     </div>
-</div>
 
-<div style="margin-top:8px;">
-    Mode:
-    <select id="mode-select">
-        <option value="rc">RC (manual)</option>
-        <option value="autonomous">Autonomous (generic)</option>
-        <option value="single_cam">Autonomous (single cam)</option>
-        <option value="stereo_cam">Autonomous (stereo)</option>
-    </select>
-    <small style="margin-left:8px;color:#aaa;">Autonomous enables SLAM/navigation stack (server must handle pipeline).</small>
+    <div class="row">
+        <div class="card">
+            <div class="card-h">
+                <div>
+                    <strong>Live video</strong>
+                    <span class="badge" style="margin-left:8px;">update video URL in HTML</span>
+                </div>
+                <label style="display:flex;align-items:center;gap:8px;">
+                    <span style="color:var(--muted);font-size:13px;">Mode</span>
+                    <select id="mode-select">
+                        <option value="rc">RC (manual)</option>
+                        <option value="autonomous">Autonomous (generic)</option>
+                        <option value="single_cam">Autonomous (single cam)</option>
+                        <option value="stereo_cam">Autonomous (stereo)</option>
+                    </select>
+                </label>
+            </div>
+            <div class="card-b">
+                <video class="video" id="video" src="http://YOUR_PI_IP:8554" autoplay playsinline></video>
+
+                <div class="controls" aria-label="drive controls">
+                    <button class="btn primary" id="btn-forward">Forward <span class="val">(W)</span></button>
+                    <button class="btn" id="btn-stop">STOP</button>
+                    <button class="btn" id="btn-left">Left <span class="val">(A)</span></button>
+                    <button class="btn stop" id="btn-estop">E‑STOP</button>
+                    <button class="btn" id="btn-right">Right <span class="val">(D)</span></button>
+                    <button class="btn" id="btn-back">Back <span class="val">(S)</span></button>
+                </div>
+
+                <div class="hint">
+                    <strong>Controls:</strong> hold <span class="val">W/A/S/D</span> or press/hold buttons. Releasing stops.
+                    Space triggers E‑STOP. Xbox controller supported.
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-h">
+                <strong>Settings & tuning</strong>
+                <span class="badge">applies via <code>/settings</code></span>
+            </div>
+            <div class="card-b">
+                <div class="field">
+                    <label>
+                        <span>Enable path smoothing</span>
+                        <input id="smoothing-toggle" type="checkbox" />
+                    </label>
+                </div>
+
+                <div style="height:10px;"></div>
+
+                <div class="field"><label><span>Detector gamma</span><input id="t-gamma" type="number" step="0.05" min="0.5" max="1.5" value="0.9" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field"><label><span>Contour min area</span><input id="t-area" type="number" step="50" min="50" max="5000" value="400" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field"><label><span>Obstacle stop ymin</span><input id="t-ymin" type="number" step="0.02" min="0" max="1" value="0.35" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field"><label><span>Rock score threshold</span><input id="t-rockthr" type="number" step="0.05" min="0" max="1" value="0.45" /></label></div>
+                <div style="height:10px;"></div>
+                <div class="field">
+                    <label>
+                        <span>RC speed</span>
+                        <span class="val" id="t-rcspeed-val">0.6</span>
+                    </label>
+                    <input id="t-rcspeed" type="range" min="0.2" max="1.0" step="0.05" value="0.6" />
+                </div>
+
+                <div style="height:10px;"></div>
+
+                <div class="grid-2">
+                    <button class="btn" id="t-apply">Apply settings</button>
+                    <button class="btn stop" id="btn-clear-estop">Clear E‑STOP</button>
+                </div>
+
+                <div class="hint">
+                    <strong>Tip:</strong> In non‑RC modes, manual controls are disabled.
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -59,14 +195,24 @@ let currentMode = 'rc';
 
 function setConnState(ok) {
     const el = document.getElementById('conn');
-    if (ok) { el.textContent = 'Connected'; el.style.background = '#0a0'; }
-    else { el.textContent = 'Disconnected'; el.style.background = '#a00'; }
+    const dot = document.getElementById('conn-dot');
+    if (ok) {
+        el.textContent = 'Connected';
+        if (dot) { dot.classList.add('ok'); dot.classList.remove('bad'); }
+    } else {
+        el.textContent = 'Disconnected';
+        if (dot) { dot.classList.add('bad'); dot.classList.remove('ok'); }
+    }
 }
 
 function setEStop(on) {
     const el = document.getElementById('e-stop');
-    el.textContent = (on ? 'E-STOP: ON' : 'E-STOP: OFF');
-    el.style.background = on ? '#a00' : '#333';
+    const dot = document.getElementById('estop-dot');
+    el.textContent = (on ? 'E‑STOP: ON' : 'E‑STOP: OFF');
+    if (dot) {
+        if (on) dot.classList.add('bad');
+        else dot.classList.remove('bad');
+    }
 }
 
 function setActiveList(list) {
@@ -183,14 +329,18 @@ document.getElementById('mode-select').addEventListener('change', (ev)=>{
         .then(r=>r.json()).then(js=>{ setModeUI(js.mode); }).catch(()=>{ alert('Failed to set mode'); });
 });
 
-// Stop button immediate
-document.getElementById('btn-stop').addEventListener('click', ()=>{ fetch('/emergency_stop',{method:'POST'}).catch(()=>{}); });
+// STOP = soft stop (non e-stop)
+document.getElementById('btn-stop').addEventListener('click', ()=>{ fetch('/cmd/s').catch(()=>{}); });
+// E-stop buttons
+document.getElementById('btn-estop').addEventListener('click', ()=>{ fetch('/emergency_stop',{method:'POST'}).catch(()=>{}); });
+document.getElementById('btn-clear-estop').addEventListener('click', ()=>{ fetch('/clear_emergency',{method:'POST'}).catch(()=>{}); });
 
 function setButtonActive(action, on) {
     const map = {'f':'btn-forward','b':'btn-back','l':'btn-left','r':'btn-right'};
     const el = document.getElementById(map[action]);
     if (!el) return;
-    el.style.background = on ? '#0a0' : '';
+    if (on) el.classList.add('active');
+    else el.classList.remove('active');
     // update active list
     // fetch status to get authoritative active list
     fetch('/status').then(r=>r.json()).then(js=>{ setActiveList(js.active_actions || []); setEStop(js.e_stop); }).catch(()=>{});
@@ -210,32 +360,11 @@ fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(
 }).catch(()=>{ setConnState(false); });
 
 // smoothing toggle handler
-const smoothingToggle = document.createElement('label');
-smoothingToggle.style.display = 'block';
-smoothingToggle.style.marginTop = '8px';
-smoothingToggle.innerHTML = '<input id="smoothing-toggle" type="checkbox"> Enable path smoothing';
-document.body.appendChild(smoothingToggle);
 document.getElementById('smoothing-toggle').addEventListener('change', (ev)=>{
     const v = ev.target.checked;
     fetch('/settings', {method:'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({smoothing: v})})
         .then(r=>r.json()).then(js=>{ /* noop */ }).catch(()=>{ alert('Failed to update settings'); });
 });
-
-// Live tuning controls
-const tuning = document.createElement('div');
-tuning.style.marginTop = '10px';
-tuning.style.padding = '10px';
-tuning.style.border = '1px solid #333';
-tuning.innerHTML = `
-    <h3 style="margin:0 0 8px 0;">Tuning</h3>
-    <label>Detector gamma <input id="t-gamma" type="number" step="0.05" min="0.5" max="1.5" value="0.9"></label><br>
-    <label>Contour min area <input id="t-area" type="number" step="50" min="50" max="5000" value="400"></label><br>
-    <label>Obstacle stop ymin <input id="t-ymin" type="number" step="0.02" min="0" max="1" value="0.35"></label><br>
-    <label>Rock score threshold <input id="t-rockthr" type="number" step="0.05" min="0" max="1" value="0.45"></label><br>
-    <label>RC speed <input id="t-rcspeed" type="range" min="0.2" max="1.0" step="0.05" value="0.6"></label> <span id="t-rcspeed-val">0.6</span><br>
-    <button id="t-apply">Apply</button>
-`;
-document.body.appendChild(tuning);
 
 document.getElementById('t-rcspeed').addEventListener('input', (ev)=>{
     document.getElementById('t-rcspeed-val').textContent = ev.target.value;
@@ -256,8 +385,22 @@ document.getElementById('t-apply').addEventListener('click', ()=>{
 
 // Gamepad support
 let gpIndex = null;
+let gpPollTimer = null;
 const GP_POLL_MS = 100;
 const DEADZONE = 0.15;
+
+function setGamepadStatus(connected, name) {
+    const el = document.getElementById('gp-status');
+    const dot = document.getElementById('gp-dot');
+    if (!el) return;
+    if (connected) {
+        el.textContent = name ? `Connected: ${name}` : 'Connected';
+        if (dot) { dot.classList.add('ok'); dot.classList.remove('bad'); }
+    } else {
+        el.textContent = 'Not connected';
+        if (dot) { dot.classList.remove('ok'); dot.classList.remove('bad'); }
+    }
+}
 
 function pollGamepad() {
     const gps = navigator.getGamepads ? navigator.getGamepads() : [];
@@ -282,10 +425,31 @@ window.addEventListener('gamepadconnected', (e)=>{
     gpIndex = e.gamepad.index;
     console.log('Gamepad connected', e.gamepad.id);
     setConnState(true);
-    setInterval(pollGamepad, GP_POLL_MS);
+    setGamepadStatus(true, e.gamepad.id);
+    if (gpPollTimer) clearInterval(gpPollTimer);
+    gpPollTimer = setInterval(pollGamepad, GP_POLL_MS);
 });
 
-window.addEventListener('gamepaddisconnected', (e)=>{ if (gpIndex === e.gamepad.index) gpIndex = null; setConnState(false); });
+window.addEventListener('gamepaddisconnected', (e)=>{
+    if (gpIndex === e.gamepad.index) gpIndex = null;
+    if (gpPollTimer) { clearInterval(gpPollTimer); gpPollTimer = null; }
+    setGamepadStatus(false);
+});
+
+// initial probe (in case the page loads after the controller is already connected)
+try {
+    const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+    const first = gps && gps.length ? gps.find(g => g) : null;
+    if (first) {
+        gpIndex = first.index;
+        setGamepadStatus(true, first.id);
+        gpPollTimer = setInterval(pollGamepad, GP_POLL_MS);
+    } else {
+        setGamepadStatus(false);
+    }
+} catch (e) {
+    setGamepadStatus(false);
+}
 
 </script>
 
