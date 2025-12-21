@@ -78,6 +78,20 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
 .field input[type="number"] { width: 120px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: rgba(0,0,0,0.18); color: var(--text); }
 .field input[type="range"] { width: 100%; }
 .val { font-variant-numeric: tabular-nums; color: var(--muted); }
+
+.console {
+    margin-top: 10px;
+    background: rgba(0,0,0,0.22);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px;
+    max-height: 260px;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.35;
+}
 </style>
 </head>
 <body>
@@ -495,6 +509,39 @@ select { padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border)
                 <div class="hint">
                     <strong>Tip:</strong> In non‑RC modes, manual controls are disabled.
                 </div>
+
+                <div style="height:14px;"></div>
+                <div class="badge" style="display:inline-block;">Autonomy console</div>
+                <div style="height:10px;"></div>
+                <div class="field">
+                    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                        <span style="color:var(--muted); font-size:13px;">Decisions + runtime errors</span>
+                        <button class="btn" id="console-clear" style="padding:8px 10px;">Clear</button>
+                    </div>
+                    <pre id="autonomy-console" class="console">Waiting for data…</pre>
+                    <div class="hint" style="margin-top:8px;">Pulls from <span class="val">/status</span> and <span class="val">/console_data</span>.</div>
+                </div>
+
+                <div style="height:14px;"></div>
+                <div class="badge" style="display:inline-block;">Global map</div>
+                <div style="height:10px;"></div>
+                <div class="field">
+                    <div class="hint" style="margin-bottom:6px;">Shows the persisted occupancy grid (<span class="val">nav_map_global.npz</span>). Enable map persistence in settings to populate.</div>
+                    <img id="global-map" src="/debug/global_map.png" alt="Global map" style="width:100%; border:1px solid var(--border); border-radius:10px; background:rgba(0,0,0,0.2);" />
+                    <div style="height:8px;"></div>
+                    <div class="grid-2">
+                        <button class="btn" id="btn-map-refresh">Refresh map</button>
+                        <button class="btn stop" id="btn-map-reset">Reset map</button>
+                    </div>
+                    <div style="height:8px;"></div>
+                    <div class="field" style="background:rgba(255,255,255,0.02);">
+                        <div style="font-size:13px; color:var(--muted); display:flex; flex-direction:column; gap:6px;">
+                            <div><strong>SLAM</strong> <span id="slam-status" class="val">—</span></div>
+                            <div><strong>Nav goal</strong> <span id="nav-goal" class="val">—</span></div>
+                            <div><strong>Nav target</strong> <span id="nav-target" class="val">—</span></div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -516,6 +563,40 @@ const keepaliveIntervals = {};
 const failureCounts = {};
 let disconnected = false;
 let currentMode = 'rc';
+
+// Autonomy console
+const consoleEl = document.getElementById('autonomy-console');
+const consoleClearBtn = document.getElementById('console-clear');
+let consoleLines = [];
+let lastDecisionSig = null;
+let lastErrorSig = null;
+let lastDetectorSig = null;
+
+function _ts() {
+    try {
+        return new Date().toLocaleTimeString();
+    } catch (e) {
+        return '';
+    }
+}
+
+function consoleAppend(line) {
+    if (!consoleEl) return;
+    consoleLines.push(line);
+    if (consoleLines.length > 200) consoleLines = consoleLines.slice(consoleLines.length - 200);
+    consoleEl.textContent = consoleLines.join('\n');
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+}
+
+if (consoleClearBtn) {
+    consoleClearBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        consoleLines = [];
+        lastDecisionSig = null;
+        lastErrorSig = null;
+        if (consoleEl) consoleEl.textContent = '';
+    });
+}
 
 function setConnState(ok) {
     const el = document.getElementById('conn');
@@ -548,6 +629,48 @@ function setImuStatus(imu) {
         const age = (typeof imu.age_s === 'number') ? ` (${imu.age_s.toFixed(1)}s)` : '';
         el.textContent = `Not connected${age}`;
         if (dot) { dot.classList.remove('ok'); dot.classList.add('bad'); }
+    }
+}
+
+function setSlamStatus(slam) {
+    const el = document.getElementById('slam-status');
+    if (!el) return;
+    if (!slam) {
+        el.textContent = 'No data';
+        return;
+    }
+    const age = (typeof slam.age_s === 'number') ? `${slam.age_s.toFixed(1)}s` : '—';
+    if (slam.connected) {
+        try {
+            const p = slam.pose || {};
+            const x = (typeof p.x === 'number') ? p.x.toFixed(2) : '—';
+            const y = (typeof p.y === 'number') ? p.y.toFixed(2) : '—';
+            const yaw = (typeof p.yaw === 'number') ? p.yaw.toFixed(2) : '—';
+            el.textContent = `OK (age ${age}) x=${x} y=${y} yaw=${yaw}`;
+        } catch (e) {
+            el.textContent = `OK (age ${age})`;
+        }
+    } else {
+        el.textContent = `Missing (age ${age})`;
+    }
+}
+
+function setNavGoalTarget(goal, target) {
+    const g = document.getElementById('nav-goal');
+    const t = document.getElementById('nav-target');
+    if (g) {
+        if (goal && typeof goal.x === 'number' && typeof goal.y === 'number') {
+            g.textContent = `x=${goal.x.toFixed(2)} y=${goal.y.toFixed(2)}`;
+        } else {
+            g.textContent = '—';
+        }
+    }
+    if (t) {
+        if (target && typeof target.x === 'number' && typeof target.y === 'number') {
+            t.textContent = `x=${target.x.toFixed(2)} y=${target.y.toFixed(2)}`;
+        } else {
+            t.textContent = '—';
+        }
     }
 }
 
@@ -711,6 +834,27 @@ document.getElementById('btn-stop').addEventListener('click', ()=>{
 document.getElementById('btn-estop').addEventListener('click', ()=>{ fetch('/emergency_stop',{method:'POST'}).then(()=>fetch('/status').then(r=>r.json()).then(js=>{ setModeUI(js.mode||'rc'); setEStop(js.e_stop); })).catch(()=>{}); });
 document.getElementById('btn-clear-estop').addEventListener('click', ()=>{ fetch('/clear_emergency',{method:'POST'}).then(()=>fetch('/status').then(r=>r.json()).then(js=>{ setModeUI(js.mode||'rc'); setEStop(js.e_stop); })).catch(()=>{}); });
 
+function refreshMap() {
+    const img = document.getElementById('global-map');
+    if (img) {
+        img.src = `/debug/global_map.png?ts=${Date.now()}`;
+    }
+}
+
+const mapRefreshBtn = document.getElementById('btn-map-refresh');
+if (mapRefreshBtn) {
+    mapRefreshBtn.addEventListener('click', (ev)=>{ ev.preventDefault(); refreshMap(); });
+}
+
+const mapResetBtn = document.getElementById('btn-map-reset');
+if (mapResetBtn) {
+    mapResetBtn.addEventListener('click', async (ev)=>{
+        ev.preventDefault();
+        try { await fetch('/nav_reset', {method:'POST'}); } catch (e) {}
+        refreshMap();
+    });
+}
+
 function setButtonActive(action, on) {
     const map = {'f':'btn-forward','b':'btn-back','l':'btn-left','r':'btn-right'};
     const el = document.getElementById(map[action]);
@@ -724,8 +868,99 @@ function setButtonActive(action, on) {
 
 // poll server status periodically
 setInterval(()=>{
-    fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); setImuStatus(js.imu); }).catch(()=>{ setConnState(false); setImuStatus(null); });
+    fetch('/status').then(r=>r.json()).then(js=>{
+        setConnState(true);
+        setActiveList(js.active_actions||[]);
+        setEStop(js.e_stop);
+        setImuStatus(js.imu);
+        setSlamStatus(js.slam);
+        setNavGoalTarget(js.nav_goal, js.nav_target);
+    }).catch(()=>{ setConnState(false); setImuStatus(null); setSlamStatus(null); });
 }, 1000);
+
+// Poll autonomy console data (decisions/errors)
+setInterval(async ()=>{
+    if (!consoleEl) return;
+    try {
+        const statusRes = await fetch('/status');
+        const status = await statusRes.json();
+        let log = null;
+        try {
+            const logRes = await fetch('/console_data');
+            log = await logRes.json();
+        } catch (e) {
+            log = null;
+        }
+
+        const mode = status && status.mode ? status.mode : 'unknown';
+        const running = status && typeof status.autonomy_running === 'boolean' ? status.autonomy_running : null;
+        const age = status && typeof status.log_age_s === 'number' ? status.log_age_s : null;
+        const estop = status && status.e_stop ? true : false;
+
+        const decision = status ? status.decision : null;
+        const cmd = decision && decision.command ? String(decision.command) : null;
+        const reason = decision && decision.reason ? String(decision.reason) : null;
+        const stuck = decision && decision.stuck ? true : false;
+        const recovery = decision && decision.recovery ? true : false;
+        const recAttempt = (decision && typeof decision.recovery_attempt === 'number') ? decision.recovery_attempt : null;
+        const decisionSig = JSON.stringify({cmd, reason, stuck, recovery, recAttempt});
+        if (decisionSig !== lastDecisionSig && (cmd || reason)) {
+            const ageStr = (typeof age === 'number') ? ` age=${age.toFixed(2)}s` : '';
+            const flags = `${stuck ? ' stuck' : ''}${recovery ? ' recovery' : ''}${(recAttempt !== null) ? ` attempt=${recAttempt}` : ''}`;
+            consoleAppend(`[${_ts()}] mode=${mode} running=${running} estop=${estop}${ageStr} decision=${cmd || '—'}${reason ? ` (${reason})` : ''}${flags}`);
+            lastDecisionSig = decisionSig;
+        }
+
+        const err = status && status.autonomy_error ? String(status.autonomy_error) : null;
+        const detInitErr = status && status.detector_init_error ? String(status.detector_init_error) : null;
+        const tb = status && status.autonomy_traceback ? String(status.autonomy_traceback) : null;
+        const errorSig = JSON.stringify({err, detInitErr});
+        if (errorSig !== lastErrorSig && (err || detInitErr)) {
+            if (detInitErr) consoleAppend(`[${_ts()}] detector_init_error: ${detInitErr}`);
+            if (err) consoleAppend(`[${_ts()}] autonomy_error: ${err}`);
+            if (tb) {
+                // keep it bounded; last ~30 lines is usually enough
+                const lines = tb.split('\n');
+                const tail = lines.slice(Math.max(0, lines.length - 30)).join('\n');
+                consoleAppend(tail);
+            }
+            lastErrorSig = errorSig;
+        }
+
+        // Also show detector kind / fallback info from latest log, when available
+        try {
+            const p = log && log.perception ? log.perception : null;
+            const det = p && p.detector ? p.detector : null;
+            if (det && det.kind) {
+                const detSig = JSON.stringify({k: det.kind, e: det.detect_error || null});
+                if (detSig !== lastDetectorSig) {
+                    const detLine = `[${_ts()}] detector=${det.kind}${det.detect_error ? ` detect_error=${det.detect_error}` : ''}`;
+                    consoleAppend(detLine);
+                    lastDetectorSig = detSig;
+                }
+            }
+        } catch (e) {}
+
+        // If nothing yet, show a short heartbeat
+        if (consoleLines.length === 0) {
+            const ageStr = (typeof age === 'number') ? ` age=${age.toFixed(2)}s` : '';
+            consoleAppend(`[${_ts()}] mode=${mode} running=${running} estop=${estop}${ageStr}`);
+        }
+    } catch (e) {
+        // Don’t spam; just show occasional connectivity failure
+        const last = consoleLines.length ? consoleLines[consoleLines.length - 1] : '';
+        const line = `[${_ts()}] console poll failed`;
+        if (last !== line) consoleAppend(line);
+    }
+}, 500);
+
+// Refresh global map image periodically
+const mapImg = document.getElementById('global-map');
+if (mapImg) {
+    setInterval(()=>{
+        mapImg.src = '/debug/global_map.png?ts=' + Date.now();
+    }, 2000);
+}
 
 // initial status probe
 fetch('/status').then(r=>r.json()).then(js=>{ setConnState(true); setActiveList(js.active_actions||[]); setEStop(js.e_stop); setModeUI(js.mode||'rc');

@@ -8,8 +8,12 @@ import subprocess
 import time
 import threading
 import json
+import traceback
 from pathlib import Path
 import io
+import math
+import requests
+from collections import deque
 
 from motor_control import MotorController
 from camera import FrameProvider
@@ -43,6 +47,14 @@ _autonomy_thread = None
 _autonomy_stop = threading.Event()
 _autonomy_lock = threading.Lock()
 _autonomy_last_error = None
+_autonomy_last_traceback = None
+_autonomy_detector_init_error = None
+_autonomy_detector_init_traceback = None
+_autonomy_heartbeat_ts = 0.0
+_autonomy_last_slam_ts = 0.0
+
+_navigator = None
+_navigator_lock = threading.Lock()
 
 _power_monitor = None
 _power_lock = threading.Lock()
@@ -110,8 +122,13 @@ def _autonomy_loop():
     Runs when MODE != 'rc'. Uses the shared camera provider + SETTINGS and
     commands the server's global MotorController.
     """
-    global latest_log, latest_log_ts, _autonomy_last_error
+    global latest_log, latest_log_ts, _autonomy_last_error, _autonomy_last_traceback
+    global _autonomy_detector_init_error, _autonomy_detector_init_traceback
+    global _autonomy_heartbeat_ts, _autonomy_last_slam_ts
     _autonomy_last_error = None
+    _autonomy_last_traceback = None
+    _autonomy_detector_init_error = None
+    _autonomy_detector_init_traceback = None
 
     # Lazy imports: keep server start fast and allow partial installs.
     try:
@@ -119,8 +136,13 @@ def _autonomy_loop():
         from terrain import TerrainAnalyzer
         from decision import DecisionMaker
         from overlay import OverlayDrawer
+        from navigator import Navigator
     except Exception as e:
         _autonomy_last_error = f"import_failed:{type(e).__name__}:{e}"
+        try:
+            _autonomy_last_traceback = traceback.format_exc()
+        except Exception:
+            _autonomy_last_traceback = None
         return
 
     # Optional: full model detector
@@ -128,13 +150,26 @@ def _autonomy_loop():
     try:
         from detector import ObstacleDetector
         det = ObstacleDetector(settings=SETTINGS)
-    except Exception:
+    except Exception as e:
+        _autonomy_detector_init_error = f"{type(e).__name__}:{e}"
+        try:
+            _autonomy_detector_init_traceback = traceback.format_exc()
+        except Exception:
+            _autonomy_detector_init_traceback = None
         det = None
 
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()
     decider = DecisionMaker()
     overlay = OverlayDrawer()
+
+    nav = None
+    try:
+        nav = Navigator(grid_size=40, resolution=0.2)
+    except Exception:
+        nav = None
+    with _navigator_lock:
+        globals()['_navigator'] = nav
 
     # Optional ultrasonic
     us = None
@@ -145,9 +180,49 @@ def _autonomy_loop():
         us = None
 
     last_motor_cmd = None
+    dist_history = deque(maxlen=5)
+    dist_last_ts = 0.0
+    power_history = deque(maxlen=5)
+
+    def _median_current(hist, key):
+        vals = []
+        for p in hist:
+            try:
+                v = p.get(key, {}).get('current_a')
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+            except Exception:
+                continue
+        if not vals:
+            return None
+        vals.sort()
+        mid = len(vals) // 2
+        if len(vals) % 2 == 1:
+            return vals[mid]
+        return (vals[mid - 1] + vals[mid]) / 2.0
+
+    def _sleep_interruptible(total_s: float) -> bool:
+        """Sleep up to total_s seconds, returning False if stop/mode/estop aborts."""
+        try:
+            total = float(total_s)
+        except Exception:
+            total = 0.0
+        end = time.time() + max(0.0, total)
+        while time.time() < end:
+            if _autonomy_stop.is_set():
+                return False
+            try:
+                with _keepalive_lock:
+                    if MODE == 'rc' or bool(_e_stop):
+                        return False
+            except Exception:
+                pass
+            time.sleep(min(0.05, max(0.0, end - time.time())))
+        return True
 
     while not _autonomy_stop.is_set():
         try:
+            _autonomy_heartbeat_ts = time.time()
             with _keepalive_lock:
                 mode_now = MODE
                 estop_now = bool(_e_stop)
@@ -169,18 +244,35 @@ def _autonomy_loop():
             except Exception:
                 settings_snapshot = SETTINGS
 
+            tick_enabled = bool(settings_snapshot.get('auto_tick_enabled', True))
+
             dev_idx = _parse_camera_device(settings_snapshot.get('cam_device', '/dev/video0'))
             width = int(settings_snapshot.get('cam_width', 640))
             height = int(settings_snapshot.get('cam_height', 480))
             fps = int(settings_snapshot.get('cam_fps', 20))
 
             provider = _get_video_provider(dev_idx, width, height, fps)
+
+            # Tick mode: stop first to reduce motion blur, then capture.
+            if tick_enabled:
+                try:
+                    motor.stop()
+                    last_motor_cmd = None
+                except Exception:
+                    pass
+                _sleep_interruptible(float(settings_snapshot.get('auto_tick_settle_s', 0.06)))
+
             data = provider.get_frame()
             if data is None:
                 time.sleep(0.05)
                 continue
             frame = data.get('frame')
             ts = float(data.get('timestamp', time.time()))
+
+            detector_info = {
+                'kind': 'tflite' if det is not None else 'contour',
+                'init_error': _autonomy_detector_init_error,
+            }
 
             if det is not None:
                 try:
@@ -190,7 +282,9 @@ def _autonomy_loop():
 
             try:
                 obstacles = det.detect(frame) if det is not None else _contour_obstacles(frame, settings_snapshot)
-            except Exception:
+            except Exception as e:
+                detector_info['kind'] = 'contour_fallback'
+                detector_info['detect_error'] = f"{type(e).__name__}:{e}"
                 obstacles = _contour_obstacles(frame, settings_snapshot)
 
             boundary_info = bounds.detect(frame)
@@ -206,44 +300,219 @@ def _autonomy_loop():
             power = None
             try:
                 with _power_lock:
-                    power = _power_latest
+                    if _power_latest_ts is not None:
+                        if (time.time() - float(_power_latest_ts)) <= 1.0:
+                            power = _power_latest
+                    else:
+                        power = None
             except Exception:
                 power = None
+
+            if power is not None:
+                power_history.append(power)
+            else:
+                power_history.clear()
+            power_filtered = None
+            if power_history:
+                try:
+                    ml = _median_current(power_history, 'motor_left')
+                    mr = _median_current(power_history, 'motor_right')
+                    sys_i = _median_current(power_history, 'system')
+                    total_i = None
+                    try:
+                        vals = [v for v in (ml, mr) if isinstance(v, (int, float))]
+                        total_i = sum(vals) if vals else None
+                    except Exception:
+                        total_i = None
+                    power_filtered = {}
+                    if ml is not None:
+                        power_filtered['motor_left'] = {'current_a': ml}
+                    if mr is not None:
+                        power_filtered['motor_right'] = {'current_a': mr}
+                    if sys_i is not None:
+                        power_filtered['system'] = {'current_a': sys_i}
+                    if total_i is not None:
+                        power_filtered['total_motor_current_a'] = total_i
+                except Exception:
+                    power_filtered = None
+            if power_filtered is not None:
+                power = power_filtered
+
+            slam_pose = None
+            try:
+                resp = requests.get('http://127.0.0.1:5001/pose', timeout=0.05)
+                if resp.status_code == 200:
+                    slam_pose = (resp.json() or {}).get('pose')
+                    if isinstance(slam_pose, dict) and 'x' in slam_pose and 'y' in slam_pose:
+                        _autonomy_last_slam_ts = ts
+            except Exception:
+                slam_pose = None
+
+            try:
+                nav_goal_copy = dict(NAV_GOAL) if isinstance(NAV_GOAL, dict) else None
+            except Exception:
+                nav_goal_copy = None
+
+            if dist_cm is not None and isinstance(dist_cm, (int, float)) and 1.0 <= float(dist_cm) <= 500.0:
+                dist_history.append(float(dist_cm))
+                dist_last_ts = ts
+            dist_filtered = None
+            if dist_history and (ts - dist_last_ts) <= 1.0:
+                try:
+                    dist_filtered = float(np.median(np.array(dist_history, dtype=np.float32)))
+                except Exception:
+                    try:
+                        dist_filtered = sum(dist_history) / len(dist_history)
+                    except Exception:
+                        dist_filtered = None
+
+            dynamic_detections = []
+            try:
+                pose = slam_pose
+                if isinstance(pose, dict) and 'x' in pose and 'y' in pose:
+                    x0 = float(pose['x']); y0 = float(pose.get('y', 0.0))
+                    yaw = float(pose.get('yaw', 0.0))
+                    for obj in obstacles:
+                        box = obj.get('box', [0, 0, 0, 0])
+                        ymin = float(box[0])
+                        est_dist = 0.3 + (1.0 - min(max(ymin, 0.0), 1.0)) * 3.2
+                        center_x = (box[1] + box[3]) / 2.0
+                        angle_image = (center_x - 0.5) * (math.radians(70))
+                        ox = x0 + est_dist * math.cos(yaw + angle_image)
+                        oy = y0 + est_dist * math.sin(yaw + angle_image)
+                        dynamic_detections.append((ox, oy))
+            except Exception:
+                dynamic_detections = []
 
             perception = {
                 'timestamp': ts,
                 'obstacles': obstacles,
+                'detector': detector_info,
                 'boundary': boundary_info,
                 'terrain': terrain_info,
-                'distance_cm': dist_cm,
+                'distance_cm': dist_filtered,
                 'power': power,
                 'settings': settings_snapshot,
-                # placeholders (keeps UI/status code happy)
-                'imu': None,
-                'slam_pose': None,
+                'dynamic_detections': dynamic_detections,
+                'slam_pose': slam_pose,
                 'nav_goal': None,
                 'nav_target': None,
                 'nav_debug': None,
+                'imu': None,
             }
+
+            nav_target = None
+            nav_goal_payload = nav_goal_copy if nav_goal_copy is not None else None
+            if nav is not None and isinstance(slam_pose, dict) and 'x' in slam_pose and 'y' in slam_pose:
+                try:
+                    x0 = float(slam_pose['x']); y0 = float(slam_pose.get('y', 0.0))
+                    yaw = float(slam_pose.get('yaw', 0.0))
+                    explore_enabled = bool(settings_snapshot.get('nav_explore_enabled', False))
+                    if isinstance(nav_goal_copy, dict) and 'x' in nav_goal_copy and 'y' in nav_goal_copy:
+                        nav_goal_payload = {'x': float(nav_goal_copy['x']), 'y': float(nav_goal_copy['y'])}
+                        with _navigator_lock:
+                            nav.set_goal(nav_goal_payload['x'], nav_goal_payload['y'])
+                    elif not explore_enabled:
+                        nav_goal_dist_m = float(settings_snapshot.get('nav_goal_dist_m', 1.2))
+                        gx = x0 + nav_goal_dist_m * math.cos(yaw)
+                        gy = y0 + nav_goal_dist_m * math.sin(yaw)
+                        nav_goal_payload = {'x': gx, 'y': gy}
+                        with _navigator_lock:
+                            nav.set_goal(gx, gy)
+                    else:
+                        nav_goal_payload = None
+                except Exception:
+                    pass
+
+                try:
+                    with _navigator_lock:
+                        nav_target_raw = nav.update(perception)
+                    if nav_target_raw is not None:
+                        nav_target = {'x': float(nav_target_raw[0]), 'y': float(nav_target_raw[1])}
+                except Exception:
+                    nav_target = None
+            perception['nav_goal'] = nav_goal_payload
+            perception['nav_target'] = nav_target
 
             decision = decider.decide(perception)
 
             # Execute motor action
-            action, params = decider.map_to_motor(decision.get('command'), speed=decision.get('speed'))
-            try:
-                if hasattr(motor, action):
+            if tick_enabled:
+                cmd = decision.get('command')
+                try:
+                    sp = float(decision.get('speed')) if decision.get('speed') is not None else None
+                except Exception:
+                    sp = None
+                if sp is None:
+                    sp = float(settings_snapshot.get('auto_speed', 0.6))
+
+                fwd_s = float(settings_snapshot.get('auto_tick_forward_s', 0.18))
+                turn_s = float(settings_snapshot.get('auto_tick_turn_s', 0.16))
+                rev_s = float(settings_snapshot.get('auto_tick_reverse_s', 0.22))
+                idle_s = float(settings_snapshot.get('auto_tick_idle_s', 0.02))
+
+                try:
+                    if cmd in ('FORWARD', 'SLOW'):
+                        motor.forward(speed=sp)
+                        last_motor_cmd = 'forward'
+                        _sleep_interruptible(fwd_s)
+                    elif cmd == 'TURN_LEFT':
+                        motor.turn_left(speed=sp)
+                        last_motor_cmd = 'turn_left'
+                        _sleep_interruptible(turn_s)
+                    elif cmd == 'TURN_RIGHT':
+                        motor.turn_right(speed=sp)
+                        last_motor_cmd = 'turn_right'
+                        _sleep_interruptible(turn_s)
+                    elif cmd == 'ADJUST_LEFT':
+                        # Avoid MotorController.adjust_left() because it sleeps internally.
+                        motor.turn_left(speed=min(1.0, max(0.0, sp)))
+                        last_motor_cmd = 'turn_left'
+                        _sleep_interruptible(max(0.02, turn_s * 0.6))
+                    elif cmd == 'ADJUST_RIGHT':
+                        motor.turn_right(speed=min(1.0, max(0.0, sp)))
+                        last_motor_cmd = 'turn_right'
+                        _sleep_interruptible(max(0.02, turn_s * 0.6))
+                    elif cmd == 'STOP_REVERSE':
+                        # Interruptible reverse maneuver (avoid MotorController.stop_and_reverse() internal sleeps)
+                        motor.stop()
+                        _sleep_interruptible(0.04)
+                        motor.reverse(speed=min(1.0, max(0.0, sp)))
+                        last_motor_cmd = 'reverse'
+                        _sleep_interruptible(rev_s)
+                    else:
+                        motor.stop()
+                        last_motor_cmd = None
+                except Exception:
                     try:
-                        getattr(motor, action)(**(params or {}))
-                    except TypeError:
-                        getattr(motor, action)()
-                    last_motor_cmd = action
-            except Exception:
-                # fail safe
+                        motor.stop()
+                    except Exception:
+                        pass
+                    last_motor_cmd = None
+
                 try:
                     motor.stop()
+                    last_motor_cmd = None
                 except Exception:
                     pass
-                last_motor_cmd = None
+                _sleep_interruptible(idle_s)
+
+            else:
+                action, params = decider.map_to_motor(decision.get('command'), speed=decision.get('speed'))
+                try:
+                    if hasattr(motor, action):
+                        try:
+                            getattr(motor, action)(**(params or {}))
+                        except TypeError:
+                            getattr(motor, action)()
+                        last_motor_cmd = action
+                except Exception:
+                    # fail safe
+                    try:
+                        motor.stop()
+                    except Exception:
+                        pass
+                    last_motor_cmd = None
 
             # Update UI/debug log buffer (same structure as /log expects)
             try:
@@ -269,16 +538,24 @@ def _autonomy_loop():
             except Exception:
                 pass
 
-            # Pace loop roughly; camera read itself is the limiter.
-            time.sleep(0.01)
+            # Pace loop roughly; tick mode already sleeps during actions.
+            if not tick_enabled:
+                time.sleep(0.01)
 
         except Exception as e:
             _autonomy_last_error = f"loop_error:{type(e).__name__}:{e}"
+            try:
+                _autonomy_last_traceback = traceback.format_exc()
+            except Exception:
+                _autonomy_last_traceback = None
             try:
                 motor.stop()
             except Exception:
                 pass
             time.sleep(0.2)
+
+    with _navigator_lock:
+        globals()['_navigator'] = None
 
 
 def _start_autonomy_if_needed():
@@ -450,6 +727,18 @@ SETTINGS = {
     'auto_speed_turn': 1.0,
     # When stuck is detected (via SLAM pose delta), boost to full
     'auto_speed_stuck': 1.0,
+
+    # Tick-based autonomy (stop → detect → act → stop)
+    # This reduces motion blur and can lower CPU/camera load.
+    'auto_tick_enabled': True,
+    # Time to remain stopped before grabbing a frame (seconds)
+    'auto_tick_settle_s': 0.06,
+    # Drive durations per tick (seconds)
+    'auto_tick_forward_s': 0.18,
+    'auto_tick_turn_s': 0.16,
+    'auto_tick_reverse_s': 0.22,
+    # Pause between ticks (seconds)
+    'auto_tick_idle_s': 0.02,
 
     # IMU (MPU-6050 / GY-521) tuning
     'imu_enabled': True,
@@ -639,6 +928,14 @@ def _apply_settings_ranges():
     SETTINGS['auto_speed_turn'] = _clamp(SETTINGS.get('auto_speed_turn', 1.0), 0.0, 1.0)
     SETTINGS['auto_speed_stuck'] = _clamp(SETTINGS.get('auto_speed_stuck', 1.0), 0.0, 1.0)
 
+    # Tick-based autonomy
+    SETTINGS['auto_tick_enabled'] = bool(SETTINGS.get('auto_tick_enabled', True))
+    SETTINGS['auto_tick_settle_s'] = _clamp(SETTINGS.get('auto_tick_settle_s', 0.06), 0.0, 0.5)
+    SETTINGS['auto_tick_forward_s'] = _clamp(SETTINGS.get('auto_tick_forward_s', 0.18), 0.02, 2.0)
+    SETTINGS['auto_tick_turn_s'] = _clamp(SETTINGS.get('auto_tick_turn_s', 0.16), 0.02, 2.0)
+    SETTINGS['auto_tick_reverse_s'] = _clamp(SETTINGS.get('auto_tick_reverse_s', 0.22), 0.02, 2.0)
+    SETTINGS['auto_tick_idle_s'] = _clamp(SETTINGS.get('auto_tick_idle_s', 0.02), 0.0, 1.0)
+
     # IMU (MPU-6050)
     SETTINGS['imu_enabled'] = bool(SETTINGS.get('imu_enabled', True))
     SETTINGS['imu_i2c_bus'] = _clamp_int(SETTINGS.get('imu_i2c_bus', 1), 0, 10)
@@ -749,6 +1046,41 @@ def _watchdog_loop():
 # start watchdog thread
 _watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
 _watchdog_thread.start()
+
+
+def _autonomy_watchdog_loop():
+    """Restart autonomy if the loop stalls for too long."""
+    while True:
+        try:
+            now = time.time()
+            stale = None
+            try:
+                if _autonomy_heartbeat_ts > 0:
+                    stale = now - float(_autonomy_heartbeat_ts)
+            except Exception:
+                stale = None
+            if MODE != 'rc' and _autonomy_thread is not None and _autonomy_thread.is_alive():
+                if stale is not None and stale > 1.2:
+                    try:
+                        globals()['_autonomy_last_error'] = 'heartbeat_timeout'
+                    except Exception:
+                        pass
+                    try:
+                        _stop_autonomy()
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+                    try:
+                        _start_autonomy_if_needed()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+
+_autonomy_watchdog_thread = threading.Thread(target=_autonomy_watchdog_loop, daemon=True)
+_autonomy_watchdog_thread.start()
 
 
 def _power_poll_loop():
@@ -1035,9 +1367,12 @@ def keepalive():
 def status():
     with _keepalive_lock:
         power_copy = None
+        power_age = None
         try:
             with _power_lock:
                 power_copy = _power_latest
+                if _power_latest_ts is not None:
+                    power_age = max(0.0, time.time() - float(_power_latest_ts))
         except Exception:
             power_copy = None
         # best-effort IMU summary from the last autonomy log (if running)
@@ -1063,6 +1398,19 @@ def status():
                 imu_summary = {'connected': False, 'age_s': max(0.0, time.time() - latest_log_ts) if latest_log_ts else None}
         except Exception:
             imu_summary = None
+
+        slam_summary = None
+        try:
+            slam_age = None if _autonomy_last_slam_ts == 0 else max(0.0, time.time() - _autonomy_last_slam_ts)
+            p = (latest_log or {}).get('perception', {}) if isinstance(latest_log, dict) else {}
+            slam_pose = p.get('slam_pose') if isinstance(p, dict) else None
+            slam_summary = {
+                'connected': slam_pose is not None,
+                'age_s': slam_age,
+                'pose': slam_pose,
+            }
+        except Exception:
+            slam_summary = None
 
         nav_summary = None
         try:
@@ -1100,21 +1448,34 @@ def status():
                     }
         except Exception:
             decision_debug = None
+        nav_target = None
+        try:
+            p = (latest_log or {}).get('perception', {}) if isinstance(latest_log, dict) else {}
+            if isinstance(p, dict):
+                nt = p.get('nav_target')
+                nav_target = nt if isinstance(nt, dict) else None
+        except Exception:
+            nav_target = None
         return jsonify({
             'active_actions': list(_active_actions),
             'e_stop': bool(_e_stop),
             'mode': MODE,
             'autonomy_running': bool(_autonomy_thread is not None and _autonomy_thread.is_alive()),
             'autonomy_error': _autonomy_last_error,
+            'autonomy_traceback': _autonomy_last_traceback,
+            'detector_init_error': _autonomy_detector_init_error,
             'log_age_s': (max(0.0, time.time() - latest_log_ts) if latest_log_ts else None),
             'smoothing': bool(SETTINGS.get('smoothing', False)),
             'settings': SETTINGS,
             'imu': imu_summary,
+            'slam': slam_summary,
             'nav': nav_summary,
             'nav_debug': nav_debug,
             'nav_goal': NAV_GOAL,
+            'nav_target': nav_target,
             'decision': decision_debug,
             'power': power_copy,
+            'power_age_s': power_age,
         })
 
 
@@ -1122,45 +1483,97 @@ def status():
 def debug_global_map_png():
     """Render a lightweight global map PNG (seen vs occupied).
 
-    This is best-effort debug output using the most recent `/log` payload.
+    This reads the persisted nav_map_global.npz (Navigator save) and visualizes:
+      - red: occupied
+      - gray: observed free
+      - dark: unknown/unobserved
+      - yellow: dynamic occupancy over threshold
     """
     try:
         import numpy as np
         import cv2
         from flask import Response
 
-        # Try to read optional raw arrays from log if present (not currently sent).
-        # Fallback: just render a blank image with whatever info we have.
-        # Note: global grids live inside Navigator; we don't have them here unless
-        # you later decide to stream them via /log.
-        img = np.zeros((240, 240, 3), dtype=np.uint8)
-        img[:] = (10, 10, 14)
-
-        txt = 'global map: (not streamed)'
+        occ = seen = dyn = origin = None
+        map_label = 'live'
         try:
-            p = (latest_log or {}).get('perception', {}) if isinstance(latest_log, dict) else {}
-            nd = p.get('nav_debug') if isinstance(p, dict) else None
-            if isinstance(nd, dict):
-                plan = nd.get('plan')
-                front = nd.get('frontier')
-                eg = nd.get('explore_goal_world')
-                txt = f"plan={plan} frontier={front} explore_goal={eg}"
+            with _navigator_lock:
+                nav = _navigator
+                if nav is not None:
+                    occ = np.array(nav.global_occupancy, dtype=np.uint8, copy=True)
+                    seen = np.array(nav.global_seen, dtype=np.uint8, copy=True)
+                    dyn = np.array(nav.global_dyn, dtype=np.float32, copy=True)
+                    if nav.global_origin is not None:
+                        origin = np.array([nav.global_origin[0], nav.global_origin[1]], dtype=np.float32)
+        except Exception:
+            occ = seen = dyn = origin = None
+
+        if occ is None:
+            try:
+                nav_path = SETTINGS.get('nav_persist_path', 'nav_map_global.npz')
+            except Exception:
+                nav_path = 'nav_map_global.npz'
+            p = Path(nav_path)
+            if not p.is_absolute():
+                p = Path(__file__).parent / p
+
+            if not p.exists():
+                img = np.zeros((320, 320, 3), dtype=np.uint8)
+                img[:] = (22, 24, 32)
+                cv2.putText(img, 'No map file', (12, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
+                cv2.putText(img, str(p), (12, 205), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
+                ok, buf = cv2.imencode('.png', img)
+                return Response(buf.tobytes(), mimetype='image/png') if ok else ('encode_failed', 500)
+
+            data = np.load(p, allow_pickle=False)
+            occ = np.array(data.get('global_occupancy'), dtype=np.uint8) if 'global_occupancy' in data else None
+            seen = np.array(data.get('global_seen'), dtype=np.uint8) if 'global_seen' in data else None
+            dyn = np.array(data.get('global_dyn'), dtype=np.float32) if 'global_dyn' in data else None
+            origin = np.array(data.get('global_origin')).reshape(-1) if 'global_origin' in data else None
+            map_label = p.name
+        else:
+            map_label = 'live'
+
+        if occ is None or occ.ndim != 2:
+            return ('no_occupancy', 500)
+
+        h, w = occ.shape
+        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        canvas[:] = (25, 25, 30)  # unknown
+
+        if seen is not None and seen.shape == occ.shape:
+            canvas[seen == 1] = (80, 80, 80)
+
+        dyn_mask = None
+        if dyn is not None and dyn.shape == occ.shape:
+            try:
+                dyn_thresh = float(SETTINGS.get('nav_dyn_thresh', 0.40))
+            except Exception:
+                dyn_thresh = 0.40
+            dyn_mask = dyn >= dyn_thresh
+            canvas[dyn_mask] = (40, 200, 200)
+
+        canvas[occ == 1] = (0, 0, 220)
+
+        try:
+            if origin is not None and origin.size >= 2 and np.isfinite(origin[0]) and np.isfinite(origin[1]):
+                cx = w // 2
+                cy = h // 2
+                cv2.drawMarker(canvas, (cx, cy), (0, 255, 0), markerType=cv2.MARKER_CROSS, markerSize=12, thickness=2)
         except Exception:
             pass
 
-        cv2.putText(img, 'Navigator global map', (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 230), 1)
-        # Wrap long debug string
-        y = 48
-        for chunk in [txt[i:i+52] for i in range(0, len(txt), 52)]:
-            cv2.putText(img, chunk, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170, 170, 180), 1)
-            y += 18
-
-        ok, buf = cv2.imencode('.png', img)
+        scale = 2
+        if max(h, w) < 300:
+            scale = int(max(2, round(320 / max(h, w))))
+        img = cv2.resize(canvas, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
+        cv2.putText(img, f"map: {map_label}", (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1)
+        ok, buf = cv2.imencode('.png', cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         if not ok:
             return ('encode_failed', 500)
         return Response(buf.tobytes(), mimetype='image/png')
     except Exception:
-        return ('unavailable', 500)
+        return ('error', 500)
 
 
 @app.route('/nav_goal', methods=['GET', 'POST', 'DELETE'])
@@ -1185,6 +1598,44 @@ def nav_goal():
         return jsonify({'error': 'bad_goal'}), 400
     NAV_GOAL = {'x': x, 'y': y}
     return jsonify({'nav_goal': NAV_GOAL})
+
+
+def _reset_nav_state(delete_file=True):
+    """Clear live navigator state and optionally delete persisted map."""
+    try:
+        with _navigator_lock:
+            nav = _navigator
+            if nav is not None:
+                nav.global_occupancy[:, :] = 0
+                nav.global_seen[:, :] = 0
+                nav.global_dyn[:, :] = 0.0
+                nav.global_visit_count[:, :] = 0
+                nav.global_origin = None
+                nav.goal = None
+                nav._explore_goal_cell = None
+    except Exception:
+        pass
+
+    if not delete_file:
+        return
+    try:
+        nav_path = SETTINGS.get('nav_persist_path', 'nav_map_global.npz')
+    except Exception:
+        nav_path = 'nav_map_global.npz'
+    p = Path(nav_path)
+    if not p.is_absolute():
+        p = Path(__file__).parent / p
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+@app.route('/nav_reset', methods=['POST'])
+def nav_reset():
+    _reset_nav_state(delete_file=True)
+    return jsonify({'status': 'reset'})
 
 
 @app.route('/emergency_stop', methods=['POST'])

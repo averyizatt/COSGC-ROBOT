@@ -83,9 +83,10 @@ class DecisionMaker:
                 return {"command": "SLOW", "reason": "IMU jolt cooldown"}
 
         terrain = perception.get("terrain", {})
-        # if a deep dip detected, do immediate stop+reverse
+        # Terrain dip detection can be noisy depending on lighting/ground texture.
+        # Treat as a slow-down by default instead of an immediate reverse.
         if terrain.get("dip_detected"):
-            return {"command": "STOP_REVERSE", "reason": "Dip detected"}
+            return {"command": "SLOW", "reason": "Dip detected"}
 
         # terrain roughness: if very rough, slow and prefer careful steering
         roughness = terrain.get('variance', 0.0)
@@ -94,6 +95,10 @@ class DecisionMaker:
 
         # Ultrasonic distance check (safety)
         distance = perception.get("distance_cm")
+        if isinstance(distance, (int, float)):
+            # sanity filter: ignore obviously bogus ranges
+            if not (1.0 <= float(distance) <= 500.0):
+                distance = None
         if distance is not None:
             # If extremely close, emergency stop and reverse
             if distance < 12.0:
@@ -116,6 +121,24 @@ class DecisionMaker:
             cur_enabled = True
         if cur_enabled:
             total_a, left_a, right_a, system_a = self._extract_currents(perception)
+
+            # Normalize / sanity-check currents; sensors can report negative direction.
+            def _norm_i(v):
+                if not isinstance(v, (int, float)):
+                    return None
+                try:
+                    v = abs(float(v))
+                except Exception:
+                    return None
+                # treat extreme values as invalid (likely bad shunt value / decode)
+                if not math.isfinite(v) or v > 60.0:
+                    return None
+                return v
+
+            total_a = _norm_i(total_a)
+            left_a = _norm_i(left_a)
+            right_a = _norm_i(right_a)
+            system_a = _norm_i(system_a)
             try:
                 motor_over_a = float(s.get('dec_current_motor_over_a', 7.0))
                 system_over_a = float(s.get('dec_current_system_over_a', 10.0))
