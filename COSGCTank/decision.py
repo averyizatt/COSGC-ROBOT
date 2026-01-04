@@ -88,9 +88,24 @@ class DecisionMaker:
         if terrain.get("dip_detected"):
             return {"command": "SLOW", "reason": "Dip detected"}
 
-        # terrain roughness: if very rough, slow and prefer careful steering
+        # terrain roughness: debounce high variance before slowing
         roughness = terrain.get('variance', 0.0)
-        if roughness > 120.0:
+        try:
+            rough_thresh = float(s.get('dec_rough_slow_thresh', 200.0))
+        except Exception:
+            rough_thresh = 200.0
+        try:
+            rough_frames = int(s.get('dec_rough_slow_frames', 3))
+        except Exception:
+            rough_frames = 3
+        rough_frames = max(1, min(50, rough_frames))
+        if not hasattr(self, '_rough_high_count'):
+            self._rough_high_count = 0
+        if isinstance(roughness, (int, float)) and roughness > rough_thresh:
+            self._rough_high_count += 1
+        else:
+            self._rough_high_count = 0
+        if self._rough_high_count >= rough_frames:
             return {"command": "SLOW", "reason": f"High roughness ({roughness:.1f})"}
 
         # Ultrasonic distance check (safety)

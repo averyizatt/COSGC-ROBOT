@@ -52,6 +52,7 @@ _autonomy_detector_init_error = None
 _autonomy_detector_init_traceback = None
 _autonomy_heartbeat_ts = 0.0
 _autonomy_last_slam_ts = 0.0
+_autonomy_restart_attempts = 0
 
 _navigator = None
 _navigator_lock = threading.Lock()
@@ -145,18 +146,22 @@ def _autonomy_loop():
             _autonomy_last_traceback = None
         return
 
-    # Optional: full model detector
+    # Optional: full model detector (tflite). Try once; stick to contour if unavailable.
     det = None
-    try:
-        from detector import ObstacleDetector
-        det = ObstacleDetector(settings=SETTINGS)
-    except Exception as e:
-        _autonomy_detector_init_error = f"{type(e).__name__}:{e}"
+    det_available = False
+    if bool(SETTINGS.get('det_use_tflite', False)):
         try:
-            _autonomy_detector_init_traceback = traceback.format_exc()
-        except Exception:
-            _autonomy_detector_init_traceback = None
-        det = None
+            from detector import ObstacleDetector
+            det = ObstacleDetector(settings=SETTINGS)
+            det_available = True
+        except Exception as e:
+            _autonomy_detector_init_error = f"{type(e).__name__}:{e}"
+            try:
+                _autonomy_detector_init_traceback = traceback.format_exc()
+            except Exception:
+                _autonomy_detector_init_traceback = None
+            det = None
+            det_available = False
 
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()
@@ -281,7 +286,10 @@ def _autonomy_loop():
                     pass
 
             try:
-                obstacles = det.detect(frame) if det is not None else _contour_obstacles(frame, settings_snapshot)
+                if det is not None:
+                    obstacles = det.detect(frame)
+                else:
+                    obstacles = _contour_obstacles(frame, settings_snapshot)
             except Exception as e:
                 detector_info['kind'] = 'contour_fallback'
                 detector_info['detect_error'] = f"{type(e).__name__}:{e}"
@@ -696,11 +704,14 @@ SETTINGS = {
     'smoothing': True,
     # detector tuning
     'det_gamma': 0.9,
+    'det_use_tflite': False,
     'det_contour_min_area': 400,
     'det_clahe_clip': 3.0,
     'det_rock_score_threshold': 0.45,
     # decision tuning
     'dec_obstacle_stop_ymin': 0.35,
+    'dec_rough_slow_thresh': 200.0,
+    'dec_rough_slow_frames': 3,
     'dec_ultra_stop_cm': 12.0,
     'dec_ultra_turn_cm': 30.0,
     'dec_stuck_dx_m': 0.02,
@@ -886,12 +897,18 @@ def _apply_settings_ranges():
 
     # Detector
     SETTINGS['det_gamma'] = _clamp(SETTINGS.get('det_gamma', 0.9), 0.5, 1.5)
+    try:
+        SETTINGS['det_use_tflite'] = bool(SETTINGS.get('det_use_tflite', False))
+    except Exception:
+        SETTINGS['det_use_tflite'] = False
     SETTINGS['det_contour_min_area'] = _clamp_int(SETTINGS.get('det_contour_min_area', 400), 50, 20000)
     SETTINGS['det_clahe_clip'] = _clamp(SETTINGS.get('det_clahe_clip', 3.0), 0.5, 10.0)
     SETTINGS['det_rock_score_threshold'] = _clamp(SETTINGS.get('det_rock_score_threshold', 0.45), 0.0, 1.0)
 
     # Decision
     SETTINGS['dec_obstacle_stop_ymin'] = _clamp(SETTINGS.get('dec_obstacle_stop_ymin', 0.35), 0.0, 1.0)
+    SETTINGS['dec_rough_slow_thresh'] = _clamp(SETTINGS.get('dec_rough_slow_thresh', 200.0), 0.0, 2000.0)
+    SETTINGS['dec_rough_slow_frames'] = _clamp_int(SETTINGS.get('dec_rough_slow_frames', 3), 1, 50)
     # Ultrasonic thresholds (HC-SR04 typical operating range)
     SETTINGS['dec_ultra_stop_cm'] = _clamp(SETTINGS.get('dec_ultra_stop_cm', 12.0), 2.0, 200.0)
     SETTINGS['dec_ultra_turn_cm'] = _clamp(SETTINGS.get('dec_ultra_turn_cm', 30.0), 5.0, 300.0)
@@ -1059,21 +1076,44 @@ def _autonomy_watchdog_loop():
                     stale = now - float(_autonomy_heartbeat_ts)
             except Exception:
                 stale = None
+
             if MODE != 'rc' and _autonomy_thread is not None and _autonomy_thread.is_alive():
-                if stale is not None and stale > 1.2:
+                try:
+                    if stale is not None and stale <= 4.0:
+                        globals()['_autonomy_restart_attempts'] = 0
+                except Exception:
+                    pass
+                if stale is not None and stale > 4.0:
                     try:
                         globals()['_autonomy_last_error'] = 'heartbeat_timeout'
                     except Exception:
                         pass
                     try:
-                        _stop_autonomy()
+                        attempts = globals().get('_autonomy_restart_attempts', 0)
                     except Exception:
-                        pass
-                    time.sleep(0.25)
-                    try:
-                        _start_autonomy_if_needed()
-                    except Exception:
-                        pass
+                        attempts = 0
+                    if attempts >= 3:
+                        try:
+                            globals()['_autonomy_last_error'] = 'heartbeat_timeout_max'
+                        except Exception:
+                            pass
+                        time.sleep(1.0)
+                    else:
+                        try:
+                            globals()['_autonomy_restart_attempts'] = attempts + 1
+                        except Exception:
+                            pass
+                        backoff = 0.5 * (attempts + 1)
+                        time.sleep(backoff)
+                        try:
+                            _stop_autonomy()
+                        except Exception:
+                            pass
+                        time.sleep(0.25)
+                        try:
+                            _start_autonomy_if_needed()
+                        except Exception:
+                            pass
         except Exception:
             pass
         time.sleep(0.4)
