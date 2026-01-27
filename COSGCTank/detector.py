@@ -1,6 +1,16 @@
 import numpy as np
 import cv2
 from utils import resize_frame
+import os
+
+_HAS_TRT = False
+try:
+    import tensorrt as trt  # type: ignore
+    import pycuda.driver as cuda  # type: ignore
+    import pycuda.autoinit  # type: ignore
+    _HAS_TRT = True
+except Exception:
+    _HAS_TRT = False
 
 try:
     import tflite_runtime.interpreter as tflite
@@ -23,24 +33,97 @@ class ObstacleDetector:
     """
 
     def __init__(self, model_path="models/mobilenet_ssd.tflite", input_size=(300, 300), score_threshold=0.5, labels=None, settings=None):
-        if tflite is None:
-            raise RuntimeError("TFLite interpreter not available; install tflite-runtime or TensorFlow Lite")
-
         self.model_path = model_path
         self.input_size = input_size
         self.score_threshold = float(score_threshold)
         self.labels = labels or {}
         self.settings = settings or {}
 
-        self.interpreter = tflite.Interpreter(model_path=model_path)
-        self.interpreter.allocate_tensors()
+        # Enable OpenCV optimizations on capable platforms (Jetson/Pi)
+        try:
+            cv2.setUseOptimized(True)
+            cv2.setNumThreads(max(1, int(self.settings.get('cv_threads', 2))))
+        except Exception:
+            pass
 
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
+        # Optional TensorRT backend
+        self._use_trt = bool(self.settings.get('use_trt', False)) and _HAS_TRT
+        self._trt = None
+        self._trt_context = None
+        self._trt_bindings = {}
+        self._trt_stream = None
+        self._trt_in_name = None
+        self._trt_out_names = []
+
+        if self._use_trt:
+            engine_path = str(self.settings.get('trt_engine_path', 'models/mobilenet_ssd.engine'))
+            if not os.path.exists(engine_path):
+                self._use_trt = False
+            else:
+                try:
+                    logger = trt.Logger(trt.Logger.WARNING)
+                    with open(engine_path, 'rb') as f:
+                        runtime = trt.Runtime(logger)
+                        self._trt = runtime.deserialize_cuda_engine(f.read())
+                    self._trt_context = self._trt.create_execution_context()
+                    self._trt_stream = cuda.Stream()
+                    # Prepare bindings
+                    for i in range(self._trt.num_bindings):
+                        name = self._trt.get_binding_name(i)
+                        dtype = trt.nptype(self._trt.get_binding_dtype(i))
+                        shape = tuple(self._trt.get_binding_shape(i))
+                        is_input = self._trt.binding_is_input(i)
+                        size = int(np.prod(shape))
+                        d_buf = cuda.mem_alloc(size * np.dtype(dtype).itemsize)
+                        self._trt_bindings[name] = {
+                            'index': i,
+                            'dtype': dtype,
+                            'shape': shape,
+                            'size': size,
+                            'device_buf': d_buf,
+                            'is_input': is_input,
+                        }
+                    # Configure inputs/outputs
+                    self._trt_out_names = list(self.settings.get('trt_outputs', ['boxes', 'scores', 'classes']))
+                    if not all(n in self._trt_bindings for n in self._trt_out_names):
+                        self._trt_out_names = [n for n, b in self._trt_bindings.items() if not b['is_input']]
+                    self._trt_in_name = self.settings.get('trt_input', None)
+                    if not self._trt_in_name:
+                        for n, b in self._trt_bindings.items():
+                            if b['is_input']:
+                                self._trt_in_name = n
+                                break
+                except Exception:
+                    self._use_trt = False
+
+        if not self._use_trt:
+            # Graceful fallback: if TFLite is unavailable, run contour-based detector only.
+            if tflite is None:
+                self.interpreter = None
+                self.input_details = []
+                self.output_details = []
+            else:
+                self.interpreter = tflite.Interpreter(model_path=model_path)
+                self.interpreter.allocate_tensors()
+                self.input_details = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
 
     def _preprocess(self, frame):
-        # Resize to model input and ensure uint8
-        img = resize_frame(frame, self.input_size)
+        # Resize to model input and ensure uint8 (prefer CUDA resize when available)
+        try:
+            use_cuda = bool(self.settings.get('use_cuda_resize', True)) and hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0
+        except Exception:
+            use_cuda = False
+        if use_cuda:
+            try:
+                g = cv2.cuda_GpuMat()
+                g.upload(frame)
+                g_resized = cv2.cuda.resize(g, self.input_size)
+                img = g_resized.download()
+            except Exception:
+                img = resize_frame(frame, self.input_size)
+        else:
+            img = resize_frame(frame, self.input_size)
 
         # Convert to LAB and apply CLAHE on L channel to reduce brightness/contrast issues
         try:
@@ -163,27 +246,81 @@ class ObstacleDetector:
         inp = self._preprocess(frame)
 
         detections = []
-        try:
-            self.interpreter.set_tensor(self.input_details[0]['index'], inp)
-            self.interpreter.invoke()
-            # output ordering can vary by model; many SSDs use boxes, classes, scores
-            boxes = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
-            classes = self.interpreter.get_tensor(self.output_details[1]['index'])[0]
-            scores = self.interpreter.get_tensor(self.output_details[2]['index'])[0]
+        if self._use_trt and self._trt and self._trt_context is not None:
+            try:
+                in_b = self._trt_bindings[self._trt_in_name]
+                in_host = np.ascontiguousarray(inp.astype(in_b['dtype']).reshape(in_b['shape']))
+                cuda.memcpy_htod_async(in_b['device_buf'], in_host, self._trt_stream)
 
-            for i, score in enumerate(scores):
-                if float(score) >= self.score_threshold:
-                    bbox = boxes[i].tolist()
-                    cls = int(classes[i]) if classes is not None else 0
-                    detections.append({
-                        "box": bbox,
-                        "class": cls,
-                        "score": float(score),
-                        "label": self.labels.get(cls, str(cls))
-                    })
-        except Exception:
-            # model may fail on some platforms; we'll rely on fallback below
-            detections = []
+                bindings = [None] * self._trt.num_bindings
+                for name, b in self._trt_bindings.items():
+                    bindings[b['index']] = int(b['device_buf'])
+
+                self._trt_context.execute_async_v2(bindings=bindings, stream_handle=self._trt_stream.handle)
+
+                out_arrays = {}
+                for name in self._trt_out_names:
+                    b = self._trt_bindings.get(name)
+                    if not b:
+                        continue
+                    host = np.empty(b['shape'], dtype=b['dtype'])
+                    cuda.memcpy_dtoh_async(host, b['device_buf'], self._trt_stream)
+                    out_arrays[name] = host
+                self._trt_stream.synchronize()
+
+                keys = list(out_arrays.keys())
+                if len(keys) >= 3:
+                    boxes, scores, classes = out_arrays[keys[0]], out_arrays[keys[1]], out_arrays[keys[2]]
+                else:
+                    boxes = out_arrays.get('boxes')
+                    scores = out_arrays.get('scores')
+                    classes = out_arrays.get('classes')
+
+                if boxes is None or scores is None or classes is None:
+                    raise RuntimeError('TRT outputs unavailable')
+
+                boxes = boxes[0] if boxes.ndim == 3 else boxes
+                scores = scores[0] if scores.ndim > 1 else scores
+                classes = classes[0] if classes.ndim > 1 else classes
+
+                for i, score in enumerate(scores):
+                    if float(score) >= self.score_threshold:
+                        bbox = boxes[i].tolist()
+                        cls = int(classes[i]) if classes is not None else 0
+                        detections.append({
+                            "box": bbox,
+                            "class": cls,
+                            "score": float(score),
+                            "label": self.labels.get(cls, str(cls))
+                        })
+            except Exception:
+                detections = []
+        else:
+            try:
+                if self.interpreter is not None:
+                    self.interpreter.set_tensor(self.input_details[0]['index'], inp)
+                    self.interpreter.invoke()
+                    # output ordering can vary by model; many SSDs use boxes, classes, scores
+                    boxes = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
+                    classes = self.interpreter.get_tensor(self.output_details[1]['index'])[0]
+                    scores = self.interpreter.get_tensor(self.output_details[2]['index'])[0]
+
+                    for i, score in enumerate(scores):
+                        if float(score) >= self.score_threshold:
+                            bbox = boxes[i].tolist()
+                            cls = int(classes[i]) if classes is not None else 0
+                            detections.append({
+                                "box": bbox,
+                                "class": cls,
+                                "score": float(score),
+                                "label": self.labels.get(cls, str(cls))
+                            })
+                else:
+                    # No interpreter available; keep detections empty and rely on fallback below
+                    detections = []
+            except Exception:
+                # model may fail on some platforms; we'll rely on fallback below
+                detections = []
 
         # Complement with contour-based detections to improve recall in sandy bright scenes
         try:

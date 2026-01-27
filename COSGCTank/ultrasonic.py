@@ -2,8 +2,8 @@
 simulation fallback.
 
 Default wiring (BCM GPIO numbers) for this rover:
-    - TRIG -> GPIO 24
-    - ECHO -> GPIO 25
+    - TRIG -> GPIO 6   (physical pin 31)
+    - ECHO -> GPIO 12  (physical pin 32)
 
 IMPORTANT (Raspberry Pi safety): HC-SR04 ECHO is typically 5V.
 You MUST level-shift ECHO to 3.3V before connecting to a Pi GPIO.
@@ -23,17 +23,24 @@ import logging
 import statistics
 
 try:
-    import RPi.GPIO as GPIO
+    import RPi.GPIO as GPIO  # type: ignore
     _HAS_GPIO = True
+    _GPIO_BACKEND = 'RPi'
 except Exception:
-    _HAS_GPIO = False
+    try:
+        import Jetson.GPIO as GPIO  # type: ignore
+        _HAS_GPIO = True
+        _GPIO_BACKEND = 'Jetson'
+    except Exception:
+        _HAS_GPIO = False
+        _GPIO_BACKEND = None
 
 logging.basicConfig(level=logging.INFO)
 
 
 class Ultrasonic:
-    DEFAULT_TRIG_BCM = 24
-    DEFAULT_ECHO_BCM = 25
+    DEFAULT_TRIG_BCM = 6
+    DEFAULT_ECHO_BCM = 12
 
     def __init__(self, trig_pin=DEFAULT_TRIG_BCM, echo_pin=DEFAULT_ECHO_BCM, timeout_s=0.03):
         self.trig = int(trig_pin)
@@ -49,7 +56,7 @@ class Ultrasonic:
             GPIO.output(self.trig, GPIO.LOW)
             time.sleep(0.05)
         else:
-            logging.info("Ultrasonic: RPi.GPIO not available — running in simulation mode")
+            logging.info("Ultrasonic: GPIO backend not available — running in simulation mode")
 
     def _read_once_cm(self):
         """Perform a single ping and return distance in centimeters, or None."""

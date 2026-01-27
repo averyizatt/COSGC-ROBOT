@@ -1,10 +1,14 @@
 from camera import FrameProvider
+import argparse
+import os
 from detector import ObstacleDetector
 from boundaries import BoundaryDetector
 from terrain import TerrainAnalyzer
 from decision import DecisionMaker
 from overlay import OverlayDrawer
 from motor_control import MotorController
+from tft_display import TFTDisplay
+from hardware_switches import Switches
 
 import cv2
 import time
@@ -29,9 +33,19 @@ def send_log_to_server(data):
 
 
 def main():
+    # CLI args: allow video file input for demos/tests
+    parser = argparse.ArgumentParser(description="COSGC Tank Rover Pipeline")
+    parser.add_argument("--video", type=str, default=None, help="Path to a video file for offline testing")
+    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index (ignored if --video provided)")
+    parser.add_argument("--width", type=int, default=640, help="Output frame width")
+    parser.add_argument("--height", type=int, default=480, help="Output frame height")
+    parser.add_argument("--fps", type=int, default=20, help="Target processing FPS")
+    args, unknown = parser.parse_known_args()
+
     print("Starting rover perception system...")
 
-    provider = FrameProvider(width=640, height=480, fps=20)
+    cam_source = args.video if (args.video and os.path.exists(args.video)) else args.camera_index
+    provider = FrameProvider(width=args.width, height=args.height, fps=args.fps, camera_index=cam_source)
     det = ObstacleDetector(settings={})
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()
@@ -40,8 +54,8 @@ def main():
     motor = MotorController()
     try:
         from ultrasonic import Ultrasonic
-        # HC-SR04 wiring (BCM): TRIG=24, ECHO=25 (ECHO must be level-shifted to 3.3V)
-        us = Ultrasonic(trig_pin=24, echo_pin=25)
+        # HC-SR04 wiring (BCM): TRIG=6 (pin31), ECHO=12 (pin32). Level-shift ECHO to 3.3V.
+        us = Ultrasonic(trig_pin=6, echo_pin=12)
     except Exception:
         us = None
     from navigator import Navigator
@@ -51,6 +65,10 @@ def main():
     # This makes the planner generate a corridor-following waypoint even without a global map.
     nav_goal_dist_m = 1.2
     scale_est = ScaleEstimator(window=80)
+
+    # Hardware UI (TFT + switches)
+    tft = TFTDisplay(dc_pin=25, rst_pin=24, spi_port=0, spi_device=0, width=160, height=80, rotate=90)
+    switches = Switches(btn1_pin=23, sw1_pin=22, sw2_pin=27, debounce_s=0.03)
 
     frame_iter = provider.frames()
     last_time = time.time()
@@ -75,6 +93,16 @@ def main():
         for data in frame_iter:
             frame = data["frame"]
             ts = data["timestamp"]
+
+            # Poll hardware switches (debounced)
+            try:
+                switches.poll()
+            except Exception:
+                pass
+
+            # Apply hardware-driven modes into settings
+            settings_cache['nav_explore_enabled'] = (switches.mode == 'EXPLORE')
+            settings_cache['safe_mode'] = bool(switches.safe)
 
             obstacles = det.detect(frame)
             boundary_info = bounds.detect(frame)
@@ -296,6 +324,17 @@ def main():
 
             decision = decider.decide(perception)
 
+            # Safe-mode: cap speed conservatively
+            try:
+                if bool(settings_cache.get('safe_mode', False)) and isinstance(decision, dict):
+                    spd = decision.get('speed')
+                    if isinstance(spd, (int, float)):
+                        decision['speed'] = max(0.2, min(0.35, float(spd)))
+                    else:
+                        decision['speed'] = 0.3
+            except Exception:
+                pass
+
             # Recovery-aware exploration: if we trigger recovery while exploring,
             # temporarily blacklist the current explore frontier goal.
             try:
@@ -336,6 +375,19 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
+            # Update hardware TFT status (best-effort)
+            try:
+                if getattr(tft, 'available', False):
+                    tft.draw_status(
+                        mode=switches.mode,
+                        explore=bool(settings_cache.get('nav_explore_enabled', False)),
+                        safe=bool(settings_cache.get('safe_mode', False)),
+                        fps=float(fps),
+                        distance_cm=perception.get('distance_cm'),
+                        power=perception.get('power'))
+            except Exception:
+                pass
+
             # send log asynchronously (best-effort)
             log = overlay.export_log(perception, decision)
             send_log_to_server(log)
@@ -363,6 +415,10 @@ def main():
     finally:
         provider.release()
         motor.cleanup()
+        try:
+            switches.cleanup()
+        except Exception:
+            pass
         try:
             if imu is not None:
                 imu.close()

@@ -130,26 +130,18 @@ The main loop (`main.py`) polls `/settings` about once per second and:
 `rover_server.py` now loads/saves settings to `COSGCTank/settings.json`.
 
 - On startup, it loads known keys from `settings.json` if present.
-- On `POST /settings`, it clamps values to safe ranges and writes them back to disk.
-
-### Enforced min/max ranges
-
 The server clamps these keys to prevent unsafe/invalid values:
 
 - `rc_speed`: $[0.2, 1.0]$
-- `rc_turn_gain`: $[0.2, 2.5]$
-- `det_gamma`: $[0.5, 1.5]$
 - `det_contour_min_area`: $[50, 20000]$
 - `det_clahe_clip`: $[0.5, 10.0]$
 - `det_rock_score_threshold`: $[0.0, 1.0]$
 - `dec_obstacle_stop_ymin`: $[0.0, 1.0]$
 - `dec_ultra_stop_cm`: $[2, 200]$
-- `dec_ultra_turn_cm`: $[5, 300]$
 - `dec_stuck_dx_m`: $[0.0, 1.0]$
 - `dec_stuck_frames`: $[1, 50]$
 - `auto_speed`, `auto_speed_slow`, `auto_speed_turn`, `auto_speed_stuck`: $[0.0, 1.0]$
 
-## Ultrasonic sensor (HC-SR04)
 
 The autonomy stack supports an HC-SR04-style ultrasonic rangefinder mounted near the camera.
 
@@ -163,21 +155,15 @@ To avoid conflicts with the DRV8833 motor pins (`17, 27, 23, 18, 4`), the rover 
 These are the defaults in `ultrasonic.py`, and `main.py` initializes the sensor with these pins.
 
 ### Wiring (important)
-
-- HC-SR04 power: **VCC = 5V**, **GND = GND**
-- **TRIG** (5V-tolerant input on sensor) can be driven directly from Pi `GPIO 24`.
 - **ECHO is typically 5V** and **must be level-shifted** down to **3.3V** for Pi `GPIO 25`.
   - Use a voltage divider (example: 1k (top) + 2k (bottom) gives ~3.3V), or a logic-level shifter.
 
 ### Usage in code
 
 `main.py` reads the sensor and injects:
-
 - `perception['distance_cm']` (float cm or `None`)
 
 `decision.py` uses `distance_cm` with these tunables:
-
-- `dec_ultra_stop_cm`: if distance is below this, trigger an emergency escape
 - `dec_ultra_turn_cm`: if distance is below this (but above stop), bias turning/avoidance
 
 The reader uses a small median filter (`samples=3`) and timeouts to avoid blocking the main loop.
@@ -186,44 +172,26 @@ The reader uses a small median filter (`samples=3`) and timeouts to avoid blocki
 
 You mentioned a **USB stereo camera** with:
 
-- Dual lens, **1080p** over USB
-- **60mm baseline** between the two cameras
-- Ultrasonic sensor mounted with the camera assembly
 
 Current code treats `stereo_cam` as a *mode flag* and does not yet perform true stereo depth.
-The baseline is noted here so future depth/range fusion can use it consistently.
-
-## IMU (GY-521 / MPU-6050)
-
-The rover supports an I2C IMU (GY-521 breakout with MPU-6050) for roll/pitch estimation and motion smoothing.
-
-### Pins (I2C)
 
 MPU-6050 uses the Raspberry Pi's I2C bus (not arbitrary GPIO):
 
 - **SDA**: `GPIO 2` (physical pin 3)
-- **SCL**: `GPIO 3` (physical pin 5)
 - **3.3V**: physical pin 1 (or 17)
 - **GND**: physical pin 6 (or any GND)
-
 Address selection:
 
-- `AD0` LOW → `0x68` (default)
 - `AD0` HIGH → `0x69`
 
-`INT` can be left unconnected (this code polls).
 
 ### Enable I2C on the Pi
 
-On Raspberry Pi OS:
 
 ```bash
 sudo raspi-config
 ```
 
-Enable **Interface Options → I2C**, then reboot.
-
-Optional sanity check:
 
 ```bash
 sudo apt-get update
@@ -261,9 +229,9 @@ These keys are exposed under autonomy tuning and are persisted via `settings.jso
 
 ## Combined pin map (quick reference)
 
-- **DRV8833 motor driver (BCM)**: `AIN1=17`, `AIN2=27`, `BIN1=23`, `BIN2=18`, `STBY=4`
-- **Ultrasonic HC-SR04 (BCM)**: `TRIG=24`, `ECHO=25` (ECHO must be level-shifted)
-- **I2C (IMU MPU-6050)**: `SDA=2`, `SCL=3`
+- **DRV8833 motor driver (BCM)**: `AIN1=12`, `AIN2=13`, `BIN1=24`, `BIN2=23`, `STBY=26`
+- **Ultrasonic HC-SR04 (BCM)**: `TRIG=6` (physical 31), `ECHO=12` (physical 32) — ECHO must be level-shifted to 3.3V.
+- **I2C (IMU MPU-6050)**: On Jetson Nano header, `SDA=pin 3`, `SCL=pin 5` (typically `/dev/i2c-1`). The code uses `i2c_bus=1` by default.
 
 ## Motor control and safety
 
@@ -397,6 +365,131 @@ python3 main.py
 ```
 
 RC control tips
+## Raspberry Pi Setup
+
+This project is optimized for Raspberry Pi. Enable required interfaces and install packages:
+
+### Enable interfaces
+
+```bash
+sudo raspi-config
+# Interface Options → enable Camera and SPI
+```
+
+### Install system packages
+
+```bash
+sudo apt update
+sudo apt install -y python3-opencv python3-pip python3-picamera2 python3-rpi.gpio python3-spidev
+```
+
+### Python packages
+
+```bash
+pip3 install --upgrade pip
+pip3 install -r requirements.txt
+```
+
+### Camera notes
+
+- Picamera2 is preferred; `FrameProvider` uses it automatically when available.
+- USB cameras use V4L2; ensure `/dev/video0` exists.
+
+### TFT + Switches (SPI)
+
+- Enable SPI via `raspi-config` → Interface Options → SPI
+- Wiring (BCM): TFT DC=25, RST=24, SPI0 CE0; BTN1=23, SW1=22, SW2=27 (active‑low to GND)
+- Files: `tft_display.py`, `hardware_switches.py` (integrated in `main.py`)
+
+## Jetson Nano (JetPack 4.6.4) Setup
+
+The rover now supports NVIDIA Jetson Nano on JetPack 4.6.4 using GStreamer and the Jetson camera stack. On Jetson, the code auto-detects the platform and opens the CSI camera via a GStreamer `nvarguscamerasrc` pipeline for hardware-accelerated capture.
+
+### Install system dependencies
+
+```bash
+sudo apt update
+sudo apt install -y \
+  python3-opencv python3-pip \
+  gstreamer1.0-tools gstreamer1.0-plugins-good \
+  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+  v4l-utils python3-jetson-gpio
+```
+
+Note: `requirements.txt` skips `opencv-python` on `aarch64`. Use the system `python3-opencv` that ships with JetPack (CUDA-enabled).
+
+### Python packages
+
+```bash
+pip3 install --upgrade pip
+pip3 install -r requirements.txt
+```
+
+### Camera notes (CSI and USB)
+
+- CSI (Raspberry Pi Camera Module / IMX219): opened via `nvarguscamerasrc` automatically. No extra config needed; the default `FrameProvider()` will use the Jetson pipeline when detected.
+- USB cameras: opened via V4L2 (MJPG preferred). If using a USB camera exclusively, no changes are required.
+
+You can sanity-check the CSI camera with GStreamer:
+
+```bash
+gst-launch-1.0 nvarguscamerasrc ! nvoverlaysink
+```
+
+### Run
+
+```bash
+python3 rover_server.py &
+python3 main.py
+```
+
+If you need GStreamer debugging, you can enable it temporarily:
+
+```bash
+export GST_DEBUG=2
+python3 main.py
+```
+
+### Performance tips (Jetson Nano)
+
+- Power/perf modes:
+  ```bash
+  sudo nvpmodel -m 0   # max performance mode
+  sudo jetson_clocks   # lock clocks to max
+  ```
+- CUDA/OpenCV libs are typically under `/usr/local/cuda` and `/usr/lib/aarch64-linux-gnu` on JetPack 4.6.4. If needed, export:
+  ```bash
+  export CUDA_HOME=/usr/local/cuda
+  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+  ```
+- GPIO access: ensure your user is in the `gpio` group:
+  ```bash
+  sudo usermod -aG gpio $USER
+  newgrp gpio
+  ```
+- OpenCV: the detector enables `cv2.setUseOptimized(True)` and uses a small thread count by default. You can tune via settings key `cv_threads`.
+
+### TensorRT Detector (optional)
+
+For higher detector throughput on Nano, convert your SSD ONNX model to a TensorRT engine and enable the TRT backend:
+
+1) Convert ONNX → TRT:
+```bash
+cd COSGC-ROBOT/COSGCTank
+chmod +x tools/trtexec_convert.sh
+./tools/trtexec_convert.sh models/mobilenet_ssd.onnx models/mobilenet_ssd.engine
+```
+2) Enable in settings (via `/settings` POST or in code):
+- `use_trt: true`
+- `trt_engine_path: "models/mobilenet_ssd.engine"`
+- Optional: `trt_input`, `trt_outputs` if your engine uses custom binding names.
+
+The detector will fall back to TFLite when TRT isn’t available or the engine path is missing.
+
+### CUDA-accelerated resize
+
+If your OpenCV build includes CUDA modules, the detector uses CUDA for image resize before inference (`use_cuda_resize: true` in settings). Color-space normalization remains on the CPU for robustness.
+
 
 - **WASD/buttons**: press-and-hold sends keepalives; release stops.
 - **Xbox controller**: connect it to your laptop/browser; the page will send joystick updates while in `rc` mode.

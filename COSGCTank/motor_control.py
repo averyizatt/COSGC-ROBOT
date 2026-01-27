@@ -9,11 +9,11 @@ Pins and PWM usage can be adapted for specific H-bridge or ESC hardware.
 This project commonly uses a DRV8833 dual H-bridge board.
 
 User pinout (BCM GPIO numbers):
-    - BIN1 (BN1)  -> GPIO 23
-    - BIN2 (BN2)  -> GPIO 18
-    - STBY/SLEEP  -> GPIO 4
-    - AIN2 (AN2)  -> GPIO 27
-    - AIN1 (AN1)  -> GPIO 17
+    - BIN2 (BN2)  -> GPIO 23
+    - BIN1 (BN1)  -> GPIO 24
+    - STBY/SLEEP  -> GPIO 26
+    - AIN2 (AN2)  -> GPIO 13
+    - AIN1 (AN1)  -> GPIO 12
 
 For DRV8833 boards without dedicated EN/PWM pins, speed control is done by
 applying software PWM on the active direction input per motor.
@@ -22,11 +22,19 @@ applying software PWM on the active direction input per motor.
 import time
 import logging
 
+# GPIO backend: prefer RPi.GPIO when on Raspberry Pi, otherwise try Jetson.GPIO
 try:
-    import RPi.GPIO as GPIO
+    import RPi.GPIO as GPIO  # type: ignore
     _HAS_GPIO = True
+    _GPIO_BACKEND = 'RPi'
 except Exception:
-    _HAS_GPIO = False
+    try:
+        import Jetson.GPIO as GPIO  # type: ignore
+        _HAS_GPIO = True
+        _GPIO_BACKEND = 'Jetson'
+    except Exception:
+        _HAS_GPIO = False
+        _GPIO_BACKEND = None
 
 logging.basicConfig(level=logging.INFO)
 
@@ -35,7 +43,7 @@ class MotorController:
     def __init__(self, pins=None, pwm_frequency=1000, invert_left=False, invert_right=False, pwm_mode='auto'):
         # default pins follow rover_server.py layout if not provided
         # H-bridge direction: IN1/IN2 per motor; optional STBY and optional PWM pins.
-        self.pins = pins or {"AIN1": 17, "AIN2": 27, "BIN1": 23, "BIN2": 18, "STBY": 4}
+        self.pins = pins or {"AIN1": 12, "AIN2": 13, "BIN1": 24, "BIN2": 23, "STBY": 26}
         self.pwm_frequency = pwm_frequency
         self._using_gpio = _HAS_GPIO
         self._pwms = {}
@@ -88,7 +96,7 @@ class MotorController:
 
             self.pwm_mode = mode
         else:
-            logging.info("RPi.GPIO not available — running in simulation mode")
+            logging.info("GPIO backend not available — running in simulation mode")
 
     def _clamp_speed(self, speed):
         try:

@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 import json
 from pathlib import Path
+import platform
 
 try:
     from picamera2 import Picamera2
@@ -50,6 +51,8 @@ class FrameProvider:
         self._last_time = 0.0
 
         self._use_picam = False
+        self._use_gst = False
+        self._cap_backend = None
         if _HAS_PICAM2:
             try:
                 self.picam = Picamera2()
@@ -63,21 +66,74 @@ class FrameProvider:
                 self._use_picam = False
 
         if not self._use_picam:
-            # OpenCV fallback. `camera_index` may be an int or a path to a video file.
-            try:
-                self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-            except Exception:
-                self.cap = cv2.VideoCapture(camera_index)
+            # Try Jetson CSI via GStreamer first
+            if self._is_jetson() and isinstance(camera_index, int):
+                gst = self._build_csi_gstreamer_pipeline(width=width, height=height, fps=fps)
+                try:
+                    self.cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+                    if self.cap is not None and self.cap.isOpened():
+                        self._use_gst = True
+                        self._cap_backend = 'gstreamer'
+                except Exception:
+                    self._use_gst = False
+                    self._cap_backend = None
 
-            # Prefer MJPG for USB cams (lower USB bandwidth); harmless if unsupported.
-            try:
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            except Exception:
-                pass
-            # try to set preferred size/fps
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            self.cap.set(cv2.CAP_PROP_FPS, float(fps))
+            # OpenCV V4L2 fallback (USB cams / files)
+            if not self._use_gst:
+                try:
+                    self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+                    self._cap_backend = 'v4l2'
+                except Exception:
+                    self.cap = cv2.VideoCapture(camera_index)
+                    self._cap_backend = None
+
+                # Prefer MJPG for USB cams (lower USB bandwidth); harmless if unsupported.
+                try:
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                except Exception:
+                    pass
+                # try to set preferred size/fps
+                try:
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    self.cap.set(cv2.CAP_PROP_FPS, float(fps))
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _is_jetson():
+        """Best-effort detection of NVIDIA Jetson (L4T)."""
+        try:
+            model_path = Path('/proc/device-tree/model')
+            if model_path.exists():
+                txt = model_path.read_text(errors='ignore').lower()
+                if 'nvidia jetson' in txt:
+                    return True
+        except Exception:
+            pass
+        try:
+            if platform.machine() == 'aarch64':
+                with open('/proc/version', 'r') as f:
+                    v = f.read().lower()
+                if 'tegra' in v or 'nv' in v:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _build_csi_gstreamer_pipeline(width=640, height=480, fps=30, flip_method=0):
+        """Build a CSI camera pipeline for Jetson using nvarguscamerasrc.
+
+        Outputs BGR frames for OpenCV appsink; we convert to RGB later.
+        """
+        return (
+            f"nvarguscamerasrc ! "
+            f"video/x-raw(memory:NVMM), framerate={int(fps)}/1, format=NV12 ! "
+            f"nvvidconv flip-method={int(flip_method)} ! "
+            f"video/x-raw, width={int(width)}, height={int(height)}, format=BGRx ! "
+            f"videoconvert ! video/x-raw, format=BGR ! appsink drop=1 max-buffers=1 sync=false"
+        )
 
     def _preprocess(self, frame, to_rgb=True, resize=True):
         """Apply basic preprocessing: convert to RGB and resize to target size."""
@@ -133,6 +189,12 @@ class FrameProvider:
         if self._use_picam:
             try:
                 self.picam.stop()
+            except Exception:
+                pass
+        else:
+            try:
+                if hasattr(self, 'cap') and self.cap is not None:
+                    self.cap.release()
             except Exception:
                 pass
 

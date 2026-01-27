@@ -1,9 +1,27 @@
 flask
 requests
 numpy
-opencv-python
+opencv-python; platform_machine != "aarch64"
 smbus2
+# TFT LCD (ST7735) + drawing
+Pillow
+luma.core
+luma.lcd
+spidev
 # Optional (Pi-only)
 # RPi.GPIO
 # picamera2
 # tflite-runtime
+# On Raspberry Pi enable Camera + SPI via raspi-config:
+#   sudo raspi-config  (Interface Options)
+# Install GPIO/SPI system libs on Raspberry Pi:
+#   sudo apt install -y python3-rpi.gpio python3-spidev python3-picamera2
+# On NVIDIA Jetson (aarch64, JetPack 4.x), install system OpenCV with CUDA:
+#   sudo apt install -y python3-opencv
+# For Jetson GPIO control, install via apt:
+#   sudo apt install -y python3-jetson-gpio
+# For CircuitPython alternative (Jetson/RPi):
+#   python3 -m pip install Adafruit-Blinka adafruit-circuitpython-st7735r
+# Optional for TensorRT backend:
+#   TensorRT Python API and trtexec are bundled with JetPack (no pip). Install pycuda via pip:
+#   python3 -m pip install pycuda
