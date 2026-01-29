@@ -16,9 +16,10 @@ import requests
 from collections import deque
 
 from hardware.motor_control import MotorController
-from camera import FrameProvider
+from hardware.camera import FrameProvider
 
-app = Flask(__name__, template_folder="templates")
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / 'templates'
+app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 
 
 def _parse_camera_device(device):
@@ -133,11 +134,11 @@ def _autonomy_loop():
 
     # Lazy imports: keep server start fast and allow partial installs.
     try:
-        from boundaries import BoundaryDetector
-        from terrain import TerrainAnalyzer
-        from decision import DecisionMaker
-        from overlay import OverlayDrawer
-        from navigator import Navigator
+        from objectDetection.boundaries import BoundaryDetector
+        from objectDetection.terrain import TerrainAnalyzer
+        from slam.decision import DecisionMaker
+        from objectDetection.overlay import OverlayDrawer
+        from slam.navigator import Navigator
     except Exception as e:
         _autonomy_last_error = f"import_failed:{type(e).__name__}:{e}"
         try:
@@ -151,7 +152,7 @@ def _autonomy_loop():
     det_available = False
     if bool(SETTINGS.get('det_use_tflite', False)):
         try:
-            from detector import ObstacleDetector
+            from slam.detector import ObstacleDetector
             det = ObstacleDetector(settings=SETTINGS)
             det_available = True
         except Exception as e:

@@ -1,6 +1,6 @@
-from camera import FrameProvider
+from hardware.camera import FrameProvider
 try:
-    from camera import _is_jetson
+    _is_jetson = FrameProvider._is_jetson
 except Exception:
     def _is_jetson():
         try:
@@ -12,16 +12,16 @@ except Exception:
 import argparse
 import os
 import subprocess
-from detector import ObstacleDetector
-from boundaries import BoundaryDetector
-from terrain import TerrainAnalyzer
-from decision import DecisionMaker
-from overlay import OverlayDrawer
+from slam.detector import ObstacleDetector
+from objectDetection.boundaries import BoundaryDetector
+from objectDetection.terrain import TerrainAnalyzer
+from slam.decision import DecisionMaker
+from objectDetection.overlay import OverlayDrawer
 from hardware.motor_control import MotorController
 from hardware.tft_display import TFTDisplay
 from hardware.hardware_switches import Switches
 try:
-    from rc_controller import RCController  # local offline Xbox controller
+    from hardware.rc_controller import RCController  # local offline Xbox controller
 except Exception:
     RCController = None  # type: ignore
 
@@ -31,7 +31,7 @@ import requests
 import math
 
 try:
-    from power_monitor import PowerMonitor, PowerMonitorSettings
+    from hardware.power_monitor import PowerMonitor, PowerMonitorSettings
 except Exception:
     PowerMonitor = None  # type: ignore
     PowerMonitorSettings = None  # type: ignore
@@ -87,8 +87,8 @@ def main():
         us = Ultrasonic(trig_pin=6, echo_pin=12)
     except Exception:
         us = None
-    from navigator import Navigator
-    from scale_estimator import ScaleEstimator
+    from slam.navigator import Navigator
+    from objectDetection.scale_estimator import ScaleEstimator
     nav = Navigator(grid_size=40, resolution=0.2)
     # Default local navigation behavior: keep a short-horizon goal ahead.
     # This makes the planner generate a corridor-following waypoint even without a global map.

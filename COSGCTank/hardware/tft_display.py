@@ -108,7 +108,7 @@ class TFTDisplay:
 
     @property
     def available(self) -> bool:
-        return bool(self._available and (self._device is not None or self._ada_device is not None))
+        return bool(self._available and self._device is not None)
 
     def draw_lines(self, lines: List[str]) -> None:
         """Draw up to 6 lines of status text."""
