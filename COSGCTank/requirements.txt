@@ -8,6 +8,11 @@ Pillow
 luma.core
 luma.lcd
 spidev
+# CircuitPython fallback for TFT (Jetson-friendly)
+Adafruit-Blinka
+adafruit-circuitpython-st7735r
+# Local Bluetooth/Xbox controller (Pi/Linux)
+evdev
 # Optional (Pi-only)
 # RPi.GPIO
 # picamera2

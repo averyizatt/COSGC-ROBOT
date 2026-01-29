@@ -15,7 +15,7 @@ import math
 import requests
 from collections import deque
 
-from motor_control import MotorController
+from hardware.motor_control import MotorController
 from camera import FrameProvider
 
 app = Flask(__name__, template_folder="templates")
@@ -179,7 +179,7 @@ def _autonomy_loop():
     # Optional ultrasonic
     us = None
     try:
-        from ultrasonic import Ultrasonic
+        from hardware.ultrasonic import Ultrasonic
         us = Ultrasonic(trig_pin=24, echo_pin=25)
     except Exception:
         us = None

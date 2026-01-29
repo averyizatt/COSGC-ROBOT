@@ -1,14 +1,29 @@
 from camera import FrameProvider
+try:
+    from camera import _is_jetson
+except Exception:
+    def _is_jetson():
+        try:
+            with open('/proc/device-tree/model', 'r') as f:
+                txt = f.read().lower()
+            return ('jetson' in txt)
+        except Exception:
+            return False
 import argparse
 import os
+import subprocess
 from detector import ObstacleDetector
 from boundaries import BoundaryDetector
 from terrain import TerrainAnalyzer
 from decision import DecisionMaker
 from overlay import OverlayDrawer
-from motor_control import MotorController
-from tft_display import TFTDisplay
-from hardware_switches import Switches
+from hardware.motor_control import MotorController
+from hardware.tft_display import TFTDisplay
+from hardware.hardware_switches import Switches
+try:
+    from rc_controller import RCController  # local offline Xbox controller
+except Exception:
+    RCController = None  # type: ignore
 
 import cv2
 import time
@@ -46,14 +61,28 @@ def main():
 
     cam_source = args.video if (args.video and os.path.exists(args.video)) else args.camera_index
     provider = FrameProvider(width=args.width, height=args.height, fps=args.fps, camera_index=cam_source)
-    det = ObstacleDetector(settings={})
+    # Use Jetson acceleration when available
+    det_settings = {
+        'use_cuda_resize': True,
+        'cv_threads': 2,
+    }
+    try:
+        if _is_jetson():
+            engine_path = 'COSGC-ROBOT/COSGCTank/models/mobilenet_ssd.engine'
+            alt_engine = 'models/mobilenet_ssd.engine'
+            ep = engine_path if os.path.exists(engine_path) else (alt_engine if os.path.exists(alt_engine) else None)
+            if ep:
+                det_settings.update({'use_trt': True, 'trt_engine_path': ep})
+    except Exception:
+        pass
+    det = ObstacleDetector(settings=det_settings)
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()
     decider = DecisionMaker()
     overlay = OverlayDrawer()
     motor = MotorController()
     try:
-        from ultrasonic import Ultrasonic
+        from hardware.ultrasonic import Ultrasonic
         # HC-SR04 wiring (BCM): TRIG=6 (pin31), ECHO=12 (pin32). Level-shift ECHO to 3.3V.
         us = Ultrasonic(trig_pin=6, echo_pin=12)
     except Exception:
@@ -67,8 +96,14 @@ def main():
     scale_est = ScaleEstimator(window=80)
 
     # Hardware UI (TFT + switches)
-    tft = TFTDisplay(dc_pin=25, rst_pin=24, spi_port=0, spi_device=0, width=160, height=80, rotate=90)
-    switches = Switches(btn1_pin=23, sw1_pin=22, sw2_pin=27, debounce_s=0.03)
+    # GPIO mappings chosen to avoid common motor/ultrasonic pins
+    # TFT DEC=20 (pin 38), RES=21 (pin 40); SPI0 CE0 used for CS
+    tft = TFTDisplay(dec_pin=20, res_pin=21, spi_port=0, spi_device=0, width=160, height=80, rotate=90)
+    # Buttons/Switches: BTN1=5 (pin 29), SW1=16 (pin 36), SW2=27 (pin 13)
+    switches = Switches(btn1_pin=5, rc_pin=16, nav_pin=27, debounce_s=0.03)
+    last_mode_sent = None
+    rc = None  # offline RC controller instance
+    pair_scan_until = 0.0  # show 'pairing' while scan helper is active
 
     frame_iter = provider.frames()
     last_time = time.time()
@@ -100,9 +135,31 @@ def main():
             except Exception:
                 pass
 
-            # Apply hardware-driven modes into settings
-            settings_cache['nav_explore_enabled'] = (switches.mode == 'EXPLORE')
-            settings_cache['safe_mode'] = bool(switches.safe)
+            # Apply hardware-driven modes into settings and server
+            is_rc = (switches.mode == 'RC')
+            settings_cache['mode'] = 'rc' if is_rc else 'autonomous'
+            settings_cache['nav_explore_enabled'] = False if is_rc else bool(settings_cache.get('nav_explore_enabled', False))
+            # Notify server of mode change (best-effort)
+            try:
+                mode_val = settings_cache['mode']
+                if last_mode_sent != mode_val:
+                    r = requests.post('http://127.0.0.1:5000/mode', json={'mode': mode_val}, timeout=0.25)
+                    if r.status_code == 200:
+                        last_mode_sent = mode_val
+            except Exception:
+                pass
+
+            # Pairing toggle via BTN1 press: start simple Bluetooth scan/pair helper
+            try:
+                if switches.consume_pair_toggle():
+                    # Best-effort: attempt to start bluetoothctl scan for 12s
+                    try:
+                        subprocess.Popen(['bash', '-lc', 'bluetoothctl scan on; sleep 12; bluetoothctl scan off'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        pair_scan_until = time.time() + 12.0
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             obstacles = det.detect(frame)
             boundary_info = bounds.detect(frame)
@@ -211,7 +268,7 @@ def main():
             else:
                 if imu is None:
                     try:
-                        from imu import MPU6050, ImuSettings
+                        from hardware.imu import MPU6050, ImuSettings
                         imu = MPU6050(ImuSettings(
                             i2c_bus=int(settings_cache.get('imu_i2c_bus', 1)),
                             i2c_addr=int(settings_cache.get('imu_i2c_addr', 0x68)),
@@ -324,14 +381,49 @@ def main():
 
             decision = decider.decide(perception)
 
-            # Safe-mode: cap speed conservatively
+            # RC mode: if offline controller available, drive motors directly.
             try:
-                if bool(settings_cache.get('safe_mode', False)) and isinstance(decision, dict):
-                    spd = decision.get('speed')
-                    if isinstance(spd, (int, float)):
-                        decision['speed'] = max(0.2, min(0.35, float(spd)))
+                if settings_cache.get('mode') == 'rc':
+                    # Lazy init controller on entering RC mode
+                    if rc is None and RCController is not None:
+                        try:
+                            rc = RCController()
+                        except Exception:
+                            rc = None
+                    # If controller present, read state and mix to motor outputs
+                    rc_status = None
+                    rc_debug = None
+                    if rc is not None and getattr(rc, 'available', False):
+                        thr, steer, estop = rc.get()
+                        name = getattr(rc, 'device_name', None)
+                        rc_status = f"paired{(' ('+name+')') if name else ''}"
+                        rc_debug = f"thr {thr:.2f} steer {steer:.2f} estop {'Y' if estop else 'N'}"
+                        if estop or abs(thr) < 1e-3 and abs(steer) < 1e-3:
+                            motor.stop()
+                        else:
+                            # Mix to differential speeds: left = thr + steer, right = thr - steer
+                            left = max(-1.0, min(1.0, float(thr + steer)))
+                            right = max(-1.0, min(1.0, float(thr - steer)))
+                            motor._drive(left_forward=(left >= 0.0), right_forward=(right >= 0.0),
+                                         left_speed=abs(left), right_speed=abs(right))
+                        # Skip autonomy mapping
+                        decision = {'command': 'STOP', 'reason': 'RC mode (offline controller)'}
                     else:
-                        decision['speed'] = 0.3
+                        # No local controller — fall back to server-based RC semantics
+                        decision = {'command': 'STOP', 'reason': 'RC mode'}
+                        # Show pairing status while scan helper active
+                        if time.time() < pair_scan_until:
+                            rc_status = 'pairing'
+                        else:
+                            rc_status = 'not paired'
+                else:
+                    # Leaving RC mode: clean up controller if present
+                    if rc is not None:
+                        try:
+                            rc.close()
+                        except Exception:
+                            pass
+                        rc = None
             except Exception:
                 pass
 
@@ -378,13 +470,20 @@ def main():
             # Update hardware TFT status (best-effort)
             try:
                 if getattr(tft, 'available', False):
+                    # Compute RC status/debug only when in RC mode
+                    mode_str = switches.mode
+                    if mode_str == 'RC':
+                        # rc_status and rc_debug from above scope if defined
+                        pass
                     tft.draw_status(
-                        mode=switches.mode,
+                        mode=mode_str,
                         explore=bool(settings_cache.get('nav_explore_enabled', False)),
                         safe=bool(settings_cache.get('safe_mode', False)),
                         fps=float(fps),
                         distance_cm=perception.get('distance_cm'),
-                        power=perception.get('power'))
+                        power=perception.get('power'),
+                        rc_status=locals().get('rc_status'),
+                        rc_debug=locals().get('rc_debug'))
             except Exception:
                 pass
 

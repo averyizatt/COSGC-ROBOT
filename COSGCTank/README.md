@@ -19,7 +19,7 @@ This README documents the current architecture, module responsibilities, endpoin
 
 ## What it does (quick)
 
-- **RC driving from a webpage:** press-and-hold WASD/buttons, plus Xbox controller support.
+ - **RC driving:** from the webpage (WASD/buttons + Xbox via browser) or offline on the Pi with a Bluetooth‑paired Xbox controller.
 - **Autonomous driving pipeline:** camera → obstacle detection + boundary detection + terrain analysis → decision → motor control.
 - **SLAM integration hooks:** polls a separate SLAM process via `slam/bridge.py` (`GET /pose`) and uses pose for navigation/stuck detection.
 - **Dynamic obstacle tracking (debug):** tracks moving obstacles in world space using a lightweight Kalman filter + Hungarian assignment.
@@ -42,7 +42,7 @@ The system is organized into five layers:
 
 The rover supports multiple modes selectable from the web UI:
 
-- `rc`: Manual RC control from the browser (WASD/buttons or Xbox controller).
+- `rc`: Manual RC control. With the web UI, inputs are sent to `/joystick`. Offline, a paired Xbox controller is read locally on the Pi.
 - `autonomous`: General autonomous mode (your autonomy loop decides how to use it).
 - `single_cam`: Autonomous mode intended for a single camera pipeline.
 - `stereo_cam`: Autonomous mode intended for a stereo pipeline (debugging/expansion).
@@ -119,6 +119,36 @@ Current tuning keys include:
 - RC:
   - `rc_speed`
   - `rc_turn_gain`
+
+## Offline RC (Bluetooth Xbox)
+
+Drive without the web UI or Wi‑Fi using a Bluetooth‑paired Xbox controller. The Pi reads the controller locally via `evdev`.
+
+- Dependencies:
+  - System: `sudo apt install -y bluetooth bluez`
+  - Python: `evdev` (included in `requirements.txt`).
+- Pairing (quick helper): press the controller pair button, then press the physical BTN1 (GPIO5) to start a 12‑second `bluetoothctl` scan/pair cycle. Or pair manually:
+
+```
+bluetoothctl
+agent on
+default-agent
+scan on
+# wait to see "Xbox Wireless Controller" MAC
+pair AA:BB:CC:DD:EE:FF
+trust AA:BB:CC:DD:EE:FF
+connect AA:BB:CC:DD:EE:FF
+scan off
+exit
+```
+
+- Usage:
+  - Flip the SPDT to RC (grounds GPIO16). The pipeline stops autonomy and reads the controller locally.
+  - Controls:
+    - Steering: left stick X.
+    - Throttle: RT forward, LT reverse (combined to [-1,1]).
+    - E‑stop: A button.
+  - The TFT shows mode/status; autonomous commands are suppressed while in RC.
 
 The main loop (`main.py`) polls `/settings` about once per second and:
 
@@ -227,11 +257,35 @@ These keys are exposed under autonomy tuning and are persisted via `settings.jso
 - `imu_sample_div` (0..255, default 4)
 - `imu_gyro_calib_seconds` (0.2..10.0, default 1.0)
 
-## Combined pin map (quick reference)
+## GPIO Map (Raspberry Pi, BCM)
 
-- **DRV8833 motor driver (BCM)**: `AIN1=12`, `AIN2=13`, `BIN1=24`, `BIN2=23`, `STBY=26`
-- **Ultrasonic HC-SR04 (BCM)**: `TRIG=6` (physical 31), `ECHO=12` (physical 32) — ECHO must be level-shifted to 3.3V.
-- **I2C (IMU MPU-6050)**: On Jetson Nano header, `SDA=pin 3`, `SCL=pin 5` (typically `/dev/i2c-1`). The code uses `i2c_bus=1` by default.
+- SPI0 Bus:
+  - SCLK: GPIO11 (pin 23)
+  - MOSI: GPIO10 (pin 19)
+  - MISO: GPIO9 (pin 21)
+  - CS (CE0): GPIO8 (pin 24) [used]
+  - CS (CE1): GPIO7 (pin 26) [optional]
+
+- TFT ST7735 (Vendor labels → GPIO):
+  - SCL → GPIO11 (SPI SCLK)
+  - SDA → GPIO10 (SPI MOSI)
+  - CS  → CE0 (GPIO8)
+  - DEC (D/C) → GPIO20 (pin 38)
+  - RES (Reset) → GPIO21 (pin 40)
+  - Backlight → 3V3 or a spare GPIO (optional)
+
+- Inputs (active‑low to GND):
+  - BTN1 (momentary) → GPIO5 (pin 29) — toggles Bluetooth pairing helper
+  - SPDT switch throws → GPIO16 (pin 36) for RC, GPIO27 (pin 13) for NAV (common to GND)
+
+- Ultrasonic HC‑SR04:
+  - TRIG → GPIO6 (pin 31)
+  - ECHO → GPIO12 (pin 32) — MUST be level‑shifted to 3.3V
+
+- I2C (IMU MPU‑6050):
+  - SDA → GPIO2 (pin 3)
+  - SCL → GPIO3 (pin 5)
+  - Bus: `/dev/i2c-1` (default)
 
 ## Motor control and safety
 
@@ -398,12 +452,18 @@ pip3 install -r requirements.txt
 ### TFT + Switches (SPI)
 
 - Enable SPI via `raspi-config` → Interface Options → SPI
-- Wiring (BCM): TFT DC=25, RST=24, SPI0 CE0; BTN1=23, SW1=22, SW2=27 (active‑low to GND)
+- Vendor labels → Pi pins:
+  - SCL → SPI SCLK (BCM11, pin 23)
+  - SDA → SPI MOSI (BCM10, pin 19)
+  - CS  → CE0/CE1 (device 0/1; CE0 = BCM8, pin 24)
+  - DEC → D/C GPIO (BCM20, pin 38)
+  - RES → RESET GPIO (BCM21, pin 40)
+- Inputs (active‑low to GND): BTN1=BCM5 (pin 29), SW1=BCM16 (pin 36), SW2=BCM27 (pin 13)
 - Files: `tft_display.py`, `hardware_switches.py` (integrated in `main.py`)
 
-## Jetson Nano (JetPack 4.6.4) Setup
+## Jetson Nano (JetPack 4.6.x) Setup
 
-The rover now supports NVIDIA Jetson Nano on JetPack 4.6.4 using GStreamer and the Jetson camera stack. On Jetson, the code auto-detects the platform and opens the CSI camera via a GStreamer `nvarguscamerasrc` pipeline for hardware-accelerated capture.
+The rover supports NVIDIA Jetson Nano on JetPack 4.6.x (tested on 4.6.4 and 4.6.2) using GStreamer and the Jetson camera stack. On Jetson, the code auto-detects the platform and opens the CSI camera via a GStreamer `nvarguscamerasrc` pipeline for hardware-accelerated capture.
 
 ### Install system dependencies
 
@@ -414,6 +474,8 @@ sudo apt install -y \
   gstreamer1.0-tools gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
   v4l-utils python3-jetson-gpio
+# Enable SPI/I2C GPIO on the 40-pin header (Jetson Nano):
+sudo /opt/nvidia/jetson-io/jetson-io.py  # select SPI0, I2C1, GPIO as needed
 ```
 
 Note: `requirements.txt` skips `opencv-python` on `aarch64`. Use the system `python3-opencv` that ships with JetPack (CUDA-enabled).
@@ -458,6 +520,60 @@ python3 main.py
   sudo jetson_clocks   # lock clocks to max
   ```
 - CUDA/OpenCV libs are typically under `/usr/local/cuda` and `/usr/lib/aarch64-linux-gnu` on JetPack 4.6.4. If needed, export:
+
+### Verify Jetson stack
+
+Quick check for CUDA/OpenCV/TensorRT/Jetson.GPIO without running the full app:
+
+```bash
+python3 COSGC-ROBOT/COSGCTank/tools/verify_jetson_stack.py
+```
+
+The script prints a report and exits non‑zero if key accelerations are missing. If TensorRT is installed, consider converting your TFLite/ONNX model to a `.engine` with `trtexec` (see [tools/trtexec_convert.sh](COSGC-ROBOT/COSGCTank/tools/trtexec_convert.sh)).
+
+### TFT + Switches on Jetson Nano
+
+- Two display backends:
+  - `luma.lcd` (SPI) when available.
+  - Fallback: Adafruit CircuitPython ST7735R via Blinka (added to requirements).
+- Wiring (40‑pin header; BCM-compatible numbering via Jetson.GPIO):
+  - DEC (D/C) → GPIO20 (pin 38)
+  - RES (Reset) → GPIO21 (pin 40)
+  - SPI0: SCLK (pin 23), MOSI (pin 19), CE0 (pin 24) or CE1 (pin 26)
+  - Inputs (active‑low to GND): BTN1=GPIO5 (pin 29), RC=GPIO16 (pin 36), NAV=GPIO27 (pin 13)
+- Permissions: `sudo usermod -aG gpio $USER` then log out/in to use Jetson.GPIO without sudo.
+
+## Jetson Nano Pinout (40‑pin Header) — Project Signals
+
+- Power & I2C (IMU `MPU-6050`):
+  - 3V3: pin 1 or 17
+  - GND: any GND (e.g., pin 6)
+  - I2C1 SDA: GPIO2 (pin 3)
+  - I2C1 SCL: GPIO3 (pin 5)
+- Ultrasonic (HC‑SR04 style):
+  - TRIG: GPIO6 (pin 31)
+  - ECHO: GPIO12 (pin 32) — level shift to 3.3V
+- TFT ST7735 (SPI0):
+  - SCLK: pin 23
+  - MOSI: pin 19
+  - CS: pin 24 (CE0) [or pin 26 (CE1)]
+  - DEC (D/C): GPIO20 (pin 38)
+  - RES (Reset): GPIO21 (pin 40)
+- Inputs:
+  - BTN1 (pairing): GPIO5 (pin 29), active‑low to GND
+  - SPDT RC throw: GPIO16 (pin 36), active‑low to GND
+  - SPDT NAV throw: GPIO27 (pin 13), active‑low to GND
+- Motor driver (DRV8833 default mapping):
+  - AIN1: GPIO12 (pin 32)
+  - AIN2: GPIO13 (pin 33)
+  - BIN1: GPIO24 (pin 18)
+  - BIN2: GPIO23 (pin 16)
+  - STBY: GPIO26 (pin 37)
+
+Notes:
+- Jetson header uses Pi‑like BOARD/BCM numbering via `Jetson.GPIO`. Enable SPI/I2C in `jetson-io` first.
+- Ensure ultrasonic ECHO is level‑shifted to 3.3V.
+- If your TFT CS is wired to CE1, set `spi_device=1` in `tft_display.py` or when constructing `TFTDisplay`.
   ```bash
   export CUDA_HOME=/usr/local/cuda
   export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
