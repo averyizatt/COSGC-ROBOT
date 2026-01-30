@@ -4,7 +4,7 @@ import numpy as np
 
 class TerrainAnalyzer:
     def __init__(self, lower_band_fraction=0.35, dip_variance_thresh=200.0, incline_grad_thresh=20.0):
-        """Analyze near-field terrain for dips and inclines.
+        """Analyze near-field terrain for dips and inclines with added texture metrics.
 
         Parameters are tunable; the defaults are conservative guesses and should be
         tuned on a per-vehicle basis.
@@ -19,6 +19,12 @@ class TerrainAnalyzer:
         lower = frame[y0:, :]
 
         gray = cv2.cvtColor(lower, cv2.COLOR_RGB2GRAY)
+        # equalize for robustness under varying light
+        try:
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+        except Exception:
+            pass
 
         # measure local variance: a large flat dark area (dip) tends to lower variance
         variance = float(np.var(gray))
@@ -31,8 +37,16 @@ class TerrainAnalyzer:
         edges = cv2.Canny(gray, 50, 120)
         edge_density = float(np.sum(edges > 0) / edges.size)
 
-        # heuristics (tunable)
-        dip = variance < self.dip_variance_thresh and edge_density < 0.02
+        # texture entropy (low entropy + low edges -> likely smooth dip)
+        hist = cv2.calcHist([gray],[0],None,[32],[0,256]).flatten()
+        p = hist / max(np.sum(hist), 1e-6)
+        entropy = float(-np.sum([pi*np.log2(pi+1e-12) for pi in p]))
+
+        # brightness (darker lower band can also indicate dip)
+        brightness = float(np.mean(gray))
+
+        # heuristics (tunable) combining signals
+        dip = (variance < self.dip_variance_thresh and edge_density < 0.02) or (entropy < 3.0 and edge_density < 0.02 and brightness < 100)
         incline = grad_mean > self.incline_grad_thresh or edge_density > 0.12
 
         return {
@@ -40,5 +54,7 @@ class TerrainAnalyzer:
             "incline_detected": bool(incline),
             "edge_density": edge_density,
             "variance": variance,
-            "grad_mean": grad_mean
+            "grad_mean": grad_mean,
+            "entropy": entropy,
+            "brightness": brightness
         }

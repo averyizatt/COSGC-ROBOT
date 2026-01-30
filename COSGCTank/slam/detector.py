@@ -1,7 +1,17 @@
 import numpy as np
 import cv2
-from utils import resize_frame
 import os
+# Robust import for resize_frame: support both root utils.py and tools/utils.py
+try:
+    from utils import resize_frame  # type: ignore
+except Exception:
+    try:
+        from tools.utils import resize_frame  # type: ignore
+    except Exception:
+        # Last-resort inline implementation to avoid import errors
+        def resize_frame(frame, size):
+            return cv2.resize(frame, size).astype('uint8')
+from typing import List, Dict, Any, Optional
 
 _HAS_TRT = False
 try:
@@ -38,6 +48,14 @@ class ObstacleDetector:
         self.score_threshold = float(score_threshold)
         self.labels = labels or {}
         self.settings = settings or {}
+        # region-of-interest (only consider lower portion of frame for obstacles)
+        self.lower_roi_fraction = float(self.settings.get('det_lower_roi_fraction', 0.6))
+        # temporal smoothing / persistence
+        self.temporal_alpha = float(self.settings.get('det_temporal_alpha', 0.6))
+        self.temporal_enabled = bool(self.settings.get('det_temporal_smoothing', True))
+        self.min_persistence = int(self.settings.get('det_min_persistence', 2))
+        self._tracks: List[Dict[str, Any]] = []
+        self._next_id = 1
 
         # Enable OpenCV optimizations on capable platforms (Jetson/Pi)
         try:
@@ -108,6 +126,45 @@ class ObstacleDetector:
                 self.input_details = self.interpreter.get_input_details()
                 self.output_details = self.interpreter.get_output_details()
 
+        # Optional labels mapping from settings or models/labels.json
+        try:
+            import json
+            labels_path = self.settings.get('labels_path', None)
+            if not labels_path:
+                # default path
+                for p in ('models/labels.json', 'COSGC-ROBOT/COSGCTank/models/labels.json'):
+                    if os.path.exists(p):
+                        labels_path = p
+                        break
+            if labels_path and os.path.exists(labels_path):
+                with open(labels_path, 'r') as f:
+                    data = json.load(f)
+                # accept dict of {str/int: name}
+                lab = {}
+                for k, v in data.items():
+                    try:
+                        lab[int(k)] = str(v)
+                    except Exception:
+                        continue
+                if lab:
+                    self.labels = lab
+        except Exception:
+            pass
+
+    def _gray_world(self, img: np.ndarray) -> np.ndarray:
+        try:
+            imgf = img.astype(np.float32) + 1e-6
+            r, g, b = cv2.split(imgf)
+            mr, mg, mb = np.mean(r), np.mean(g), np.mean(b)
+            avg = (mr + mg + mb) / 3.0
+            r *= (avg / mr)
+            g *= (avg / mg)
+            b *= (avg / mb)
+            out = cv2.merge((r, g, b))
+            return np.clip(out, 0, 255).astype(np.uint8)
+        except Exception:
+            return img
+
     def _preprocess(self, frame):
         # Resize to model input and ensure uint8 (prefer CUDA resize when available)
         try:
@@ -124,6 +181,9 @@ class ObstacleDetector:
                 img = resize_frame(frame, self.input_size)
         else:
             img = resize_frame(frame, self.input_size)
+
+        # Basic gray-world white balance to stabilize color under varying illumination
+        img = self._gray_world(img)
 
         # Convert to LAB and apply CLAHE on L channel to reduce brightness/contrast issues
         try:
@@ -185,6 +245,9 @@ class ObstacleDetector:
                 if area < min_area:  # ignore small noisy regions
                     continue
                 x, y, cw, ch = cv2.boundingRect(cnt)
+                # ignore boxes too high in the image (likely far-away or sky)
+                if (y + ch/2.0) / h < (1.0 - self.lower_roi_fraction):
+                    continue
                 ymin = y / h
                 xmin = x / w
                 ymax = (y + ch) / h
@@ -352,6 +415,26 @@ class ObstacleDetector:
         except Exception:
             pass
 
+        # filter detections to lower ROI (helps ignore sky/horizon false positives)
+        try:
+            roi_min_y = 1.0 - self.lower_roi_fraction
+            detections = [d for d in detections if ((d['box'][0] + d['box'][2]) * 0.5) >= roi_min_y]
+        except Exception:
+            pass
+
+        # Apply NMS to reduce duplicates
+        try:
+            detections = self._nms(detections, iou_thresh=float(self.settings.get('det_nms_iou', 0.45)))
+        except Exception:
+            pass
+
+        # Temporal smoothing to reduce jitter and flicker
+        if self.temporal_enabled:
+            try:
+                detections = self._temporal_update(detections)
+            except Exception:
+                pass
+
         # final: sort by score desc
         detections.sort(key=lambda x: x.get('score', 0.0), reverse=True)
 
@@ -368,3 +451,111 @@ class ObstacleDetector:
         except Exception:
             pass
         return detections
+
+    # ---------------------- helpers ----------------------
+    def _nms(self, dets: List[Dict[str, Any]], iou_thresh: float = 0.45) -> List[Dict[str, Any]]:
+        if not dets:
+            return dets
+        # group by label/class to avoid suppressing cross-class detections
+        def iou(a, b):
+            ax0, ay0, ax1, ay1 = a['box'][1], a['box'][0], a['box'][3], a['box'][2]
+            bx0, by0, bx1, by1 = b['box'][1], b['box'][0], b['box'][3], b['box'][2]
+            ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+            ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+            iw, ih = max(0.0, ix1-ix0), max(0.0, iy1-iy0)
+            inter = iw*ih
+            aa = (ax1-ax0)*(ay1-ay0)
+            bb = (bx1-bx0)*(by1-by0)
+            return inter / max(aa+bb-inter, 1e-6)
+
+        out: List[Dict[str, Any]] = []
+        # split groups
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for d in dets:
+            key = f"{d.get('label', '')}:{d.get('class', 0)}"
+            groups.setdefault(key, []).append(d)
+        for key, arr in groups.items():
+            arr = sorted(arr, key=lambda x: x.get('score', 0.0), reverse=True)
+            keep = []
+            while arr:
+                cur = arr.pop(0)
+                keep.append(cur)
+                arr = [x for x in arr if iou(cur, x) < iou_thresh]
+            out.extend(keep)
+        return out
+
+    def _temporal_update(self, dets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # simple IOU-based tracker with EMA on box coords; increases persistence and adds ids
+        def iou(a, b):
+            ax0, ay0, ax1, ay1 = a['box'][1], a['box'][0], a['box'][3], a['box'][2]
+            bx0, by0, bx1, by1 = b['box'][1], b['box'][0], b['box'][3], b['box'][2]
+            ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+            ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+            iw, ih = max(0.0, ix1-ix0), max(0.0, iy1-iy0)
+            inter = iw*ih
+            aa = (ax1-ax0)*(ay1-ay0)
+            bb = (bx1-bx0)*(by1-by0)
+            return inter / max(aa+bb-inter, 1e-6)
+
+        updated_tracks: List[Dict[str, Any]] = []
+        used = set()
+        for t in self._tracks:
+            t['age'] += 1
+
+        for d_idx, d in enumerate(dets):
+            # match to best track with same class/label
+            best_iou, best_idx = 0.0, -1
+            for idx, t in enumerate(self._tracks):
+                if idx in used:
+                    continue
+                if (t.get('class') != d.get('class')) or (t.get('label') != d.get('label')):
+                    continue
+                i = iou(t, d)
+                if i > best_iou:
+                    best_iou, best_idx = i, idx
+            if best_iou > float(self.settings.get('det_track_iou', 0.3)) and best_idx >= 0:
+                t = self._tracks[best_idx]
+                used.add(best_idx)
+                # EMA on box
+                tb = np.array(t['box'], dtype=np.float32)
+                db = np.array(d['box'], dtype=np.float32)
+                newb = self.temporal_alpha * db + (1.0 - self.temporal_alpha) * tb
+                t['box'] = newb.tolist()
+                t['score'] = max(t.get('score', 0.0)*0.9, d.get('score', 0.0))
+                t['hits'] += 1
+                t['age'] = 0
+                updated_tracks.append(t)
+            else:
+                # new track
+                t = {
+                    'box': d['box'],
+                    'class': d.get('class', 0),
+                    'label': d.get('label'),
+                    'score': d.get('score', 0.0),
+                    'hits': 1,
+                    'age': 0,
+                    'id': self._next_id
+                }
+                self._next_id += 1
+                updated_tracks.append(t)
+
+        # decay unmatched old tracks
+        for idx, t in enumerate(self._tracks):
+            if idx in used:
+                continue
+            t['age'] += 1
+            if t['age'] <= 2:  # brief occlusion tolerance
+                updated_tracks.append(t)
+
+        # keep only recent tracks
+        self._tracks = [t for t in updated_tracks if t['age'] <= 4]
+
+        # emit detections for tracks that are sufficiently persistent
+        out: List[Dict[str, Any]] = []
+        for t in self._tracks:
+            if t['hits'] >= self.min_persistence:
+                out.append({k: t[k] for k in t.keys() if k in ['box','class','label','score','id']})
+        # if nothing meets persistence yet, fall back to current raw detections to avoid emptiness
+        if not out:
+            return dets
+        return out

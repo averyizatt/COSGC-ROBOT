@@ -17,6 +17,8 @@ from objectDetection.boundaries import BoundaryDetector
 from objectDetection.terrain import TerrainAnalyzer
 from slam.decision import DecisionMaker
 from objectDetection.overlay import OverlayDrawer
+from objectDetection.ground_classifier import GroundClassifier
+from objectDetection.barrier_detector import BarrierDetector
 from hardware.motor_control import MotorController
 from hardware.tft_display import TFTDisplay
 from hardware.hardware_switches import Switches
@@ -55,6 +57,7 @@ def main():
     parser.add_argument("--width", type=int, default=640, help="Output frame width")
     parser.add_argument("--height", type=int, default=480, help="Output frame height")
     parser.add_argument("--fps", type=int, default=20, help="Target processing FPS")
+    parser.add_argument("--headless", action="store_true", default=False, help="Run without GUI display (for systemd)")
     args, unknown = parser.parse_known_args()
 
     print("Starting rover perception system...")
@@ -94,6 +97,9 @@ def main():
     # This makes the planner generate a corridor-following waypoint even without a global map.
     nav_goal_dist_m = 1.2
     scale_est = ScaleEstimator(window=80)
+    # Additional perception modules
+    ground_cls = GroundClassifier(roi_fraction=0.55)
+    barrier_det = BarrierDetector(roi_fraction=0.6)
 
     # Hardware UI (TFT + switches)
     # GPIO mappings chosen to avoid common motor/ultrasonic pins
@@ -164,12 +170,18 @@ def main():
             obstacles = det.detect(frame)
             boundary_info = bounds.detect(frame)
             terrain_info = terrain.analyze(frame)
+            # ground classification and barrier detection
+            ground_info = ground_cls.analyze(frame)
+            barrier_dets = barrier_det.detect(frame)
+            if barrier_dets:
+                obstacles = list(obstacles) + list(barrier_dets)
 
             perception = {
                 "timestamp": ts,
                 "obstacles": obstacles,
                 "boundary": boundary_info,
-                "terrain": terrain_info
+                "terrain": terrain_info,
+                "ground": ground_info,
             }
 
             # read ultrasonic when available (non-blocking)
@@ -439,8 +451,9 @@ def main():
             except Exception:
                 pass
 
-            # execute mapped motor action
-            action, params = decider.map_to_motor(decision["command"], speed=decision.get('speed'))
+            # execute mapped motor action (robust to missing command)
+            cmd = decision.get("command", "STOP") if isinstance(decision, dict) else "STOP"
+            action, params = decider.map_to_motor(cmd, speed=decision.get('speed') if isinstance(decision, dict) else None)
             if hasattr(motor, action):
                 try:
                     getattr(motor, action)(**params)
@@ -448,8 +461,11 @@ def main():
                     # method signature mismatch, call without params
                     getattr(motor, action)()
 
-            # overlays and display
-            frame_overlay = overlay.apply(frame.copy(), obstacles, boundary_info, terrain_info, decision)
+            # overlays and display (guard if frame is None)
+            if frame is not None:
+                frame_overlay = overlay.apply(frame.copy(), obstacles, boundary_info, terrain_info, decision, ground=ground_info)
+            else:
+                frame_overlay = None
 
             # compute simple FPS
             fps_count += 1
@@ -460,12 +476,14 @@ def main():
             else:
                 fps = 0.0
 
-            frame_overlay = overlay.draw_fps(frame_overlay, fps)
-            frame_overlay = overlay.draw_center_line(frame_overlay)
+            if frame_overlay is not None:
+                frame_overlay = overlay.draw_fps(frame_overlay, fps)
+                frame_overlay = overlay.draw_center_line(frame_overlay)
 
-            cv2.imshow("Rover Vision", cv2.cvtColor(frame_overlay, cv2.COLOR_RGB2BGR))
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if not args.headless and frame_overlay is not None:
+                cv2.imshow("Rover Vision", cv2.cvtColor(frame_overlay, cv2.COLOR_RGB2BGR))
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
             # Update hardware TFT status (best-effort)
             try:
@@ -523,7 +541,8 @@ def main():
                 imu.close()
         except Exception:
             pass
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':

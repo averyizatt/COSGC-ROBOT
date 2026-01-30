@@ -31,6 +31,8 @@ MODULES = [
     'objectDetection.terrain',
     'objectDetection.overlay',
     'objectDetection.scale_estimator',
+    'objectDetection.ground_classifier',
+    'objectDetection.barrier_detector',
 ]
 
 OPTIONAL = [

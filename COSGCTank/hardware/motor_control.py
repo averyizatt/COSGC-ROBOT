@@ -21,6 +21,7 @@ applying software PWM on the active direction input per motor.
 
 import time
 import logging
+import threading
 
 # GPIO backend: prefer RPi.GPIO when on Raspberry Pi, otherwise try Jetson.GPIO
 try:
@@ -37,6 +38,83 @@ except Exception:
         _GPIO_BACKEND = None
 
 logging.basicConfig(level=logging.INFO)
+
+
+class SoftPWM:
+    """Simple software PWM for GPIO pins (Jetson fallback).
+
+    Provides a subset of the GPIO.PWM interface: start(), ChangeDutyCycle(), stop().
+    Uses a background thread to toggle the pin at the requested frequency.
+    """
+    def __init__(self, gpio, pin, frequency_hz=200):
+        self._gpio = gpio
+        self._pin = int(pin)
+        self._freq = float(max(1.0, frequency_hz))
+        self._period = 1.0 / self._freq
+        self._duty = 0.0  # 0..100
+        self._running = False
+        self._thread = None
+
+    def start(self, duty):
+        try:
+            self._duty = float(max(0.0, min(100.0, duty)))
+        except Exception:
+            self._duty = 0.0
+        if not self._running:
+            self._running = True
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def ChangeDutyCycle(self, duty):
+        try:
+            self._duty = float(max(0.0, min(100.0, duty)))
+        except Exception:
+            pass
+
+    def _run(self):
+        gpio = self._gpio
+        pin = self._pin
+        period = self._period
+        while self._running:
+            d = self._duty
+            if d <= 0.0:
+                try:
+                    gpio.output(pin, gpio.LOW)
+                except Exception:
+                    pass
+                time.sleep(period)
+                continue
+            if d >= 100.0:
+                try:
+                    gpio.output(pin, gpio.HIGH)
+                except Exception:
+                    pass
+                time.sleep(period)
+                continue
+            on_t = period * (d / 100.0)
+            off_t = max(0.0, period - on_t)
+            try:
+                gpio.output(pin, gpio.HIGH)
+            except Exception:
+                pass
+            time.sleep(on_t)
+            try:
+                gpio.output(pin, gpio.LOW)
+            except Exception:
+                pass
+            time.sleep(off_t)
+
+    def stop(self):
+        self._running = False
+        try:
+            self._gpio.output(self._pin, self._gpio.LOW)
+        except Exception:
+            pass
+        try:
+            if self._thread is not None:
+                self._thread.join(timeout=0.5)
+        except Exception:
+            pass
 
 
 class MotorController:
@@ -75,6 +153,8 @@ class MotorController:
                 else:
                     # DRV8833 commonly has only IN pins; prefer IN-pin PWM.
                     mode = 'in_pins'
+            # Jetson.GPIO: if using IN-pin PWM, substitute software PWM on those pins.
+            use_soft_pwm = (_GPIO_BACKEND == 'Jetson' and mode == 'in_pins')
 
             if mode == 'enable':
                 if 'PWMA' in self.pins:
@@ -88,10 +168,13 @@ class MotorController:
                     self._pwms['STBY'] = GPIO.PWM(self.pins['STBY'], self.pwm_frequency)
                     self._pwms['STBY'].start(0)
             elif mode == 'in_pins':
-                # PWM on direction pins. We create PWM objects for all 4 direction pins.
+                # PWM on direction pins. Create PWM (hardware or software) for all 4.
                 for k in ('AIN1', 'AIN2', 'BIN1', 'BIN2'):
                     if k in self.pins:
-                        self._pwms[k] = GPIO.PWM(self.pins[k], self.pwm_frequency)
+                        if use_soft_pwm:
+                            self._pwms[k] = SoftPWM(GPIO, self.pins[k], self.pwm_frequency)
+                        else:
+                            self._pwms[k] = GPIO.PWM(self.pins[k], self.pwm_frequency)
                         self._pwms[k].start(0)
 
             self.pwm_mode = mode
