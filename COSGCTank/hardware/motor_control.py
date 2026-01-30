@@ -158,14 +158,14 @@ class MotorController:
 
             if mode == 'enable':
                 if 'PWMA' in self.pins:
-                    self._pwms['PWMA'] = GPIO.PWM(self.pins['PWMA'], self.pwm_frequency)
+                    self._pwms['PWMA'] = SoftPWM(GPIO, self.pins['PWMA'], self.pwm_frequency)
                     self._pwms['PWMA'].start(0)
                 if 'PWMB' in self.pins:
-                    self._pwms['PWMB'] = GPIO.PWM(self.pins['PWMB'], self.pwm_frequency)
+                    self._pwms['PWMB'] = SoftPWM(GPIO, self.pins['PWMB'], self.pwm_frequency)
                     self._pwms['PWMB'].start(0)
             elif mode == 'stby':
                 if 'STBY' in self.pins:
-                    self._pwms['STBY'] = GPIO.PWM(self.pins['STBY'], self.pwm_frequency)
+                    self._pwms['STBY'] = SoftPWM(GPIO, self.pins['STBY'], self.pwm_frequency)
                     self._pwms['STBY'].start(0)
             elif mode == 'in_pins':
                 # PWM on direction pins. Create PWM (hardware or software) for all 4.

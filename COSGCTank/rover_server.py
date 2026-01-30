@@ -15,8 +15,13 @@ import math
 import requests
 from collections import deque
 
-from motor_control import MotorController
-from camera import FrameProvider
+# Robust imports: prefer package paths, fallback to local modules
+try:
+    from hardware.motor_control import MotorController
+    from hardware.camera import FrameProvider
+except Exception:
+    from motor_control import MotorController
+    from camera import FrameProvider
 
 app = Flask(__name__, template_folder="templates")
 
@@ -686,6 +691,7 @@ motor = MotorController(
     pins={"AIN1": 17, "AIN2": 27, "BIN1": 23, "BIN2": 18, "STBY": 4},
     invert_left=True,
     invert_right=True,
+    # Use SoftPWM on direction pins for Jetson, no hardware PWM
     pwm_mode='in_pins',
 )
 
