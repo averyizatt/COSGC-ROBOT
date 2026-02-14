@@ -1,14 +1,4 @@
 from hardware.camera import FrameProvider
-try:
-    _is_jetson = FrameProvider._is_jetson
-except Exception:
-    def _is_jetson():
-        try:
-            with open('/proc/device-tree/model', 'r') as f:
-                txt = f.read().lower()
-            return ('jetson' in txt)
-        except Exception:
-            return False
 import argparse
 import os
 import subprocess
@@ -60,24 +50,20 @@ def main():
     parser.add_argument("--headless", action="store_true", default=False, help="Run without GUI display (for systemd)")
     args, unknown = parser.parse_known_args()
 
+    # Auto-enable headless if DISPLAY is unavailable (e.g., running under sudo or SSH without X forwarding)
+    if not args.headless and not os.environ.get('DISPLAY'):
+        args.headless = True
+        print("Headless enabled: DISPLAY not found; skipping GUI windows.")
+
     print("Starting rover perception system...")
 
     cam_source = args.video if (args.video and os.path.exists(args.video)) else args.camera_index
     provider = FrameProvider(width=args.width, height=args.height, fps=args.fps, camera_index=cam_source)
-    # Use Jetson acceleration when available
+    # Raspberry Pi defaults; CPU/OpenCV only
     det_settings = {
-        'use_cuda_resize': True,
+        'use_cuda_resize': False,
         'cv_threads': 2,
     }
-    try:
-        if _is_jetson():
-            engine_path = 'COSGC-ROBOT/COSGCTank/models/mobilenet_ssd.engine'
-            alt_engine = 'models/mobilenet_ssd.engine'
-            ep = engine_path if os.path.exists(engine_path) else (alt_engine if os.path.exists(alt_engine) else None)
-            if ep:
-                det_settings.update({'use_trt': True, 'trt_engine_path': ep})
-    except Exception:
-        pass
     det = ObstacleDetector(settings=det_settings)
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()

@@ -27,13 +27,8 @@ try:
     _HAS_GPIO = True
     _GPIO_BACKEND = 'RPi'
 except Exception:
-    try:
-        import Jetson.GPIO as GPIO  # type: ignore
-        _HAS_GPIO = True
-        _GPIO_BACKEND = 'Jetson'
-    except Exception:
-        _HAS_GPIO = False
-        _GPIO_BACKEND = None
+    _HAS_GPIO = False
+    _GPIO_BACKEND = None
 
 logging.basicConfig(level=logging.INFO)
 

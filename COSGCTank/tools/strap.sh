@@ -56,22 +56,19 @@ function ensure_venv() {
     echo "[+] Creating venv at $VENVDIR (system site-packages)"
     python3 -m venv --system-site-packages "$VENVDIR"
   fi
-  echo "[+] Pinning pip/setuptools/wheel for Python 3.6 compatibility"
-  "$PIP" install --upgrade 'pip==21.3.1' 'setuptools==58.3.0' 'wheel==0.37.1' 'setuptools_scm==6.4.2' || true
-  # Ensure system SPI/GPIO are available to Python (avoid pip build failures on Jetson Python 3.6)
-  echo "[+] Installing system packages for SPI/GPIO"
+  echo "[+] Upgrading pip/setuptools/wheel"
+  "$PIP" install --upgrade pip setuptools wheel || true
+  echo "[+] Installing system packages for SPI/GPIO (Raspberry Pi)"
   sudo apt update -y || true
-  sudo apt install -y python3-spidev python3-jetson-gpio || true
+  sudo apt install -y python3-spidev python3-rpi.gpio i2c-tools v4l-utils || true
   echo "[+] Installing OpenCV + NumPy from apt"
   sudo apt install -y python3-opencv python3-numpy || true
   if [[ -f "$ROOT_DIR/requirements.txt" ]]; then
     echo "[+] Installing requirements.txt"
     "$PIP" install -r "$ROOT_DIR/requirements.txt" || true
   fi
-  echo "[+] Installing extra packages (Flask, Pillow, luma, evdev)"
-  "$PIP" install flask pillow luma.lcd luma.core evdev || true
-  echo "[+] Optional: tflite-runtime"
-  "$PIP" install tflite-runtime || true
+  echo "[+] Installing extra packages (Flask, Pillow, luma, evdev, tflite-runtime)"
+  "$PIP" install flask pillow luma.lcd luma.core evdev tflite-runtime || true
   echo "[+] Verifying cv2 import"
   if ! "$PY" - <<'PY'
 import cv2, numpy

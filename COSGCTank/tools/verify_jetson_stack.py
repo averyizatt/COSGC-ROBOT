@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""
-Quick Jetson Nano stack verifier.
+import sys
+print("Deprecated: Jetson-specific stack verifier removed. Raspberry Pi-only.")
+sys.exit(0)
 
+"""
 Checks:
 - Jetson detection (L4T)
 - OpenCV build info and CUDA availability
@@ -15,6 +17,7 @@ Checks:
 
 Run:
   python3 COSGC-ROBOT/COSGCTank/tools/verify_jetson_stack.py
+"""
 """
 import os, sys, shutil
 
@@ -117,3 +120,4 @@ if not any(line.startswith('TensorRT:') and 'not available' not in line for line
 if not has_trtexec:
     missing += 1
 sys.exit(0 if missing == 0 else 1)
+"""

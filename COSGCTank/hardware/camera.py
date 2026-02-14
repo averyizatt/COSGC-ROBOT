@@ -66,74 +66,42 @@ class FrameProvider:
                 self._use_picam = False
 
         if not self._use_picam:
-            # Try Jetson CSI via GStreamer first
-            if self._is_jetson() and isinstance(camera_index, int):
-                gst = self._build_csi_gstreamer_pipeline(width=width, height=height, fps=fps)
-                try:
-                    self.cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-                    if self.cap is not None and self.cap.isOpened():
-                        self._use_gst = True
-                        self._cap_backend = 'gstreamer'
-                except Exception:
-                    self._use_gst = False
-                    self._cap_backend = None
+            # OpenCV capture (USB cams / files) for Raspberry Pi
+            try:
+                self.cap = cv2.VideoCapture(camera_index)
+                self._cap_backend = None
+            except Exception:
+                self.cap = cv2.VideoCapture(camera_index)
+                self._cap_backend = None
+            # Prefer MJPG first; then fall back to YUYV if MJPG fails.
+            try:
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+                self.cap.set(cv2.CAP_PROP_FPS, float(fps))
+            except Exception:
+                pass
 
-            # OpenCV V4L2 fallback (USB cams / files)
-            if not self._use_gst:
+            # Probe a frame; if failure, re-open with YUYV
+            try:
+                ok, test = self.cap.read()
+            except Exception:
+                ok, test = False, None
+            if not ok or test is None:
                 try:
-                    self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
-                    self._cap_backend = 'v4l2'
-                except Exception:
-                    self.cap = cv2.VideoCapture(camera_index)
-                    self._cap_backend = None
-
-                # Prefer MJPG for USB cams (lower USB bandwidth); harmless if unsupported.
-                try:
-                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                    self.cap.release()
                 except Exception:
                     pass
-                # try to set preferred size/fps
                 try:
-                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    self.cap = cv2.VideoCapture(camera_index)
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
                     self.cap.set(cv2.CAP_PROP_FPS, float(fps))
                 except Exception:
                     pass
 
-    @staticmethod
-    def _is_jetson():
-        """Best-effort detection of NVIDIA Jetson (L4T)."""
-        try:
-            model_path = Path('/proc/device-tree/model')
-            if model_path.exists():
-                txt = model_path.read_text(errors='ignore').lower()
-                if 'nvidia jetson' in txt:
-                    return True
-        except Exception:
-            pass
-        try:
-            if platform.machine() == 'aarch64':
-                with open('/proc/version', 'r') as f:
-                    v = f.read().lower()
-                if 'tegra' in v or 'nv' in v:
-                    return True
-        except Exception:
-            pass
-        return False
-
-    @staticmethod
-    def _build_csi_gstreamer_pipeline(width=640, height=480, fps=30, flip_method=0):
-        """Build a CSI camera pipeline for Jetson using nvarguscamerasrc.
-
-        Outputs BGR frames for OpenCV appsink; we convert to RGB later.
-        """
-        return (
-            f"nvarguscamerasrc ! "
-            f"video/x-raw(memory:NVMM), framerate={int(fps)}/1, format=NV12 ! "
-            f"nvvidconv flip-method={int(flip_method)} ! "
-            f"video/x-raw, width={int(width)}, height={int(height)}, format=BGRx ! "
-            f"videoconvert ! video/x-raw, format=BGR ! appsink drop=1 max-buffers=1 sync=false"
-        )
+    # Jetson-specific helpers removed; Pi-only implementation
 
     def _preprocess(self, frame, to_rgb=True, resize=True):
         """Apply basic preprocessing: convert to RGB and resize to target size."""
@@ -253,19 +221,51 @@ class StereoFrameProvider:
         self.fps = float(fps)
         self._last_time = 0.0
 
-        self.capL = cv2.VideoCapture(left_index, cv2.CAP_V4L2)
-        self.capR = cv2.VideoCapture(right_index, cv2.CAP_V4L2)
+        self.capL = cv2.VideoCapture(left_index)
+        self.capR = cv2.VideoCapture(right_index)
         if not self.capL.isOpened() or not self.capR.isOpened():
             raise RuntimeError(f'Failed to open stereo cameras: {left_index}, {right_index}')
 
+        # Prefer MJPG, then fall back to YUYV if probe fails
         for cap in (self.capL, self.capR):
             try:
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.width))
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.height))
+                cap.set(cv2.CAP_PROP_FPS, float(self.fps))
             except Exception:
                 pass
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
-            cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+
+        # Probe both; if either fails, re-open both with YUYV
+        try:
+            okL, tL = self.capL.read()
+        except Exception:
+            okL, tL = False, None
+        try:
+            okR, tR = self.capR.read()
+        except Exception:
+            okR, tR = False, None
+        if (not okL or tL is None) or (not okR or tR is None):
+            try:
+                self.capL.release()
+            except Exception:
+                pass
+            try:
+                self.capR.release()
+            except Exception:
+                pass
+            self.capL = cv2.VideoCapture(left_index)
+            self.capR = cv2.VideoCapture(right_index)
+            for cap in (self.capL, self.capR):
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.width))
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.height))
+                    cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+                except Exception:
+                    pass
+            if not self.capL.isOpened() or not self.capR.isOpened():
+                raise RuntimeError(f'Failed to open stereo cameras with YUYV: {left_index}, {right_index}')
 
         self.calib = None
         self._maps = None
@@ -349,7 +349,8 @@ if __name__ == "__main__":
     # Quick test: stream frames and show with overlay FPS
     provider = FrameProvider(width=640, height=480, fps=20)
     import time
-    from overlay import OverlayDrawer
+    from objectDetection.overlay import OverlayDrawer
+
 
     drawer = OverlayDrawer()
     last = time.time()

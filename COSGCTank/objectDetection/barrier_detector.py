@@ -25,7 +25,11 @@ class BarrierDetector:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,7))
         edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        res = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        try:
+            contours = res[0] if len(res) == 2 else res[1]
+        except Exception:
+            contours = []
         dets = []
         for cnt in contours:
             area = cv2.contourArea(cnt)

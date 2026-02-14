@@ -1,4 +1,4 @@
-# Hardware switch handling (Jetson/RPi-compatible GPIO)
+# Hardware switch handling (Raspberry Pi GPIO)
 # Supports up to 3 inputs pulled to GND with internal pull-ups.
 # - BTN1 (momentary)
 # - SW1 (SPDT logical mode)
@@ -8,17 +8,12 @@ import time
 from typing import Optional
 
 try:
-    import RPi.GPIO as _GPIO  # Prefer Raspberry Pi GPIO
+    import RPi.GPIO as _GPIO  # Raspberry Pi GPIO
     GPIO = _GPIO
     _GPIO_LIB = 'RPi.GPIO'
 except Exception:
-    try:
-        import Jetson.GPIO as _GPIO  # Jetson fallback
-        GPIO = _GPIO
-        _GPIO_LIB = 'Jetson.GPIO'
-    except Exception:
-        GPIO = None
-        _GPIO_LIB = None
+    GPIO = None
+    _GPIO_LIB = None
 
 
 class Switches:

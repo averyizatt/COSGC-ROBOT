@@ -461,150 +461,83 @@ pip3 install -r requirements.txt
 - Inputs (active‑low to GND): BTN1=BCM5 (pin 29), SW1=BCM16 (pin 36), SW2=BCM27 (pin 13)
 - Files: `tft_display.py`, `hardware_switches.py` (integrated in `main.py`)
 
-## Jetson Nano (JetPack 4.6.x) Setup
+### Raspberry Pi Pinout (40‑pin Header)
 
-The rover supports NVIDIA Jetson Nano on JetPack 4.6.x (tested on 4.6.4 and 4.6.2) using GStreamer and the Jetson camera stack. On Jetson, the code auto-detects the platform and opens the CSI camera via a GStreamer `nvarguscamerasrc` pipeline for hardware-accelerated capture.
+Use BCM numbering in code (e.g., `GPIO.setmode(GPIO.BCM)`). Below, we list pins in the style “GPIO N (Function)” with their physical pin numbers for clarity.
 
-### Install system dependencies
-
-```bash
-sudo apt update
-sudo apt install -y \
-  python3-opencv python3-pip \
-  gstreamer1.0-tools gstreamer1.0-plugins-good \
-  gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-  v4l-utils python3-jetson-gpio
-# Enable SPI/I2C GPIO on the 40-pin header (Jetson Nano):
-sudo /opt/nvidia/jetson-io/jetson-io.py  # select SPI0, I2C1, GPIO as needed
-```
-
-Note: `requirements.txt` skips `opencv-python` on `aarch64`. Use the system `python3-opencv` that ships with JetPack (CUDA-enabled).
-
-### Python packages
-
-```bash
-pip3 install --upgrade pip
-pip3 install -r requirements.txt
-```
-
-### Camera notes (CSI and USB)
-
-- CSI (Raspberry Pi Camera Module / IMX219): opened via `nvarguscamerasrc` automatically. No extra config needed; the default `FrameProvider()` will use the Jetson pipeline when detected.
-- USB cameras: opened via V4L2 (MJPG preferred). If using a USB camera exclusively, no changes are required.
-
-You can sanity-check the CSI camera with GStreamer:
-
-```bash
-gst-launch-1.0 nvarguscamerasrc ! nvoverlaysink
-```
-
-### Run
-
-```bash
-python3 rover_server.py &
-python3 main.py
-```
-
-If you need GStreamer debugging, you can enable it temporarily:
-
-```bash
-export GST_DEBUG=2
-python3 main.py
-```
-
-### Performance tips (Jetson Nano)
-
-- Power/perf modes:
-  ```bash
-  sudo nvpmodel -m 0   # max performance mode
-  sudo jetson_clocks   # lock clocks to max
-  ```
-- CUDA/OpenCV libs are typically under `/usr/local/cuda` and `/usr/lib/aarch64-linux-gnu` on JetPack 4.6.4. If needed, export:
-
-### Verify Jetson stack
-
-Quick check for CUDA/OpenCV/TensorRT/Jetson.GPIO without running the full app:
-
-```bash
-python3 COSGC-ROBOT/COSGCTank/tools/verify_jetson_stack.py
-```
-
-The script prints a report and exits non‑zero if key accelerations are missing. If TensorRT is installed, consider converting your TFLite/ONNX model to a `.engine` with `trtexec` (see [tools/trtexec_convert.sh](COSGC-ROBOT/COSGCTank/tools/trtexec_convert.sh)).
-
-### TFT + Switches on Jetson Nano
-
-- Two display backends:
-  - `luma.lcd` (SPI) when available.
-  - Fallback: Adafruit CircuitPython ST7735R via Blinka (added to requirements).
-- Wiring (40‑pin header; BCM-compatible numbering via Jetson.GPIO):
-  - DEC (D/C) → GPIO20 (pin 38)
-  - RES (Reset) → GPIO21 (pin 40)
-  - SPI0: SCLK (pin 23), MOSI (pin 19), CE0 (pin 24) or CE1 (pin 26)
-  - Inputs (active‑low to GND): BTN1=GPIO5 (pin 29), RC=GPIO16 (pin 36), NAV=GPIO27 (pin 13)
-- Permissions: `sudo usermod -aG gpio $USER` then log out/in to use Jetson.GPIO without sudo.
-
-## Jetson Nano Pinout (40‑pin Header) — Project Signals
-
-- Power & I2C (IMU `MPU-6050`):
-  - 3V3: pin 1 or 17
-  - GND: any GND (e.g., pin 6)
-  - I2C1 SDA: GPIO2 (pin 3)
-  - I2C1 SCL: GPIO3 (pin 5)
-- Ultrasonic (HC‑SR04 style):
-  - TRIG: GPIO6 (pin 31)
-  - ECHO: GPIO12 (pin 32) — level shift to 3.3V
-- TFT ST7735 (SPI0):
-  - SCLK: pin 23
-  - MOSI: pin 19
-  - CS: pin 24 (CE0) [or pin 26 (CE1)]
-  - DEC (D/C): GPIO20 (pin 38)
-  - RES (Reset): GPIO21 (pin 40)
-- Inputs:
-  - BTN1 (pairing): GPIO5 (pin 29), active‑low to GND
-  - SPDT RC throw: GPIO16 (pin 36), active‑low to GND
-  - SPDT NAV throw: GPIO27 (pin 13), active‑low to GND
-- Motor driver (DRV8833 default mapping):
-  - AIN1: GPIO12 (pin 32)
-  - AIN2: GPIO13 (pin 33)
-  - BIN1: GPIO24 (pin 18)
-  - BIN2: GPIO23 (pin 16)
-  - STBY: GPIO26 (pin 37)
+- Power:
+  - 3.3V: pin 1, pin 17
+  - 5V: pin 2, pin 4
+  - GND: pins 6, 9, 14, 20, 25, 30, 34, 39
+- I2C1 (IMU bus):
+  - GPIO 2 (SDA) → pin 3
+  - GPIO 3 (SCL) → pin 5
+- HAT EEPROM I2C:
+  - GPIO 0 (ID_SD) → pin 27
+  - GPIO 1 (ID_SC) → pin 28
+- UART0:
+  - GPIO 14 (TXD) → pin 8
+  - GPIO 15 (RXD) → pin 10
+- SPI0:
+  - GPIO 11 (SCLK) → pin 23
+  - GPIO 10 (MOSI) → pin 19
+  - GPIO 9  (MISO) → pin 21
+  - GPIO 8  (CE0)  → pin 24
+  - GPIO 7  (CE1)  → pin 26
+- PWM:
+  - GPIO 18 (PWM0) → pin 12
+  - GPIO 12 (PWM0 alt) → pin 32
+  - GPIO 13 (PWM1) → pin 33
+- Common GPIO (usable):
+  - GPIO 4 → pin 7
+  - GPIO 17 → pin 11
+  - GPIO 18 → pin 12
+  - GPIO 27 → pin 13
+  - GPIO 22 → pin 15
+  - GPIO 23 → pin 16
+  - GPIO 24 → pin 18
+  - GPIO 25 → pin 22
+  - GPIO 5  → pin 29
+  - GPIO 6  → pin 31
+  - GPIO 19 → pin 35
+  - GPIO 16 → pin 36
+  - GPIO 26 → pin 37
+  - GPIO 20 (TFT D/C) → pin 38
+  - GPIO 21 (TFT RESET) → pin 40
 
 Notes:
-- Jetson header uses Pi‑like BOARD/BCM numbering via `Jetson.GPIO`. Enable SPI/I2C in `jetson-io` first.
-- Ensure ultrasonic ECHO is level‑shifted to 3.3V.
-- If your TFT CS is wired to CE1, set `spi_device=1` in `tft_display.py` or when constructing `TFTDisplay`.
-  ```bash
-  export CUDA_HOME=/usr/local/cuda
-  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
-  ```
-- GPIO access: ensure your user is in the `gpio` group:
-  ```bash
-  sudo usermod -aG gpio $USER
-  newgrp gpio
-  ```
-- OpenCV: the detector enables `cv2.setUseOptimized(True)` and uses a small thread count by default. You can tune via settings key `cv_threads`.
+- GPIOs are 3.3V‑only; level-shift any 5V signals (e.g., ultrasonic ECHO).
+- GPIO 18/19/20/21 also serve PCM/I2S (CLK/FS/DIN/DOUT).
 
-### TensorRT Detector (optional)
+### Project Wiring Summary (BCM)
+- Camera: Picamera2 (CSI), or USB cam on `/dev/video0`.
+- TFT ST7735 (SPI0):
+  - SCLK → GPIO 11 (pin 23)
+  - MOSI → GPIO 10 (pin 19)
+  - CS   → CE0 (GPIO 8, pin 24) [or CE1 GPIO 7, pin 26]
+  - D/C  → GPIO 20 (pin 38)
+  - RESET → GPIO 21 (pin 40)
+- Inputs (active‑low to GND):
+  - BTN1 (pairing) → GPIO 5 (pin 29)
+  - RC mode throw → GPIO 16 (pin 36)
+  - NAV mode throw → GPIO 27 (pin 13)
+- Ultrasonic HC‑SR04:
+  - TRIG → GPIO 6 (pin 31)
+  - ECHO → GPIO 12 (pin 32) — MUST be level‑shifted to 3.3V
+- IMU (MPU‑6050 via I2C1):
+  - SDA → GPIO 2 (pin 3)
+  - SCL → GPIO 3 (pin 5)
+  - Bus: `/dev/i2c-1`
+- Motor Driver (DRV8833 default in code):
+  - AIN1 → GPIO 12 (pin 32)
+  - AIN2 → GPIO 13 (pin 33)
+  - BIN1 → GPIO 24 (pin 18)
+  - BIN2 → GPIO 23 (pin 16)
+  - STBY → GPIO 26 (pin 37)
 
-For higher detector throughput on Nano, convert your SSD ONNX model to a TensorRT engine and enable the TRT backend:
+<!-- Jetson-specific documentation removed for Raspberry Pi-only setup -->
 
-1) Convert ONNX → TRT:
-```bash
-cd COSGC-ROBOT/COSGCTank
-chmod +x tools/trtexec_convert.sh
-./tools/trtexec_convert.sh models/mobilenet_ssd.onnx models/mobilenet_ssd.engine
-```
-2) Enable in settings (via `/settings` POST or in code):
-- `use_trt: true`
-- `trt_engine_path: "models/mobilenet_ssd.engine"`
-- Optional: `trt_input`, `trt_outputs` if your engine uses custom binding names.
-
-The detector will fall back to TFLite when TRT isn’t available or the engine path is missing.
-
-### CUDA-accelerated resize
-
-If your OpenCV build includes CUDA modules, the detector uses CUDA for image resize before inference (`use_cuda_resize: true` in settings). Color-space normalization remains on the CPU for robustness.
+<!-- TensorRT/CUDA references removed for Raspberry Pi-only setup -->
 
 
 - **WASD/buttons**: press-and-hold sends keepalives; release stops.

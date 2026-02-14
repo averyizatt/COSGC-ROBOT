@@ -1,10 +1,9 @@
-# Models (TensorRT / ONNX)
+# Models (TFLite / ONNX)
 
-This folder holds the ONNX model and the generated TensorRT engine used by `main.py` and the verifier script.
+This folder holds model assets used by the detector. On Raspberry Pi, the default path uses a TFLite model.
 
 - Expected files:
-  - `mobilenet_ssd.onnx` — the default SSD ONNX model
-  - `mobilenet_ssd.engine` — the TensorRT engine built from the ONNX
+  - `mobilenet_ssd.tflite` — the default SSD TFLite model
 
 ## Fetch a default ONNX
 
@@ -24,12 +23,6 @@ You can find ONNX models on the Hugging Face ONNX model zoo:
 
 - https://huggingface.co/onnxmodelzoo
 
-## Build the TensorRT engine
+## Notes
 
-Convert the ONNX into a TensorRT engine using `trtexec` (Jetson Nano, FP16):
-
-```bash
-bash COSGC-ROBOT/COSGCTank/tools/trtexec_convert.sh COSGC-ROBOT/COSGCTank/models/mobilenet_ssd.onnx COSGC-ROBOT/COSGCTank/models/mobilenet_ssd.engine
-```
-
-`main.py` will auto-detect the engine at `COSGC-ROBOT/COSGCTank/models/mobilenet_ssd.engine` and enable TensorRT.
+- If you prefer ONNX for experimentation on a desktop, you can still place ONNX models here, but the Pi pipeline defaults to TFLite.

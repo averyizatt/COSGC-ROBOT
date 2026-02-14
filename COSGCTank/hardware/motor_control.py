@@ -22,31 +22,28 @@ applying software PWM on the active direction input per motor.
 import time
 import logging
 import threading
+import os
 
-# GPIO backend: prefer RPi.GPIO when on Raspberry Pi, otherwise try Jetson.GPIO
+_GPIO_BACKEND = None
+_HAS_GPIO = False
 try:
     import RPi.GPIO as GPIO  # type: ignore
     _HAS_GPIO = True
     _GPIO_BACKEND = 'RPi'
 except Exception:
-    try:
-        import Jetson.GPIO as GPIO  # type: ignore
-        _HAS_GPIO = True
-        _GPIO_BACKEND = 'Jetson'
-    except Exception:
-        _HAS_GPIO = False
-        _GPIO_BACKEND = None
+    _HAS_GPIO = False
+    _GPIO_BACKEND = None
 
 logging.basicConfig(level=logging.INFO)
 
 
 class SoftPWM:
-    """Simple software PWM for GPIO pins (Jetson fallback).
+    """Simple software PWM for GPIO pins.
 
     Provides a subset of the GPIO.PWM interface: start(), ChangeDutyCycle(), stop().
     Uses a background thread to toggle the pin at the requested frequency.
     """
-    def __init__(self, gpio, pin, frequency_hz=200):
+    def __init__(self, gpio, pin, frequency_hz=250):
         self._gpio = gpio
         self._pin = int(pin)
         self._freq = float(max(1.0, frequency_hz))
@@ -118,7 +115,7 @@ class SoftPWM:
 
 
 class MotorController:
-    def __init__(self, pins=None, pwm_frequency=1000, invert_left=False, invert_right=False, pwm_mode='auto'):
+    def __init__(self, pins=None, pwm_frequency=250, invert_left=False, invert_right=False, pwm_mode='auto'):
         # default pins follow rover_server.py layout if not provided
         # H-bridge direction: IN1/IN2 per motor; optional STBY and optional PWM pins.
         self.pins = pins or {"AIN1": 12, "AIN2": 13, "BIN1": 24, "BIN2": 23, "STBY": 26}
@@ -153,8 +150,8 @@ class MotorController:
                 else:
                     # DRV8833 commonly has only IN pins; prefer IN-pin PWM.
                     mode = 'in_pins'
-            # Jetson.GPIO: if using IN-pin PWM, substitute software PWM on those pins.
-            use_soft_pwm = (_GPIO_BACKEND == 'Jetson' and mode == 'in_pins')
+            # Always use software PWM for IN-pin control to avoid hardware PWM issues.
+            use_soft_pwm = (mode == 'in_pins')
 
             if mode == 'enable':
                 if 'PWMA' in self.pins:
@@ -168,13 +165,10 @@ class MotorController:
                     self._pwms['STBY'] = SoftPWM(GPIO, self.pins['STBY'], self.pwm_frequency)
                     self._pwms['STBY'].start(0)
             elif mode == 'in_pins':
-                # PWM on direction pins. Create PWM (hardware or software) for all 4.
+                # PWM on direction pins using software PWM for stability across platforms.
                 for k in ('AIN1', 'AIN2', 'BIN1', 'BIN2'):
                     if k in self.pins:
-                        if use_soft_pwm:
-                            self._pwms[k] = SoftPWM(GPIO, self.pins[k], self.pwm_frequency)
-                        else:
-                            self._pwms[k] = GPIO.PWM(self.pins[k], self.pwm_frequency)
+                        self._pwms[k] = SoftPWM(GPIO, self.pins[k], self.pwm_frequency)
                         self._pwms[k].start(0)
 
             self.pwm_mode = mode
@@ -231,12 +225,21 @@ class MotorController:
 
     def _set_pins(self, ain1, ain2, bin1, bin2, standby=True):
         if self._using_gpio:
-            GPIO.output(self.pins['AIN1'], GPIO.HIGH if ain1 else GPIO.LOW)
-            GPIO.output(self.pins['AIN2'], GPIO.HIGH if ain2 else GPIO.LOW)
-            GPIO.output(self.pins['BIN1'], GPIO.HIGH if bin1 else GPIO.LOW)
-            GPIO.output(self.pins['BIN2'], GPIO.HIGH if bin2 else GPIO.LOW)
+            def safe_out(pin, val):
+                try:
+                    GPIO.output(pin, val)
+                except Exception:
+                    try:
+                        GPIO.setup(pin, GPIO.OUT)
+                        GPIO.output(pin, val)
+                    except Exception:
+                        pass
+            safe_out(self.pins['AIN1'], GPIO.HIGH if ain1 else GPIO.LOW)
+            safe_out(self.pins['AIN2'], GPIO.HIGH if ain2 else GPIO.LOW)
+            safe_out(self.pins['BIN1'], GPIO.HIGH if bin1 else GPIO.LOW)
+            safe_out(self.pins['BIN2'], GPIO.HIGH if bin2 else GPIO.LOW)
             if 'STBY' in self.pins and 'STBY' not in self._pwms:
-                GPIO.output(self.pins['STBY'], GPIO.HIGH if standby else GPIO.LOW)
+                safe_out(self.pins['STBY'], GPIO.HIGH if standby else GPIO.LOW)
         else:
             logging.info(f"Set pins AIN1={ain1} AIN2={ain2} BIN1={bin1} BIN2={bin2} STBY={standby}")
 

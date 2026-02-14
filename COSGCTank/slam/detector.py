@@ -57,7 +57,7 @@ class ObstacleDetector:
         self._tracks: List[Dict[str, Any]] = []
         self._next_id = 1
 
-        # Enable OpenCV optimizations on capable platforms (Jetson/Pi)
+        # Enable OpenCV optimizations on Raspberry Pi
         try:
             cv2.setUseOptimized(True)
             cv2.setNumThreads(max(1, int(self.settings.get('cv_threads', 2))))

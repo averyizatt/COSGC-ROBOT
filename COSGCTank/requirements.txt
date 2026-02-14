@@ -8,7 +8,7 @@ Pillow
 luma.core
 luma.lcd
 spidev; python_version >= "3.7"
-# CircuitPython fallback for TFT (skip on Python < 3.7 to avoid setuptools_scm issues on Jetson)
+# CircuitPython fallback for TFT (skip on Python < 3.7)
 Adafruit-Blinka; python_version >= "3.7"
 adafruit-circuitpython-st7735r; python_version >= "3.7"
 # Local Bluetooth/Xbox controller (Pi/Linux)
@@ -21,12 +21,6 @@ evdev
 #   sudo raspi-config  (Interface Options)
 # Install GPIO/SPI system libs on Raspberry Pi:
 #   sudo apt install -y python3-rpi.gpio python3-spidev python3-picamera2
-# On NVIDIA Jetson (aarch64, JetPack 4.x), install system OpenCV with CUDA:
-#   sudo apt install -y python3-opencv
-# For Jetson GPIO control, install via apt:
-#   sudo apt install -y python3-jetson-gpio
-# For CircuitPython alternative (Jetson/RPi) on Python >= 3.7:
+# On Raspberry Pi, prefer system OpenCV via apt: `sudo apt install -y python3-opencv`.
+# Optional CircuitPython fallback (on Python >= 3.7):
 #   python3 -m pip install Adafruit-Blinka adafruit-circuitpython-st7735r
-# Optional for TensorRT backend:
-#   TensorRT Python API and trtexec are bundled with JetPack (no pip). Install pycuda via pip:
-#   python3 -m pip install pycuda

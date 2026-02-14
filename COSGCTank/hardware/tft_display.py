@@ -20,7 +20,7 @@ except Exception:
     ImageFont = None  # type: ignore
     _LUMA_AVAILABLE = False
 
-# CircuitPython ST7735R fallback (works on Jetson via Blinka)
+# CircuitPython ST7735R fallback (via Blinka)
 try:
     import board  # type: ignore
     import digitalio  # type: ignore
@@ -87,7 +87,7 @@ class TFTDisplay:
                 self._available = True
             except Exception:
                 self._available = False
-        # Fallback: Adafruit CircuitPython ST7735R via Blinka (e.g. Jetson Nano)
+        # Fallback: Adafruit CircuitPython ST7735R via Blinka
         if not self._available and _ADA_AVAILABLE and board is not None and digitalio is not None and busio is not None and ada_st7735 is not None:
             try:
                 spi_hw = busio.SPI(board.SCLK, board.MOSI)

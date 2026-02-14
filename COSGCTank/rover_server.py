@@ -691,7 +691,7 @@ motor = MotorController(
     pins={"AIN1": 17, "AIN2": 27, "BIN1": 23, "BIN2": 18, "STBY": 4},
     invert_left=True,
     invert_right=True,
-    # Use SoftPWM on direction pins for Jetson, no hardware PWM
+    # Use SoftPWM on direction pins for consistent control across Pi setups
     pwm_mode='in_pins',
 )
 
