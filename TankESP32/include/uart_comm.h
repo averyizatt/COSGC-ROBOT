@@ -65,14 +65,10 @@ public:
     // Send messages
     void sendSensorData(const SensorData& data);
     void sendStatus(const char* status);
-    void sendAck(uint8_t messageType);
     
     // Receive and process messages
     bool receiveMessage(Message& msg);
     void processMessage(const Message& msg);
-    
-    // Check if data is available
-    bool available();
     
     // Set callback for motor commands
     void onMotorCommand(void (*callback)(int speedA, int speedB));
@@ -80,6 +76,7 @@ public:
 
 private:
     void sendMessage(const Message& msg);
+    void sendAck(uint8_t messageType);
     uint8_t calculateChecksum(const Message& msg);
     bool validateChecksum(const Message& msg);
     

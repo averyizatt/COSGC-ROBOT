@@ -16,9 +16,6 @@ public:
     
     // Update button state (call in loop)
     ButtonEvent update();
-    
-    // Get current button state
-    bool isPressed();
 
 private:
     unsigned long pressStartTime;

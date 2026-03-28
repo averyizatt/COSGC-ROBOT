@@ -34,9 +34,6 @@ public:
     // Set goal position (world coordinates in cm)
     void setGoal(float worldX, float worldY);
     
-    // Set goal position (grid coordinates)
-    void setGoalGrid(int gridX, int gridY);
-    
     // Command to return to start
     void returnHome();
     
@@ -69,12 +66,13 @@ public:
     
     // Debug
     void printPath();
-    int getPathLength() { return pathLength; }
-    int getExploredFrontiers() { return frontiersFound; }
 
 private:
     OccupancyMap* occupancyMap;
     PlannerMode mode;
+    
+    // Internal: set goal in grid coordinates
+    void setGoalGrid(int gridX, int gridY);
     
     // Goal
     int goalX, goalY;
@@ -97,8 +95,12 @@ private:
     // Home position
     int homeX, homeY;
     
+    // Exploration timing — prevent premature IDLE when map is mostly unknown
+    unsigned long exploreStartTime;
+    unsigned long lastFrontierRetry;
+    
     // Waypoint reached threshold (grid cells)
-    static const int WAYPOINT_THRESHOLD = 3;  // 15cm
+    static const int WAYPOINT_THRESHOLD = 1;  // 50cm (1 cell at 50cm resolution)
     
     // Compute path using wavefront algorithm
     bool computePath(int startX, int startY, int endX, int endY);
@@ -109,11 +111,14 @@ private:
     // Select best frontier to explore
     int selectBestFrontier(int robotX, int robotY);
     
-    // Check if cell is traversable
+    // Check if cell is traversable (only FREE/LIKELY_FREE — fog of war enforced)
     bool isTraversable(int x, int y);
     
     // Check if cell is a frontier
     bool isFrontier(int x, int y);
+
+    // BFS flood-fill through free cells to find all cells reachable from (startX, startY)
+    void computeReachability(int startX, int startY, bool reachable[MAP_WIDTH][MAP_HEIGHT]);
     
     // Get heading to waypoint
     float headingToWaypoint(int fromX, int fromY, int toX, int toY);

@@ -16,7 +16,9 @@
 class XboxController {
 public:
     XboxController();
-    void begin();
+    void begin();  // First-time Bluepad32 init (call once)
+    void stop();   // Disable BT controller radio
+    void start();  // Re-enable BT controller radio (after stop)
     
     // Update controller state (call in loop)
     void update();
@@ -24,6 +26,8 @@ public:
     // Get controller values
     int getLeftStickY();   // -512 to 512 (forward/backward)
     int getRightStickX();  // -512 to 512 (left/right turn)
+    int getRightTrigger(); // 0 to 1023 (servo forward)
+    int getLeftTrigger();  // 0 to 1023 (servo reverse)
     
     // Calculate motor speeds for skid steer
     void getMotorSpeeds(int& leftSpeed, int& rightSpeed);
@@ -40,6 +44,8 @@ public:
 private:
     int leftStickY;
     int rightStickX;
+    int rightTrigger;
+    int leftTrigger;
     
     // Deadzone for joysticks
     static const int DEADZONE = 50;
@@ -58,6 +64,7 @@ private:
 #endif
 
     bool bleAvailable;
+    bool btInitialized;  // true after begin() has been called once
 
 #if XBOX_BLE_AVAILABLE
     static void onConnectedGamepad(GamepadPtr gp);

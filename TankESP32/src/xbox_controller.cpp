@@ -9,12 +9,15 @@ static XboxController* g_xboxInstance = nullptr;
 XboxController::XboxController() : 
     leftStickY(0), 
     rightStickX(0),
+    rightTrigger(0),
+    leftTrigger(0),
     pairingMode(false),
     pairingStartTime(0)
 #if XBOX_BLE_AVAILABLE
     , gamepad(nullptr), connected(false)
 #endif
-    , bleAvailable(XBOX_BLE_AVAILABLE) {
+    , bleAvailable(XBOX_BLE_AVAILABLE)
+    , btInitialized(false) {
 }
 
 void XboxController::begin() {
@@ -22,12 +25,32 @@ void XboxController::begin() {
     g_xboxInstance = this;
     BP32.setup(&XboxController::onConnectedGamepad, &XboxController::onDisconnectedGamepad);
     BP32.enableVirtualDevice(false);
+    btInitialized = true;
     Serial.println("[XBOX] Bluepad32 initialized - BLE pairing available");
     Serial.println("[XBOX] Put controller in pairing mode, then short-press button");
 #else
+    btInitialized = true;
     Serial.println("[XBOX] Controller module initialized");
     Serial.println("[XBOX] Note: Full BLE gamepad requires Bluepad32 platform");
     Serial.println("[XBOX] Stub mode - press button to simulate pairing");
+#endif
+}
+
+void XboxController::stop() {
+#if XBOX_BLE_AVAILABLE
+    btStop();
+    Serial.println("[XBOX] Bluetooth radio disabled");
+#endif
+}
+
+void XboxController::start() {
+#if XBOX_BLE_AVAILABLE
+    if (!btInitialized) {
+        begin();  // First time — full init
+    } else {
+        btStart();
+        Serial.println("[XBOX] Bluetooth radio re-enabled");
+    }
 #endif
 }
 
@@ -38,10 +61,36 @@ void XboxController::update() {
     if (gamepad && gamepad->isConnected()) {
         // Bluepad32 axis range is typically -511..512
         leftStickY = -gamepad->axisY();    // Invert so up stick = forward
-        rightStickX = gamepad->axisRX();   // Right stick X for turning
+        
+        // Right stick X for turning — amplify 3x since some controllers report small range
+        int rawRX = gamepad->axisRX();
+        rightStickX = constrain(rawRX * 3, -512, 512);
+        
+        // Triggers for servo — try analog first, fall back to digital button
+        rightTrigger = gamepad->throttle(); // RT analog (0-1023)
+        leftTrigger = gamepad->brake();     // LT analog (0-1023)
+        // If analog brake reads 0, check l2 digital button as fallback
+        if (leftTrigger < 20 && gamepad->l2()) {
+            leftTrigger = 1023;  // Digital LT pressed = full throw
+        }
+        if (rightTrigger < 20 && gamepad->r2()) {
+            rightTrigger = 1023; // Digital RT fallback
+        }
+        
+        // Raw axis debug (every 500ms, always when connected)
+        static unsigned long lastAxisDbg = 0;
+        if (millis() - lastAxisDbg > 500) {
+            lastAxisDbg = millis();
+            Serial.printf("[XBOX-RAW] Y:%d X:%d RX:%d RY:%d brake:%d throttle:%d l2:%d r2:%d\n",
+                          gamepad->axisY(), gamepad->axisX(), gamepad->axisRX(),
+                          gamepad->axisRY(), gamepad->brake(), gamepad->throttle(),
+                          gamepad->l2(), gamepad->r2());
+        }
     } else {
         leftStickY = 0;
         rightStickX = 0;
+        rightTrigger = 0;
+        leftTrigger = 0;
     }
 #endif
 
@@ -64,6 +113,14 @@ int XboxController::getRightStickX() {
     return rightStickX;
 }
 
+int XboxController::getRightTrigger() {
+    return rightTrigger;
+}
+
+int XboxController::getLeftTrigger() {
+    return leftTrigger;
+}
+
 int XboxController::applyDeadzone(int value) {
     if (abs(value) < DEADZONE) {
         return 0;
@@ -81,7 +138,7 @@ void XboxController::getMotorSpeeds(int& leftSpeed, int& rightSpeed) {
     int baseSpeed = map(throttle, -512, 512, -255, 255);
     int turnAmount = map(steering, -512, 512, -255, 255);
     
-    // Tank drive mixing
+    // Tank drive mixing — full turn authority
     // Left stick Y = forward/backward, Right stick X = turn
     leftSpeed = baseSpeed + turnAmount;
     rightSpeed = baseSpeed - turnAmount;
@@ -142,6 +199,8 @@ void XboxController::onDisconnectedGamepad(GamepadPtr gp) {
     g_xboxInstance->connected = false;
     g_xboxInstance->leftStickY = 0;
     g_xboxInstance->rightStickX = 0;
+    g_xboxInstance->rightTrigger = 0;
+    g_xboxInstance->leftTrigger = 0;
     Serial.println("[XBOX] Controller disconnected");
 }
 #endif

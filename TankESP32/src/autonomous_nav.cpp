@@ -1,61 +1,91 @@
 #include "autonomous_nav.h"
 #include "config.h"
+#include "globals.h"
+#include "motor_control.h"
+#include "path_planner.h"
 
-// Distance thresholds (cm) - ultrasonic is 76mm above ground
-#define DIST_CRITICAL   10.0f   // Emergency stop/reverse
-#define DIST_CLOSE      25.0f   // Turn away
-#define DIST_MEDIUM     50.0f   // PID starts slowing
-#define DIST_FAR        100.0f  // PID setpoint - desired cruising distance
+// Set motor speeds helper for navigation
+void setMotorSpeeds(int left, int right) {
+    extern MotorControl motors;
+    motors.setMotors(left, right);
+}
 
-// Speed settings — capped by MAX_PWM in config.h to prevent brownout
+// Navigation state variables (single definition where appropriate)
+bool turningToHeading = false;
+float targetTurnTheta = 0;
+bool hasNavTarget = false;
+float navTargetX = 0, navTargetY = 0;
+// odometry variables are defined centrally in globals.cpp
+extern float odomX;
+extern float odomY;
+extern float odomTheta;
+
+// --- Slip/Stall detection helper ---
+bool AutonomousNav::isSlippingOrStalled() {
+    // If commanded speed is high but encoder speed is low, consider slip/stall
+    return (currentSpeed > 100 && encoderSpeedCmS < 5.0f);
+}
+void AutonomousNav::setOdometry(float x, float y, float theta) {
+    odomX = x;
+    odomY = y;
+    odomTheta = theta;
+}
+void AutonomousNav::turnToHeading(float targetTheta) {
+    targetTurnTheta = targetTheta;
+    turningToHeading = true;
+}
+void AutonomousNav::returnToStart() {
+    // Use path planner for obstacle-aware routing back to start
+    extern PathPlanner pathPlanner;
+    pathPlanner.returnHome();
+    setNavTarget(0, 0);  // Also set direct target as fallback
+}
+void AutonomousNav::setNavTarget(float x_cm, float y_cm) {
+    navTargetX = x_cm;
+    navTargetY = y_cm;
+    hasNavTarget = true;
+}
+
+// ==================== NAVIGATION CONSTANTS ====================
+
+// Distance thresholds (cm) — ultrasonic is 76mm above ground
+#define DIST_CRITICAL   15.0f   // Emergency — must reverse immediately
+#define DIST_CLOSE      35.0f   // Obstacle — enter avoidance (was 25, too late to react)
+#define DIST_MEDIUM     60.0f   // Caution — speed reduction zone
+#define DIST_FAR        100.0f  // Cruising — full speed
+
+// Speed settings (PWM 0-255, hardware clamps to maxSafePWM=210)
 #define SPEED_MAX       MAX_PWM
-#define SPEED_CRUISE    (MAX_PWM - 10)  // Slightly under max for headroom
-#define SPEED_SLOW      (MAX_PWM - 30)
+#define SPEED_CRUISE    MAX_PWM
 #define SPEED_TURN      MAX_PWM
-#define SPEED_SCAN      (MAX_PWM - 30)
-#define SPEED_UPHILL    MAX_PWM
-#define SPEED_DOWNHILL  (MAX_PWM - 40)
-#define SPEED_MIN_MOVE  (MAX_PWM - 50) // Minimum PWM to overcome static friction
+#define SPEED_MIN_MOVE  (MAX_PWM * 80 / 100)  // Minimum to overcome friction
 
-// Minimum time in non-forward state before allowing transition (ms)
-#define MIN_STATE_TIME  800
+// Avoidance timing
+#define AVOID_BACKUP_MS       250   // Reverse duration on obstacle detect (short nudge back)
+#define AVOID_BACKUP_CRIT_MS  350   // Reverse duration on critical obstacle
+#define AVOID_VERIFY_MS       300   // Forward check duration after turn
+#define AVOID_MAX_CYCLES      4     // Max avoid cycles before escalating to recovery
 
-// PID gains for distance → speed control
-// Error = distance - DIST_CLOSE (positive = far from obstacle = go faster)
-#define PID_KP          5.0f    // Proportional: speed per cm of clearance
-#define PID_KI          0.1f    // Integral: accumulate error over time  
-#define PID_KD          1.5f    // Derivative: react to closing rate
-#define PID_I_MAX       2000.0f // Anti-windup clamp for integral
+// Stall detection
+#define STALL_TIMEOUT_MS      2500  // Distance stuck under DIST_MEDIUM → avoidance
+#define STUCK_THRESHOLD       8     // History readings to consider stuck
+#define STUCK_DISTANCE_TOL    5.0f  // Distance tolerance (cm)
 
-// Stall detection: if distance stays under DIST_MEDIUM for this long, force turn
-#define STALL_TIMEOUT_MS  2500
-
-// Timing
-#define STUCK_THRESHOLD     5       // Readings to consider stuck
-#define STUCK_DISTANCE_TOL  3.0f    // Distance tolerance (cm)
+// ==================== CONSTRUCTOR ====================
 
 AutonomousNav::AutonomousNav() {
     currentState = NAV_STOPPED;
-    currentBehavior = BEHAVIOR_EXPLORE;
-    lastTurnDirection = TURN_RANDOM;
-    preferredDirection = TURN_RANDOM;
     stateStartTime = 0;
-    stateDuration = 0;
     lastStateChange = 0;
+    lastTurnDirection = TURN_RANDOM;
+    
     lastDistance = 0;
     historyIndex = 0;
     stuckCounter = 0;
-    lastMovementTime = 0;
-    lastMovementDistance = 0;
-    scanLeftDistance = 0;
-    scanRightDistance = 0;
-    hasScannedLeft = false;
-    hasScannedRight = false;
     currentSpeed = 0;
     targetSpeed = 0;
-    pidIntegral = 0;
-    pidLastError = 0;
     stallStartTime = 0;
+    
     sideDistLeft = 999.0f;
     sideDistRight = 999.0f;
     detectedWallAngle = 0.0f;
@@ -63,126 +93,131 @@ AutonomousNav::AutonomousNav() {
     // IMU
     upsideDown = false;
     currentOrientation = ORIENTATION_NORMAL;
-    pitch = 0;
-    roll = 0;
-    accelX = 0;
-    accelY = 0;
-    accelZ = 1.0f;  // Default: right-side up
+    pitch = 0; roll = 0;
+    accelX = 0; accelY = 0; accelZ = 1.0f;
     gyroZ = 0;
     imuAvailable = false;
     
-    // Heading tracking
+    // Heading / DR
     heading = 0;
     headingAtObstacle = 0;
     lastIMUUpdate = 0;
+    drX = 0; drY = 0;
+    headingTowardStartSince = 0;
+    cruiseHeading = 0;
+    headingLocked = false;
+    cruiseEnteredAt = 0;
     turnStartHeading = 0;
     consecutiveSameDirection = 0;
-    
-    // Clear obstacle memory (8 directions)
-    for (int i = 0; i < 8; i++) {
-        obstacleMemory[i] = 0;
-    }
-    
-    // Path following
-    targetHeading = 0;
-    useTargetHeading = false;
+    for (int i = 0; i < 8; i++) obstacleMemory[i] = 0;
     
     firstRun = true;
     
-    // === TERRAIN HANDLING INIT ===
+    // Avoidance
+    avoidPhase = AVOID_BACKUP;
+    avoidTurnDir = TURN_RIGHT;
+    avoidAttempts = 0;
+    avoidPhaseStart = 0;
+    avoidPhaseDuration = 0;
     
-    // Movement verification
-    for (int i = 0; i < 8; i++) {
-        accelMagHistory[i] = 1.0f;  // ~1g at rest
-    }
-    accelMagIndex = 0;
-    accelMagFilled = false;
-    motionVerified = true;  // Assume moving until proven otherwise
-    noMotionStartTime = 0;
-    
-    // Incline tracking
+    // Hazard
+    hazardPhase = HAZARD_BACKUP;
+    hazardPhaseStart = 0;
+    hazardPhaseDuration = 0;
+    inclineAttempts = 0;
     steepInclineStart = 0;
     onSteepIncline = false;
-    inclineAttempts = 0;
     
-    // Recovery sequence
+    // Motion verification
+    for (int i = 0; i < 8; i++) accelMagHistory[i] = 1.0f;
+    accelMagIndex = 0;
+    accelMagFilled = false;
+    motionVerified = true;
+    noMotionStartTime = 0;
+    
+    // Recovery
     recoveryPhase = RECOVERY_DONE;
     rockCount = 0;
     recoveryStepStart = 0;
     recoveryStepDuration = 0;
     recoveryTurnDir = TURN_RIGHT;
+    coastAfterFwd = true;
     
     // Adaptive ramp
     recentlyStuck = false;
     stuckRecoveryTime = 0;
+    recoveryCooldownUntil = 0;
     
-    // Anti-spin "Send It"
-    sendItActive = false;
-    sendItUntil = 0;
-    sendItTurnCount = 0;
-    sendItWindowStart = 0;
-    sendItFwdStart = 0;
+    // Terrain boost
+    terrainBoostActive = false;
+    terrainBoostUntil = 0;
+    terrainBoostStartX = 0;
+    terrainBoostStartY = 0;
+    terrainBoostStuck = false;
     
-    for (int i = 0; i < 5; i++) {
-        distanceHistory[i] = 999.0f;
-    }
+    for (int i = 0; i < 5; i++) distanceHistory[i] = 999.0f;
     
     randomSeed(millis() ^ ESP.getCycleCount());
 }
+
+// ==================== IMU UPDATE ====================
 
 void AutonomousNav::updateIMU(float ax, float ay, float az, float gx, float gy, float gz) {
     unsigned long now = millis();
     float dt = (lastIMUUpdate > 0) ? (now - lastIMUUpdate) / 1000.0f : 0;
     lastIMUUpdate = now;
     
-    accelX = ax;
-    accelY = ay;
-    accelZ = az;
-    gyroZ = gz;  // Yaw rate
+    accelX = ax; accelY = ay; accelZ = az;
+    gyroZ = gz;
     imuAvailable = true;
     
-    // Integrate gyroscope for heading (simple dead reckoning)
-    // gyroZ is in degrees/sec, integrate to get heading change
-    if (dt > 0 && dt < 0.5f) {  // Sanity check on dt
+    // Integrate gyroscope for heading
+    if (dt > 0 && dt < 0.5f) {
         heading += gz * dt;
-        
-        // Normalize to 0-360
         while (heading >= 360) heading -= 360;
         while (heading < 0) heading += 360;
+        
+        // Dead-reckoning position (only when cruising forward)
+        if (currentState == NAV_CRUISE) {
+            // Use odometry if available (from encoders)
+            if (odomX != 0 || odomY != 0) {
+                drX = odomX;
+                drY = odomY;
+            } else {
+                float speedCmS = encoderSpeedCmS;  // Use real encoder speed
+                if (speedCmS < 1.0f) {
+                    // Encoder not producing pulses — fall back to PWM estimate
+                    float speedFraction = currentSpeed / 255.0f;
+                    speedCmS = speedFraction * ROVER_MAX_SPEED_CM_S;
+                }
+                float distStep = speedCmS * dt;
+                float headRad = heading * PI / 180.0f;
+                drX += sin(headRad) * distStep;
+                drY += cos(headRad) * distStep;
+            }
+        }
     }
     
-    // Calculate pitch and roll from accelerometer
+    // Pitch and roll from accelerometer
     pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
     roll = atan2(ay, sqrt(ax * ax + az * az)) * 180.0f / PI;
     
-    // === MOVEMENT VERIFICATION: Track accel magnitude variance ===
-    // When robot moves on terrain, accel magnitude varies (vibration).
-    // When stuck (wheels spinning in sand), accel is very steady (~1g).
+    // Movement verification — accel magnitude variance
     float accelMag = sqrt(ax * ax + ay * ay + az * az);
     accelMagHistory[accelMagIndex] = accelMag;
     accelMagIndex = (accelMagIndex + 1) % MOTION_VERIFY_WINDOW;
     if (accelMagIndex == 0) accelMagFilled = true;
+    if (accelMagFilled) checkMotionVerification();
     
-    // Check motion verification once we have enough samples
-    if (accelMagFilled) {
-        checkMotionVerification();
-    }
-    
-    // Detect upside down
+    // Upside-down detection
     bool wasUpsideDown = upsideDown;
     upsideDown = (az < UPSIDE_DOWN_THRESHOLD);
-    
     if (upsideDown != wasUpsideDown) {
-        if (upsideDown) {
-            Serial.println("[IMU] UPSIDE DOWN DETECTED - Reversing motor direction!");
-        } else {
-            Serial.println("[IMU] Right-side up - Normal motor direction");
-        }
+        Serial.printf("[IMU] %s\n", upsideDown ? "UPSIDE DOWN!" : "Right-side up");
     }
     
-    // Determine orientation
-    Orientation prevOrientation = currentOrientation;
-    
+    // Orientation
+    Orientation prev = currentOrientation;
     if (upsideDown) {
         currentOrientation = ORIENTATION_UPSIDE_DOWN;
     } else if (abs(roll) > 30) {
@@ -192,817 +227,1042 @@ void AutonomousNav::updateIMU(float ax, float ay, float az, float gx, float gy, 
     } else {
         currentOrientation = ORIENTATION_NORMAL;
     }
-    
-    // Log orientation changes
-    if (currentOrientation != prevOrientation && currentOrientation != ORIENTATION_NORMAL) {
-        const char* orientStr = 
-            currentOrientation == ORIENTATION_UPSIDE_DOWN ? "UPSIDE_DOWN" :
+    if (currentOrientation != prev && currentOrientation != ORIENTATION_NORMAL) {
+        const char* s = currentOrientation == ORIENTATION_UPSIDE_DOWN ? "UPSIDE_DOWN" :
             currentOrientation == ORIENTATION_TILTED_LEFT ? "TILTED_LEFT" :
             currentOrientation == ORIENTATION_TILTED_RIGHT ? "TILTED_RIGHT" :
-            currentOrientation == ORIENTATION_TILTED_FORWARD ? "TILTED_FWD" :
-            currentOrientation == ORIENTATION_TILTED_BACK ? "TILTED_BACK" : "NORMAL";
-        Serial.printf("[IMU] Orientation: %s (pitch=%.1f, roll=%.1f)\n", orientStr, pitch, roll);
+            currentOrientation == ORIENTATION_TILTED_FORWARD ? "TILTED_FWD" : "TILTED_BACK";
+        Serial.printf("[IMU] Orientation: %s (pitch=%.1f, roll=%.1f)\n", s, pitch, roll);
     }
 }
 
-bool AutonomousNav::isUpsideDown() {
-    return upsideDown;
-}
-
-Orientation AutonomousNav::getOrientation() {
-    return currentOrientation;
-}
-
-float AutonomousNav::getPitch() {
-    return pitch;
-}
-
-float AutonomousNav::getRoll() {
-    return roll;
-}
-
-float AutonomousNav::getHeading() {
-    return heading;
-}
-
-void AutonomousNav::setTargetHeading(float newHeading) {
-    targetHeading = newHeading;
-    while (targetHeading >= 360) targetHeading -= 360;
-    while (targetHeading < 0) targetHeading += 360;
-    useTargetHeading = true;
-}
-
-void AutonomousNav::clearTargetHeading() {
-    useTargetHeading = false;
-}
+// ==================== SENSOR INPUTS ====================
 
 void AutonomousNav::setSideDistances(float leftDist, float rightDist) {
-    sideDistLeft = leftDist;
-    sideDistRight = rightDist;
+    sideDistLeft = (leftDist < 0 || leftDist > 400) ? 999.0f : leftDist;
+    sideDistRight = (rightDist < 0 || rightDist > 400) ? 999.0f : rightDist;
 }
 
 void AutonomousNav::setWallAngle(float angle) {
     detectedWallAngle = angle;
 }
 
+void AutonomousNav::setEncoderSpeed(float speedCmPerSec) {
+    encoderSpeedCmS = speedCmPerSec;
+}
+
+// ==================== GETTERS ====================
+
+bool AutonomousNav::isUpsideDown() { return upsideDown; }
+float AutonomousNav::getPitch() { return pitch; }
+float AutonomousNav::getRoll() { return roll; }
+float AutonomousNav::getHeading() { return heading; }
+bool AutonomousNav::isMotionVerified() { return motionVerified; }
+bool AutonomousNav::isRecentlyStuck() { return recentlyStuck; }
+
+const char* AutonomousNav::getStateString() {
+    switch (currentState) {
+        case NAV_CRUISE:  return "CRUISE";
+        case NAV_AVOID:   return "AVOID";
+        case NAV_RECOVER: return "RECOVER";
+        case NAV_HAZARD:  return "HAZARD";
+        case NAV_STOPPED: return "STOP";
+        default:          return "?";
+    }
+}
+
+// ==================== MAIN UPDATE ====================
+// Clean dispatcher — each state handler owns its own decisions.
+
 void AutonomousNav::update(float distance) {
-    unsigned long currentTime = millis();
+    unsigned long now = millis();
     
-    // Handle invalid readings - fail-safe toward obstacle avoidance
+    // Sanitize input
     if (distance < 0 || distance > 400) {
-        distance = DIST_CLOSE - 1.0f;
+        distance = DIST_CLOSE - 1.0f;  // Fail toward caution
     }
     
     updateDistanceHistory(distance);
     
-    // === ADAPTIVE RAMP TIMEOUT ===
-    if (recentlyStuck && (currentTime - stuckRecoveryTime > ADAPTIVE_RAMP_TIMEOUT)) {
+    // Adaptive ramp timeout
+    if (recentlyStuck && (now - stuckRecoveryTime > ADAPTIVE_RAMP_TIMEOUT)) {
         recentlyStuck = false;
-        Serial.println("[TERRAIN] Adaptive ramp timeout - resuming normal ramp");
     }
     
-    // === RECOVERY MODE: run recovery state machine ===
-    if (currentState == NAV_RECOVERY) {
-        handleRecovery(distance);
-        smoothSpeed();
-        lastDistance = distance;
-        return;
+    // First update → start cruising
+    if (firstRun) {
+        firstRun = false;
+        enterCruise();
     }
     
-    // === SEND-IT MODE: Override navigation for anti-spin ===
-    if (sendItActive) {
-        if (currentTime >= sendItUntil) {
-            // Send-it expired — resume normal navigation
-            sendItActive = false;
-            sendItTurnCount = 0;
-            sendItWindowStart = 0;
-            sendItFwdStart = 0;
-            Serial.println("[SENDIT] === Send-it complete — resuming normal nav ===");
-            setForward();
-        } else if (distance < DIST_CRITICAL) {
-            // Even in send-it, respect collision distance
-            Serial.printf("[SENDIT] CRITICAL %.0fcm — emergency reverse\n", distance);
-            setBackward(600);
-            // Don't cancel send-it, just dodge and keep going
-        } else {
-            // Force forward — ignore DIST_CLOSE
-            if (currentState != NAV_FORWARD && currentState != NAV_BACKWARD) {
-                setForward();
-            }
-            targetSpeed = SPEED_CRUISE;
-        }
-        smoothSpeed();
-        lastDistance = distance;
-        return;
+    // Dispatch to current state handler
+    switch (currentState) {
+        case NAV_CRUISE:  handleCruise(distance);   break;
+        case NAV_AVOID:   handleAvoid(distance);    break;
+        case NAV_RECOVER: handleRecovery(distance);  break;
+        case NAV_HAZARD:  handleHazard(distance);   break;
+        case NAV_STOPPED: targetSpeed = 0;           break;
     }
     
-    // === IMU MOVEMENT VERIFICATION ===
-    // If motors are commanding forward but IMU shows no movement, enter recovery
-    if (imuAvailable && !motionVerified &&
-        (currentState == NAV_FORWARD || currentState == NAV_FORWARD_SLOW) &&
-        currentSpeed > SPEED_MIN_MOVE) {
-        unsigned long noMotionDur = (noMotionStartTime > 0) ? (currentTime - noMotionStartTime) : 0;
-        if (noMotionDur > MOTION_VERIFY_TIMEOUT) {
-            Serial.printf("[TERRAIN] No motion detected for %lums - entering recovery!\n", noMotionDur);
-            startRecovery();
-            smoothSpeed();
-            lastDistance = distance;
-            return;
-        }
-    }
-    
-    // === INCLINE CHECK ===
-    if (imuAvailable && (currentState == NAV_FORWARD || currentState == NAV_FORWARD_SLOW)) {
-        checkIncline(distance);
-    }
-    
-    // PID speed control when driving forward
-    if (currentState == NAV_FORWARD || currentState == NAV_FORWARD_SLOW) {
-        // PID: error = distance - DIST_CLOSE (how much clearance we have)
-        float error = distance - DIST_CLOSE;
-        float dt = (currentTime - lastIMUUpdate) / 1000.0f;
-        if (dt <= 0 || dt > 0.5f) dt = 0.05f;
-        
-        // Integral with anti-windup
-        pidIntegral += error * dt;
-        pidIntegral = constrain(pidIntegral, -PID_I_MAX, PID_I_MAX);
-        
-        // Derivative (rate of distance change)
-        float derivative = (error - pidLastError) / dt;
-        pidLastError = error;
-        
-        // PID output → target speed
-        float pidOutput = (PID_KP * error) + (PID_KI * pidIntegral) + (PID_KD * derivative);
-        targetSpeed = constrain((int)pidOutput, 0, SPEED_MAX);
-        
-        // If PID wants very low speed, we're too close — let makeDecision handle it
-    }
-    
-    // Check timed state expiration (turns, backward)
-    if (stateDuration > 0 && (currentTime - stateStartTime >= stateDuration)) {
-        // Timed action done — re-evaluate
-        currentState = NAV_FORWARD;
-        stateDuration = 0;
-        pidIntegral = 0;  // Reset integral on state change
-        pidLastError = 0;
-    }
-    
-    // Decision cooldown — prevent rapid state thrashing
-    if ((currentTime - lastStateChange) < DECISION_COOLDOWN_MS &&
-        currentState != NAV_STOPPED && distance > DIST_CRITICAL) {
-        smoothSpeed();
-        lastDistance = distance;
-        return;
-    }
-    
-    makeDecision(distance);
     smoothSpeed();
-    
     lastDistance = distance;
-    firstRun = false;
 }
 
-void AutonomousNav::makeDecision(float distance) {
-    // Check stuck condition — now triggers recovery instead of simple escape
-    if (isStuck() && (currentState == NAV_FORWARD || currentState == NAV_FORWARD_SLOW)) {
-        Serial.println("[AUTO] Stuck! Starting recovery sequence...");
-        useTargetHeading = false;  // Abandon path when stuck
-        startRecovery();
-        return;
-    }
-    
-    // PATH FOLLOWING MODE: If we have a target heading from path planner
-    if (useTargetHeading && currentBehavior != BEHAVIOR_ESCAPE) {
-        handlePathFollow(distance);
-        return;
-    }
-    
-    switch (currentBehavior) {
-        case BEHAVIOR_EXPLORE:
-            handleExplore(distance);
-            break;
-        case BEHAVIOR_WALL_FOLLOW:
-            handleWallFollow(distance);
-            break;
-        case BEHAVIOR_ESCAPE:
-            handleEscape(distance);
-            break;
-        case BEHAVIOR_PATH_FOLLOW:
-        case BEHAVIOR_GOTO_GOAL:
-            handlePathFollow(distance);
-            break;
-    }
-}
+// ==================== STATE: CRUISE ====================
+// Normal forward driving. Monitors for:
+//   - Obstacles (→ AVOID)
+//   - Stuck/no-motion (→ RECOVER)
+//   - Steep incline (→ HAZARD)
+//   - Heading toward start (→ correction turn via AVOID)
 
-// Handle path following - turn toward target heading while avoiding obstacles
-void AutonomousNav::handlePathFollow(float distance) {
-    // Calculate heading error
-    float headingError = targetHeading - heading;
-    
-    // Normalize to -180 to +180
-    while (headingError > 180) headingError -= 360;
-    while (headingError < -180) headingError += 360;
-    
-    // Critical obstacle - must avoid regardless of path
-    if (distance < DIST_CRITICAL) {
-        Serial.printf("[PATH] Critical obstacle! Backing up (target: %.0f°, current: %.0f°)\n", 
-                      targetHeading, heading);
-        setBackward(800);
-        return;
-    }
-    
-    // Close obstacle - turn away but try to maintain general direction
-    if (distance < DIST_CLOSE) {
-        // Turn away from obstacle, but bias toward target heading direction
-        if (headingError > 0) {
-            // Target is to the right - prefer turning right if possible
-            setTurnRight(400);
-        } else {
-            setTurnLeft(400);
-        }
-        return;
-    }
-    
-    // Need to turn toward target heading?
-    if (abs(headingError) > 20) {
-        // Significant heading error - turn toward target
-        if (headingError > 0) {
-            setTurnRight(200);  // Short turn
-        } else {
-            setTurnLeft(200);
-        }
-        targetSpeed = SPEED_TURN;
-        return;
-    }
-    
-    // On course - proceed forward
-    if (abs(headingError) < 10) {
-        // Very close to target heading - full speed
-        if (distance < DIST_MEDIUM) {
-            setForwardSlow();
-        } else {
-            setForward();
-        }
-    } else {
-        // Slight correction needed - slow forward
-        setForwardSlow();
-    }
-}
-
-void AutonomousNav::handleExplore(float distance) {
-    unsigned long now = millis();
-    
-    // === ANTI-SPIN TURN TRACKING ===
-    // Track sustained forward progress — resets turn count
-    if (currentState == NAV_FORWARD || currentState == NAV_FORWARD_SLOW) {
-        if (sendItFwdStart == 0) sendItFwdStart = now;
-        if (now - sendItFwdStart > SENDIT_FWD_PROGRESS_MS) {
-            // Sustained forward progress — clear spin detection
-            if (sendItTurnCount > 0) {
-                Serial.printf("[SENDIT] Forward progress — clearing %d turn count\n", sendItTurnCount);
+void AutonomousNav::handleCruise(float distance) {
+                // --- TURN TO HEADING ---
+                if (turningToHeading) {
+                    float headingError = targetTurnTheta - odomTheta;
+                    while (headingError > PI) headingError -= 2*PI;
+                    while (headingError < -PI) headingError += 2*PI;
+                    if (fabs(headingError) < 0.05f) { // ~3 deg
+                        turningToHeading = false;
+                        setMotorSpeeds(0, 0);
+                        targetSpeed = 0;
+                        Serial.println("[NAV] Turn complete.");
+                        return;
+                    }
+                    int turnPWM = (headingError > 0) ? 80 : -80;
+                    setMotorSpeeds(-turnPWM, turnPWM);
+                    targetSpeed = 0;
+                    return;
+                }
+            // --- HAZARD MARKING: slip/stall ---
+            if (isSlippingOrStalled()) {
+                envMap.markHazardCell();
             }
-            sendItTurnCount = 0;
-            sendItWindowStart = 0;
-        }
-    } else {
-        sendItFwdStart = 0;
-    }
-    
-    // Reset window if it expired without triggering
-    if (sendItWindowStart > 0 && (now - sendItWindowStart > SENDIT_WINDOW_MS)) {
-        sendItTurnCount = 0;
-        sendItWindowStart = 0;
-    }
-    
-    // While in a timed action (turn/backward), don't interrupt unless critical
-    if (currentState != NAV_FORWARD && currentState != NAV_FORWARD_SLOW &&
-        currentState != NAV_STOPPED) {
-        if (distance < DIST_CRITICAL) {
-            Serial.printf("[AUTO] CRITICAL %.0fcm during action → BACKWARD\n", distance);
-            setBackward(1000);
-            pidIntegral = 0;
-        }
-        return;
-    }
-    
-    // Critical → back up
-    if (distance < DIST_CRITICAL) {
-        Serial.printf("[AUTO] CRITICAL %.0fcm → BACKWARD 1.2s\n", distance);
-        setBackward(1200);
-        pidIntegral = 0;
-        stallStartTime = 0;
-        return;
-    }
-    
-    // Close → turn (use wall angle for duration: steeper angle = shorter turn needed)
-    if (distance < DIST_CLOSE) {
-        // Wall angle tells us how much we need to turn
-        // Small angle (wall nearly perpendicular) = need big turn
-        // Large angle (wall at glancing angle) = need small correction
-        float absWallAngle = abs(detectedWallAngle);
-        unsigned long turnTime;
-        if (absWallAngle > 60) {
-            turnTime = 500;  // Glancing approach — small adjustment
-        } else if (absWallAngle > 30) {
-            turnTime = 750;  // Moderate angle
-        } else {
-            turnTime = 1000;  // Nearly head-on — big turn
-        }
-        
-        // === COUNT THIS TURN FOR SPIN DETECTION ===
-        if (sendItWindowStart == 0) sendItWindowStart = now;
-        sendItTurnCount++;
-        Serial.printf("[AUTO] Close %.0fcm wall:%.0f° → TURN %lums (spin count: %d/%d)\n", 
-                      distance, detectedWallAngle, turnTime, sendItTurnCount, SENDIT_TURN_THRESHOLD);
-        
-        // Check if spin threshold reached
-        if (sendItTurnCount >= SENDIT_TURN_THRESHOLD) {
-            Serial.printf("[SENDIT] === SEND IT! %d turns in %.1fs — driving through! ===\n",
-                          sendItTurnCount, (now - sendItWindowStart) / 1000.0f);
-            sendItActive = true;
-            sendItUntil = now + SENDIT_DURATION_MS;
-            sendItTurnCount = 0;
-            sendItWindowStart = 0;
-            sendItFwdStart = 0;
-            setForward();
-            targetSpeed = SPEED_CRUISE;
-            pidIntegral = 0;
-            stallStartTime = 0;
-            return;
-        }
-        
-        decideTurnDirection(distance, turnTime);
-        pidIntegral = 0;
-        stallStartTime = 0;
-        return;
-    }
-    
-    // Stall detection: if distance stays under DIST_MEDIUM for too long, force turn
-    if (distance < DIST_MEDIUM) {
-        if (stallStartTime == 0) {
-            stallStartTime = millis();
-        } else if (millis() - stallStartTime > STALL_TIMEOUT_MS) {
-            // Count stall-triggered turns for spin detection too
-            if (sendItWindowStart == 0) sendItWindowStart = now;
-            sendItTurnCount++;
-            Serial.printf("[AUTO] STALL at %.0fcm for >%dms → TURNING (spin count: %d/%d)\n", 
-                          distance, STALL_TIMEOUT_MS, sendItTurnCount, SENDIT_TURN_THRESHOLD);
-            
-            if (sendItTurnCount >= SENDIT_TURN_THRESHOLD) {
-                Serial.printf("[SENDIT] === SEND IT! %d turns in %.1fs — driving through! ===\n",
-                              sendItTurnCount, (now - sendItWindowStart) / 1000.0f);
-                sendItActive = true;
-                sendItUntil = now + SENDIT_DURATION_MS;
-                sendItTurnCount = 0;
-                sendItWindowStart = 0;
-                sendItFwdStart = 0;
-                setForward();
-                targetSpeed = SPEED_CRUISE;
-                pidIntegral = 0;
-                stallStartTime = 0;
+        // --- WAYPOINT NAVIGATION ---
+        if (hasNavTarget) {
+            // Obstacle guard: abort waypoint following if wall is close
+            if (distance < DIST_CLOSE) {
+                Serial.printf("[NAV] Waypoint aborted — obstacle %.0fcm ahead → AVOID\n", distance);
+                enterAvoid(distance < DIST_CRITICAL);
                 return;
             }
-            
-            decideTurnDirection(distance, 600);
-            pidIntegral = 0;
-            stallStartTime = 0;
+
+            float dx = navTargetX - odomX;
+            float dy = navTargetY - odomY;
+            float distToTarget = sqrt(dx*dx + dy*dy);
+            if (distToTarget < 10.0f) { // 10cm threshold
+                Serial.println("[NAV] Waypoint reached!");
+                hasNavTarget = false;
+                targetSpeed = 0;
+                return;
+            }
+            float targetHeading = atan2(dx, dy); // radians
+            float headingError = targetHeading - odomTheta;
+            // Normalize to -pi..pi
+            while (headingError > PI) headingError -= 2*PI;
+            while (headingError < -PI) headingError += 2*PI;
+            // Simple proportional steering
+            float steer = headingError * 2.0f; // gain
+            steer = constrain(steer, -40, 40); // max PWM delta
+            int baseSpeed = SPEED_CRUISE;
+            int left = baseSpeed - steer;
+            int right = baseSpeed + steer;
+            left = constrain(left, -MAX_PWM, MAX_PWM);
+            right = constrain(right, -MAX_PWM, MAX_PWM);
+            setMotorSpeeds(left, right);
+            targetSpeed = baseSpeed;
+            return;
+        }
+    unsigned long now = millis();
+    
+    // --- OBSTACLE: CRITICAL ---
+    if (distance < DIST_CRITICAL) {
+        Serial.printf("[CRUISE] CRITICAL %.0fcm → AVOID\n", distance);
+        enterAvoid(true);
+        return;
+    }
+    
+    // --- OBSTACLE: CLOSE ---
+    if (distance < DIST_CLOSE) {
+        Serial.printf("[CRUISE] Obstacle %.0fcm → AVOID\n", distance);
+        enterAvoid(false);
+        return;
+    }
+    
+    // --- STUCK: Distance history flat ---
+    if (isStuck()) {
+        Serial.println("[CRUISE] Stuck detected → RECOVER");
+        enterRecover();
+        return;
+    }
+    
+    // --- STUCK: IMU no-motion ---
+    bool distStagnant = (abs(distance - lastDistance) < 3.0f);
+    if (imuAvailable && !motionVerified && distStagnant &&
+        currentSpeed > SPEED_MIN_MOVE &&
+        now > recoveryCooldownUntil) {
+        unsigned long noMotionDur = (noMotionStartTime > 0) ? (now - noMotionStartTime) : 0;
+        if (noMotionDur > MOTION_VERIFY_TIMEOUT) {
+            Serial.printf("[CRUISE] No motion for %lums → RECOVER\n", noMotionDur);
+            enterRecover();
+            return;
+        }
+    } else if (motionVerified || !distStagnant) {
+        noMotionStartTime = 0;
+    }
+    
+    // --- INCLINE CHECK ---
+    if (imuAvailable) {
+        float absPitch = abs(pitch);
+        if (absPitch > INCLINE_MAX_PITCH) {
+            if (steepInclineStart == 0) {
+                steepInclineStart = now;
+                Serial.printf("[CRUISE] Steep incline: pitch=%.1f°\n", pitch);
+            } else if (now - steepInclineStart > INCLINE_TIMEOUT_MS) {
+                Serial.printf("[CRUISE] Incline timeout → HAZARD (attempt %d)\n", inclineAttempts + 1);
+                enterHazard();
+                return;
+            }
+        } else {
+            if (steepInclineStart > 0) {
+                Serial.printf("[CRUISE] Incline cleared (pitch=%.1f°)\n", pitch);
+            }
+            steepInclineStart = 0;
+            onSteepIncline = false;
+            inclineAttempts = 0;
+        }
+    }
+    
+    // --- STALL: Distance stuck in medium range too long ---
+    if (distance < DIST_MEDIUM) {
+        if (stallStartTime == 0) {
+            stallStartTime = now;
+        } else if (now - stallStartTime > STALL_TIMEOUT_MS) {
+            Serial.printf("[CRUISE] Stall at %.0fcm for >%dms → AVOID\n", distance, STALL_TIMEOUT_MS);
+            enterAvoid(false);
             return;
         }
     } else {
-        stallStartTime = 0;  // Clear stall timer when far enough away
+        stallStartTime = 0;
     }
     
-    // Otherwise PID is handling speed — just make sure we're in forward state
-    if (currentState != NAV_FORWARD && currentState != NAV_FORWARD_SLOW) {
-        currentState = NAV_FORWARD;
-        stateDuration = 0;
+    // --- SPEED CONTROL ---
+    targetSpeed = calculateSpeed(distance);
+    
+    // --- DR: PROACTIVE HEADING CORRECTION ---
+    // If heading roughly toward start for too long with clear path, force correction
+    float distFromStart = sqrt(drX * drX + drY * drY);
+    if (distFromStart > DR_MIN_DIST_CM && distance > DR_CORRECT_CLEARANCE_CM) {
+        float toBearing = atan2(-drX, -drY) * 180.0f / PI;
+        float toError = toBearing - heading;
+        while (toError > 180) toError -= 360;
+        while (toError < -180) toError += 360;
+        
+        if (abs(toError) < DR_HEADING_TOWARD_DEG) {
+            if (headingTowardStartSince == 0) {
+                headingTowardStartSince = now;
+            } else if (now - headingTowardStartSince > DR_CORRECT_TIMEOUT_MS) {
+                // Force correction — use avoidance mechanism for the turn
+                float awayBearing = atan2(drX, drY) * 180.0f / PI;
+                float awayError = awayBearing - heading;
+                while (awayError > 180) awayError -= 360;
+                while (awayError < -180) awayError += 360;
+                
+                avoidPhase = AVOID_TURN;
+                avoidTurnDir = (awayError > 0) ? TURN_RIGHT : TURN_LEFT;
+                avoidPhaseStart = now;
+                avoidPhaseDuration = DR_CORRECT_TURN_MS;
+                avoidAttempts = 0;
+                currentState = NAV_AVOID;
+                lastStateChange = now;
+                targetSpeed = SPEED_TURN;
+                headingTowardStartSince = 0;
+                Serial.printf("[DR] Heading toward start for >%ds — correction turn\n",
+                              DR_CORRECT_TIMEOUT_MS / 1000);
+                return;
+            }
+        } else {
+            headingTowardStartSince = 0;
+        }
+    } else {
+        headingTowardStartSince = 0;
     }
 }
 
-void AutonomousNav::handleWallFollow(float distance) {
-    if (distance < DIST_CRITICAL) {
-        setBackward(600);
+// ==================== STATE: AVOID ====================
+// 3-phase obstacle avoidance: BACKUP → TURN → VERIFY
+// Clean sequential execution — no decisions during timed actions.
+//   BACKUP:  Reverse away from obstacle
+//   TURN:    Turn toward clearer side (sensor-informed)
+//   VERIFY:  Brief forward to confirm path is clear
+//     → CRUISE if clear
+//     → Retry BACKUP if still blocked (up to AVOID_MAX_CYCLES)
+//     → RECOVER if max attempts exceeded
+
+void AutonomousNav::handleAvoid(float distance) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - avoidPhaseStart;
+    
+    // Wait for current phase timer
+    if (elapsed < avoidPhaseDuration) {
+        return;  // Still executing — no decisions
+    }
+    
+    // Phase complete — advance
+    switch (avoidPhase) {
+        case AVOID_BACKUP: {
+            // Backup done → pick turn direction and turn
+            avoidTurnDir = pickTurnDirection(distance);
+            
+            // Turn duration based on wall angle
+            float absAngle = abs(detectedWallAngle);
+            unsigned long turnTime;
+            if (absAngle > 60) turnTime = 125;       // Glancing
+            else if (absAngle > 30) turnTime = 175;   // Moderate
+            else turnTime = 250;                       // Head-on
+            
+            avoidPhase = AVOID_TURN;
+            avoidPhaseStart = now;
+            avoidPhaseDuration = turnTime;
+            targetSpeed = SPEED_TURN;
+            Serial.printf("[AVOID] TURN %s %lums (wall:%.0f°)\n",
+                          avoidTurnDir == TURN_LEFT ? "LEFT" : "RIGHT",
+                          turnTime, detectedWallAngle);
+            break;
+        }
+        
+        case AVOID_TURN: {
+            // Turn done → verify path is clear
+            avoidPhase = AVOID_VERIFY;
+            avoidPhaseStart = now;
+            avoidPhaseDuration = AVOID_VERIFY_MS;
+            targetSpeed = SPEED_MIN_MOVE;
+            Serial.println("[AVOID] VERIFY forward");
+            break;
+        }
+        
+        case AVOID_VERIFY: {
+            // Verify done — check if path is clear
+            if (distance > DIST_CLOSE) {
+                // Path clear! Resume cruising
+                Serial.printf("[AVOID] Clear (%.0fcm) → CRUISE\n", distance);
+                avoidAttempts = 0;
+                enterCruise();
+            } else {
+                // Still blocked
+                avoidAttempts++;
+                if (avoidAttempts >= AVOID_MAX_CYCLES) {
+                    Serial.printf("[AVOID] %d attempts failed → RECOVER\n", avoidAttempts);
+                    avoidAttempts = 0;
+                    enterRecover();
+                } else {
+                    Serial.printf("[AVOID] Still blocked (%.0fcm) — retry %d/%d\n",
+                                  distance, avoidAttempts, AVOID_MAX_CYCLES);
+                    avoidPhase = AVOID_BACKUP;
+                    avoidPhaseStart = now;
+                    avoidPhaseDuration = AVOID_BACKUP_MS;
+                    targetSpeed = SPEED_CRUISE;
+                }
+            }
+            break;
+        }
+    }
+}
+
+// ==================== STATE: HAZARD ====================
+// Steep incline handling: backup → turn → return to CRUISE.
+// CRUISE will re-detect the incline if still present, incrementing attempt counter.
+// After max attempts, escalates to RECOVER.
+
+void AutonomousNav::handleHazard(float distance) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - hazardPhaseStart;
+    
+    // Check if incline cleared during handling
+    if (imuAvailable && abs(pitch) < INCLINE_MAX_PITCH) {
+        Serial.printf("[HAZARD] Incline cleared (pitch=%.1f°) → CRUISE\n", pitch);
+        steepInclineStart = 0;
+        onSteepIncline = false;
+        enterCruise();
         return;
     }
     
-    if (distance < DIST_CLOSE) {
-        setTurnLeft(300);
-        return;
-    }
+    // Wait for current phase timer
+    if (elapsed < hazardPhaseDuration) return;
     
-    if (distance > DIST_MEDIUM) {
-        preferredDirection = TURN_RIGHT;
+    switch (hazardPhase) {
+        case HAZARD_BACKUP:
+            // Backup done → turn to try a different angle
+            hazardPhase = HAZARD_TURN;
+            hazardPhaseStart = now;
+            hazardPhaseDuration = INCLINE_DIAG_TURN_MS;
+            targetSpeed = SPEED_TURN;
+            Serial.printf("[HAZARD] TURN %s\n",
+                          (inclineAttempts % 2 == 0) ? "RIGHT" : "LEFT");
+            break;
+        
+        case HAZARD_TURN:
+            // Turn done — go back to CRUISE to try new angle
+            if (inclineAttempts >= 3) {
+                Serial.printf("[HAZARD] %d attempts — escalating to RECOVER\n", inclineAttempts);
+                inclineAttempts = 0;
+                steepInclineStart = 0;
+                onSteepIncline = false;
+                enterRecover();
+            } else {
+                Serial.printf("[HAZARD] Attempt %d done → CRUISE\n", inclineAttempts);
+                steepInclineStart = 0;  // Reset for next detection
+                enterCruise();
+            }
+            break;
     }
-    
-    setForward();
 }
 
-void AutonomousNav::handleEscape(float distance) {
-    if (currentState != NAV_ESCAPE && currentState != NAV_BACKWARD &&
-        currentState != NAV_SCAN_LEFT && currentState != NAV_SCAN_RIGHT &&
-        currentState != NAV_TURN_LEFT && currentState != NAV_TURN_RIGHT) {
-        setEscape();
+// ==================== STATE: RECOVER ====================
+// Multi-phase stuck recovery (proven sequence):
+//   1. Rock forward/backward N times (break free from sand/rut)
+//   2. Diagonal approach (turn + forward at different angle)
+//   3. Full reverse escape (last resort)
+
+void AutonomousNav::handleRecovery(float distance) {
+    unsigned long now = millis();
+    unsigned long elapsed = now - recoveryStepStart;
+    
+    // Wait for current step
+    if (elapsed < recoveryStepDuration) return;
+    
+    switch (recoveryPhase) {
+        case RECOVERY_ROCK_FWD:
+            recoveryPhase = RECOVERY_COAST;
+            recoveryStepStart = now;
+            recoveryStepDuration = RECOVERY_COAST_MS;
+            targetSpeed = 0;
+            coastAfterFwd = true;
+            break;
+            
+        case RECOVERY_COAST:
+            if (coastAfterFwd) {
+                recoveryPhase = RECOVERY_ROCK_REV;
+                recoveryStepStart = now;
+                recoveryStepDuration = RECOVERY_ROCK_MS;
+                targetSpeed = RECOVERY_SPEED;
+                Serial.printf("[RECOVER] ROCK_REV (cycle %d/%d)\n", rockCount + 1, RECOVERY_ROCK_ATTEMPTS);
+            } else {
+                if (rockCount < RECOVERY_ROCK_ATTEMPTS) {
+                    recoveryPhase = RECOVERY_ROCK_FWD;
+                    recoveryStepStart = now;
+                    recoveryStepDuration = RECOVERY_ROCK_MS;
+                    targetSpeed = RECOVERY_SPEED;
+                    Serial.printf("[RECOVER] ROCK_FWD (cycle %d/%d)\n", rockCount + 1, RECOVERY_ROCK_ATTEMPTS);
+                } else {
+                    recoveryPhase = RECOVERY_DIAGONAL_TURN;
+                    recoveryStepStart = now;
+                    recoveryStepDuration = RECOVERY_DIAG_TURN_MS;
+                    targetSpeed = SPEED_TURN;
+                    Serial.printf("[RECOVER] DIAGONAL_TURN %s\n",
+                                  recoveryTurnDir == TURN_LEFT ? "LEFT" : "RIGHT");
+                }
+            }
+            break;
+            
+        case RECOVERY_ROCK_REV:
+            rockCount++;
+            recoveryPhase = RECOVERY_COAST;
+            recoveryStepStart = now;
+            recoveryStepDuration = RECOVERY_COAST_MS;
+            targetSpeed = 0;
+            coastAfterFwd = false;
+            break;
+            
+        case RECOVERY_DIAGONAL_TURN:
+            recoveryPhase = RECOVERY_DIAGONAL_FWD;
+            recoveryStepStart = now;
+            recoveryStepDuration = RECOVERY_DIAG_FWD_MS;
+            targetSpeed = SPEED_CRUISE;
+            Serial.printf("[RECOVER] DIAGONAL_FWD %dms\n", RECOVERY_DIAG_FWD_MS);
+            break;
+            
+        case RECOVERY_DIAGONAL_FWD:
+            if (motionVerified && distance > DIST_CLOSE) {
+                Serial.println("[RECOVER] === FREE! → CRUISE ===");
+                recoveryPhase = RECOVERY_DONE;
+                flagRecentlyStuck();
+                enterCruise();
+            } else {
+                recoveryPhase = RECOVERY_FULL_REVERSE;
+                recoveryStepStart = now;
+                recoveryStepDuration = RECOVERY_FULL_REV_MS;
+                targetSpeed = RECOVERY_SPEED;
+                Serial.printf("[RECOVER] FULL_REVERSE %dms\n", RECOVERY_FULL_REV_MS);
+            }
+            break;
+            
+        case RECOVERY_FULL_REVERSE: {
+            Serial.println("[RECOVER] === Complete — turning to new heading ===");
+            recoveryPhase = RECOVERY_DONE;
+            flagRecentlyStuck();
+            // Exit via a turn, then cruise
+            TurnDirection dir = pickTurnDirection(distance);
+            avoidPhase = AVOID_TURN;
+            avoidTurnDir = dir;
+            avoidPhaseStart = now;
+            avoidPhaseDuration = 250;
+            avoidAttempts = 0;
+            currentState = NAV_AVOID;
+            lastStateChange = now;
+            targetSpeed = SPEED_TURN;
+            break;
+        }
+            
+        case RECOVERY_DONE:
+        default:
+            enterCruise();
+            break;
     }
 }
 
-void AutonomousNav::decideTurnDirection(float distance, unsigned long turnDuration) {
+// ==================== STATE TRANSITIONS ====================
+
+void AutonomousNav::enterCruise() {
+    currentState = NAV_CRUISE;
+    stateStartTime = millis();
+    lastStateChange = millis();
+    targetSpeed = SPEED_CRUISE;
+    stuckCounter = 0;
+    stallStartTime = 0;
+    
+    // Heading hold — don't lock immediately, let the robot settle after a turn
+    headingLocked = false;
+    cruiseEnteredAt = millis();
+    
+    // Reset IMU motion buffer (stale data from turns/reverses)
+    accelMagFilled = false;
+    accelMagIndex = 0;
+    noMotionStartTime = 0;
+    motionVerified = true;
+    
+    // Decay obstacle memory — old data fades
+    for (int i = 0; i < 8; i++) {
+        if (obstacleMemory[i] > 0) obstacleMemory[i]--;
+    }
+}
+
+void AutonomousNav::enterAvoid(bool critical) {
+    // If terrain boost was active, this obstacle/stuck means terrain was too tough
+    if (terrainBoostActive) {
+        terrainBoostStuck = true;
+        terrainBoostActive = false;
+        checkTerrainOutcome();
+    }
+    currentState = NAV_AVOID;
+    stateStartTime = millis();
+    lastStateChange = millis();
+    avoidPhase = AVOID_BACKUP;
+    avoidPhaseStart = millis();
+    avoidPhaseDuration = critical ? AVOID_BACKUP_CRIT_MS : AVOID_BACKUP_MS;
+    targetSpeed = SPEED_CRUISE;
+    stallStartTime = 0;
+    Serial.printf("[AVOID] BACKUP %lums\n", avoidPhaseDuration);
+}
+
+void AutonomousNav::enterRecover() {
+    // If terrain boost was active, this stuck means terrain was too tough
+    if (terrainBoostActive) {
+        terrainBoostStuck = true;
+        terrainBoostActive = false;
+        checkTerrainOutcome();
+    }
+    startRecovery();
+}
+
+void AutonomousNav::enterHazard() {
+    currentState = NAV_HAZARD;
+    stateStartTime = millis();
+    lastStateChange = millis();
+    onSteepIncline = true;
+    inclineAttempts++;
+    
+    hazardPhase = HAZARD_BACKUP;
+    hazardPhaseStart = millis();
+    hazardPhaseDuration = 800;
+    targetSpeed = SPEED_CRUISE;
+    Serial.printf("[HAZARD] BACKUP 800ms (attempt %d)\n", inclineAttempts);
+}
+
+void AutonomousNav::enterAvoidFromPit() {
+    // Only interrupt CRUISE — don't override active avoidance/recovery
+    if (currentState != NAV_CRUISE) return;
+    
+    Serial.println("[PIT] Pit detected → AVOID backup");
+    currentState = NAV_AVOID;
+    stateStartTime = millis();
+    lastStateChange = millis();
+    avoidPhase = AVOID_BACKUP;
+    avoidPhaseStart = millis();
+    avoidPhaseDuration = PIT_BACKUP_MS;
+    targetSpeed = SPEED_CRUISE;
+    stallStartTime = 0;
+}
+
+void AutonomousNav::enterAvoidFromHill() {
+    // Only interrupt CRUISE — don't override active avoidance/recovery
+    if (currentState != NAV_CRUISE) return;
+    
+    // Cancel any active terrain boost — this is major terrain
+    terrainBoostActive = false;
+    
+    Serial.println("[HILL] Steep hill detected → AVOID backup");
+    currentState = NAV_AVOID;
+    stateStartTime = millis();
+    lastStateChange = millis();
+    avoidPhase = AVOID_BACKUP;
+    avoidPhaseStart = millis();
+    avoidPhaseDuration = HILL_BACKUP_MS;
+    targetSpeed = SPEED_CRUISE;
+    stallStartTime = 0;
+}
+
+void AutonomousNav::enterTerrainBoost() {
+    // Only activate during CRUISE
+    if (currentState != NAV_CRUISE) return;
+    
+    terrainBoostActive = true;
+    terrainBoostUntil = millis() + TERRAIN_BOOST_DURATION_MS;
+    terrainBoostStartX = envMap.getRobotX();
+    terrainBoostStartY = envMap.getRobotY();
+    terrainBoostStuck = false;
+    targetSpeed = SPEED_CRUISE;
+    Serial.printf("[TERRAIN] Minor terrain → boost %dms at (%d,%d)\n",
+                  TERRAIN_BOOST_DURATION_MS, terrainBoostStartX, terrainBoostStartY);
+}
+
+bool AutonomousNav::isTerrainBoostActive() {
+    if (terrainBoostActive && millis() > terrainBoostUntil) {
+        terrainBoostActive = false;
+        checkTerrainOutcome();
+    }
+    return terrainBoostActive;
+}
+
+void AutonomousNav::checkTerrainOutcome() {
+    // Called when terrain boost expires or rover gets stuck during boost
+    int curX = envMap.getRobotX();
+    int curY = envMap.getRobotY();
+    int dx = curX - terrainBoostStartX;
+    int dy = curY - terrainBoostStartY;
+    float distMoved = sqrt(dx * dx + dy * dy) * CELL_SIZE_CM;
+    
+    // If rover barely moved during boost, terrain was too difficult
+    bool failed = terrainBoostStuck || (distMoved < 10.0f); // < 10cm = failed
+    
+    if (failed) {
+        // Mark the terrain cells around start as hazard (upgrade from traversable)
+        for (int ox = -2; ox <= 2; ox++) {
+            for (int oy = -2; oy <= 2; oy++) {
+                int gx = terrainBoostStartX + ox;
+                int gy = terrainBoostStartY + oy;
+                if (gx >= 0 && gx < MAP_WIDTH && gy >= 0 && gy < MAP_HEIGHT) {
+                    uint8_t val = envMap.getCell(gx, gy);
+                    // Don't overwrite existing terrain markers
+                    if (val != CELL_PIT && val != CELL_HILL && val != CELL_HAZARD) {
+                        envMap.setCell(gx, gy, CELL_HAZARD);
+                    }
+                }
+            }
+        }
+        Serial.printf("[TERRAIN] LEARN: traversal FAILED (moved %.0fcm) → marking hazard\n", distMoved);
+    } else {
+        Serial.printf("[TERRAIN] LEARN: traversal OK (moved %.0fcm)\n", distMoved);
+    }
+}
+
+// ==================== TURN DECISIONS ====================
+
+TurnDirection AutonomousNav::pickTurnDirection(float distance) {
     // Record obstacle at current heading
     if (imuAvailable) {
         int bin = getHeadingBin();
         obstacleMemory[bin]++;
         headingAtObstacle = heading;
-        Serial.printf("[AUTO] Obstacle at heading %.0f (bin %d, count %d)\n", 
+        Serial.printf("[NAV] Obstacle at heading %.0f (bin %d, count %d)\n",
                       heading, bin, obstacleMemory[bin]);
     }
     
-    // PRIMARY: Use dual ultrasonic sensors to decide turn direction
-    // Turn away from whichever side sees the closer obstacle
     TurnDirection bestDir;
     float sideDiff = sideDistLeft - sideDistRight;
     
     if (abs(sideDiff) > 5.0f) {
-        // Meaningful difference between sides — turn toward open space
-        if (sideDistLeft > sideDistRight) {
-            bestDir = TURN_LEFT;   // More room on left
-            Serial.printf("[AUTO] Turn LEFT (L:%.0f > R:%.0f) wall:%.0f°\n", sideDistLeft, sideDistRight, detectedWallAngle);
-        } else {
-            bestDir = TURN_RIGHT;  // More room on right
-            Serial.printf("[AUTO] Turn RIGHT (R:%.0f > L:%.0f) wall:%.0f°\n", sideDistRight, sideDistLeft, detectedWallAngle);
-        }
+        // Clear difference — turn toward open space
+        bestDir = (sideDistLeft > sideDistRight) ? TURN_LEFT : TURN_RIGHT;
+        Serial.printf("[NAV] Turn %s (L:%.0f R:%.0f)\n",
+                      bestDir == TURN_LEFT ? "LEFT" : "RIGHT", sideDistLeft, sideDistRight);
     } else {
-        // Sensors roughly equal — fall back to IMU heading memory
-        bestDir = getBestTurnDirection();
-        Serial.printf("[AUTO] Sides equal (L:%.0f R:%.0f) wall:%.0f° — using IMU\n", sideDistLeft, sideDistRight, detectedWallAngle);
+        // Sides equal — bias away from start if far enough
+        float distFromStart = sqrt(drX * drX + drY * drY);
+        if (distFromStart > 30.0f) {
+            float awayBearing = atan2(drX, drY) * 180.0f / PI;
+            float angleDiff = awayBearing - heading;
+            while (angleDiff > 180) angleDiff -= 360;
+            while (angleDiff < -180) angleDiff += 360;
+            bestDir = (angleDiff > 0) ? TURN_RIGHT : TURN_LEFT;
+            Serial.printf("[NAV] Sides equal — bias away from start (dist:%.0f)\n", distFromStart);
+        } else {
+            bestDir = getBestTurnDirection();
+        }
     }
     
-    if (bestDir == TURN_LEFT) {
-        if (lastTurnDirection == TURN_LEFT) {
-            consecutiveSameDirection++;
-        } else {
-            consecutiveSameDirection = 1;
-        }
-        setTurnLeft(turnDuration);
+    // Track consecutive same-direction turns
+    if (bestDir == lastTurnDirection) {
+        consecutiveSameDirection++;
     } else {
-        if (lastTurnDirection == TURN_RIGHT) {
-            consecutiveSameDirection++;
-        } else {
-            consecutiveSameDirection = 1;
-        }
-        setTurnRight(turnDuration);
+        consecutiveSameDirection = 1;
     }
-    
+    lastTurnDirection = bestDir;
     turnStartHeading = heading;
+    
+    return bestDir;
 }
 
 int AutonomousNav::getHeadingBin() {
-    // Convert heading (0-360) to bin (0-7)
-    // Each bin is 45 degrees: 0=N, 1=NE, 2=E, etc.
-    int bin = (int)((heading + 22.5f) / 45.0f) % 8;
-    return bin;
+    return (int)((heading + 22.5f) / 45.0f) % 8;
 }
 
 TurnDirection AutonomousNav::getBestTurnDirection() {
     if (!imuAvailable) {
-        // Fallback to simple heuristics
         if (lastTurnDirection != TURN_RANDOM && consecutiveSameDirection < 3) {
-            return lastTurnDirection;  // Consistency helps escape corners
+            return lastTurnDirection;
         }
         return (random(2) == 0) ? TURN_LEFT : TURN_RIGHT;
     }
     
-    // Score each direction based on multiple factors
-    int leftScore = 0;
-    int rightScore = 0;
-    
-    // 1. Check obstacle memory - prefer direction with fewer remembered obstacles
+    int leftScore = 0, rightScore = 0;
     int currentBin = getHeadingBin();
     
-    // Left turn would face bins (currentBin - 2) and (currentBin - 1)
-    int leftBin1 = (currentBin + 6) % 8;  // -2 = +6 mod 8
-    int leftBin2 = (currentBin + 7) % 8;  // -1 = +7 mod 8
-    int leftObstacles = obstacleMemory[leftBin1] + obstacleMemory[leftBin2];
+    // Obstacle memory — prefer direction with fewer remembered obstacles
+    int leftObs = obstacleMemory[(currentBin + 6) % 8] + obstacleMemory[(currentBin + 7) % 8];
+    int rightObs = obstacleMemory[(currentBin + 1) % 8] + obstacleMemory[(currentBin + 2) % 8];
+    leftScore -= leftObs * 10;
+    rightScore -= rightObs * 10;
     
-    // Right turn would face bins (currentBin + 1) and (currentBin + 2)
-    int rightBin1 = (currentBin + 1) % 8;
-    int rightBin2 = (currentBin + 2) % 8;
-    int rightObstacles = obstacleMemory[rightBin1] + obstacleMemory[rightBin2];
-    
-    // Prefer direction with fewer obstacles (each obstacle = -10 points)
-    leftScore -= leftObstacles * 10;
-    rightScore -= rightObstacles * 10;
-    
-    // 2. Tilt compensation - prefer turning uphill (more stable)
-    // If tilted left (roll < 0), turning right goes uphill
-    // If tilted right (roll > 0), turning left goes uphill
+    // Tilt compensation — prefer turning uphill
     if (abs(roll) > 10) {
-        if (roll < 0) {
-            rightScore += 15;  // Turn right to go uphill
-        } else {
-            leftScore += 15;   // Turn left to go uphill
-        }
+        if (roll < 0) rightScore += 15;
+        else leftScore += 15;
     }
     
-    // 3. Avoid spinning in circles - if we've turned same direction 3+ times, try opposite
+    // Anti-circle — if turned same way 3+ times, try opposite
     if (consecutiveSameDirection >= 3) {
-        if (lastTurnDirection == TURN_LEFT) {
-            rightScore += 25;
-        } else if (lastTurnDirection == TURN_RIGHT) {
-            leftScore += 25;
-        }
+        if (lastTurnDirection == TURN_LEFT) rightScore += 25;
+        else if (lastTurnDirection == TURN_RIGHT) leftScore += 25;
     }
     
-    // 4. Consistency bonus - slight preference to continue same direction (helps corners)
+    // Consistency — slight preference to continue same direction
     if (consecutiveSameDirection < 3) {
-        if (lastTurnDirection == TURN_LEFT) {
-            leftScore += 5;
-        } else if (lastTurnDirection == TURN_RIGHT) {
-            rightScore += 5;
-        }
+        if (lastTurnDirection == TURN_LEFT) leftScore += 5;
+        else if (lastTurnDirection == TURN_RIGHT) rightScore += 5;
     }
     
-    // 5. Small random factor to prevent deterministic loops
+    // Small random factor
     leftScore += random(0, 8);
     rightScore += random(0, 8);
     
-    Serial.printf("[AUTO] Turn scores: L=%d R=%d (obs L:%d R:%d, roll:%.0f)\n",
-                  leftScore, rightScore, leftObstacles, rightObstacles, roll);
+    Serial.printf("[NAV] Turn scores: L=%d R=%d (obs L:%d R:%d, roll:%.0f)\n",
+                  leftScore, rightScore, leftObs, rightObs, roll);
     
     return (leftScore >= rightScore) ? TURN_LEFT : TURN_RIGHT;
 }
 
-void AutonomousNav::smartTurn() {
-    if (hasScannedLeft && hasScannedRight) {
-        Serial.printf("[AUTO] Scan: L=%.0f R=%.0f\\n", scanLeftDistance, scanRightDistance);
-        
-        if (scanLeftDistance > scanRightDistance + 10) {
-            setTurnLeft(600);
-        } else if (scanRightDistance > scanLeftDistance + 10) {
-            setTurnRight(600);
-        } else {
-            decideTurnDirection(lastDistance);
-        }
-        
-        hasScannedLeft = false;
-        hasScannedRight = false;
-    } else {
-        decideTurnDirection(lastDistance);
-    }
-}
-
-void AutonomousNav::setState(NavState newState, unsigned long duration) {
-    currentState = newState;
-    stateStartTime = millis();
-    stateDuration = duration;
-    lastStateChange = millis();
-}
-
-void AutonomousNav::setForward() {
-    setState(NAV_FORWARD, 0);
-    targetSpeed = SPEED_CRUISE;
-    stuckCounter = 0;
-}
-
-void AutonomousNav::setForwardSlow() {
-    setState(NAV_FORWARD_SLOW, 0);
-    targetSpeed = SPEED_SLOW;
-}
-
-void AutonomousNav::setBackward(unsigned long duration) {
-    setState(NAV_BACKWARD, duration);
-    targetSpeed = SPEED_CRUISE;
-}
-
-void AutonomousNav::setTurnLeft(unsigned long duration) {
-    setState(NAV_TURN_LEFT, duration);
-    targetSpeed = SPEED_TURN;
-    lastTurnDirection = TURN_LEFT;
-}
-
-void AutonomousNav::setTurnRight(unsigned long duration) {
-    setState(NAV_TURN_RIGHT, duration);
-    targetSpeed = SPEED_TURN;
-    lastTurnDirection = TURN_RIGHT;
-}
-
-void AutonomousNav::setScanLeft() {
-    setState(NAV_SCAN_LEFT, 400);
-    targetSpeed = SPEED_SCAN;
-}
-
-void AutonomousNav::setScanRight() {
-    setState(NAV_SCAN_RIGHT, 800);
-    targetSpeed = SPEED_SCAN;
-}
-
-void AutonomousNav::setEscape() {
-    Serial.println("[AUTO] Escape → starting recovery sequence");
-    stuckCounter = 0;
-    hasScannedLeft = false;
-    hasScannedRight = false;
-    startRecovery();
-}
+// ==================== MOTOR OUTPUT ====================
 
 void AutonomousNav::getMotorSpeeds(int& leftSpeed, int& rightSpeed) {
     int speed = currentSpeed;
-
-    // Ensure commanded speed can actually move the drivetrain
-    if (speed > 0 && speed < SPEED_MIN_MOVE) {
-        speed = SPEED_MIN_MOVE;
-    }
     
-    // Apply slope compensation
+    // Minimum to move
+    if (speed > 0 && speed < SPEED_MIN_MOVE) speed = SPEED_MIN_MOVE;
+    
+    // Slope compensation
     if (imuAvailable && currentOrientation == ORIENTATION_NORMAL) {
-        // Going uphill (tilted back): increase power
-        if (pitch < -15) {
-            speed = min(255, (int)(speed * 1.15f));
-        }
-        // Going downhill (tilted forward): reduce power
-        else if (pitch > 15) {
-            speed = max(80, (int)(speed * 0.75f));
-        }
+        if (pitch < -15) speed = min(255, (int)(speed * 1.15f));       // Uphill boost
+        else if (pitch > 15) speed = max(80, (int)(speed * 0.75f));    // Downhill reduce
     }
     
     switch (currentState) {
-        case NAV_FORWARD:
-        case NAV_FORWARD_SLOW:
-            leftSpeed = speed;
-            rightSpeed = speed;
-            break;
+        case NAV_CRUISE: {
+            // Lock heading after settle delay
+            if (!headingLocked && imuAvailable && (millis() - cruiseEnteredAt > HEADING_HOLD_SETTLE_MS)) {
+                cruiseHeading = heading;
+                headingLocked = true;
+                Serial.printf("[HEADING] Locked at %.1f°\n", cruiseHeading);
+            }
             
-        case NAV_BACKWARD:
-        case NAV_ESCAPE:
-            leftSpeed = -speed;
-            rightSpeed = -speed;
-            break;
+            // Heading-hold: correct drift from locked heading
+            int holdBias = 0;
+            if (headingLocked && imuAvailable) {
+                float error = cruiseHeading - heading;
+                while (error > 180) error -= 360;
+                while (error < -180) error += 360;
+                
+                if (abs(error) > HEADING_HOLD_DEADBAND) {
+                    holdBias = constrain((int)(error * HEADING_HOLD_GAIN), -HEADING_HOLD_MAX, HEADING_HOLD_MAX);
+                }
+            }
             
-        case NAV_TURN_LEFT:
-        case NAV_SCAN_LEFT:
-            leftSpeed = -speed;
-            rightSpeed = speed;
-            break;
+            // DR steering: gently arc away from start (additive with heading-hold)
+            int drBias = 0;
+            float distFromStart = sqrt(drX * drX + drY * drY);
+            if (distFromStart > DR_MIN_DIST_CM && lastDistance > DIST_MEDIUM) {
+                float awayBearing = atan2(drX, drY) * 180.0f / PI;
+                float headingError = awayBearing - heading;
+                while (headingError > 180) headingError -= 360;
+                while (headingError < -180) headingError += 360;
+                float proxScale = constrain(1.0f - (distFromStart - DR_MIN_DIST_CM) / DR_PROXIMITY_RANGE_CM, 0.2f, 1.0f);
+                drBias = constrain((int)(headingError * DR_STEER_GAIN * proxScale), -DR_STEER_MAX, DR_STEER_MAX);
+                
+                // DR correction also shifts the locked heading so heading-hold
+                // doesn't fight the DR correction
+                if (abs(drBias) > 5 && headingLocked) {
+                    cruiseHeading += drBias * 0.02f;  // Gently shift target
+                    while (cruiseHeading >= 360) cruiseHeading -= 360;
+                    while (cruiseHeading < 0) cruiseHeading += 360;
+                }
+            }
             
-        case NAV_TURN_RIGHT:
-        case NAV_SCAN_RIGHT:
-            leftSpeed = speed;
-            rightSpeed = -speed;
+            int totalBias = constrain(holdBias + drBias, -HEADING_HOLD_MAX, HEADING_HOLD_MAX);
+            
+            // Diagonal hill traversal: when terrain boost is active and pitch
+            // is significant, steer to cross the slope at an angle rather than
+            // straight up — reduces effective grade significantly.
+            // Uses roll to pick the direction (steer toward the downhill side).
+            if (terrainBoostActive && imuAvailable) {
+                float absPitch = fabs(pitch);
+                if (absPitch > 8.0f) {  // Only steer when pitch is noticeable
+                    // Roll indicates which side is lower — steer toward it
+                    // to create a diagonal traversal path
+                    int diagBias = (int)(roll * 0.8f);  // ~0.8 PWM per degree of roll
+                    diagBias = constrain(diagBias, -25, 25);
+                    totalBias += diagBias;
+                    totalBias = constrain(totalBias, -HEADING_HOLD_MAX, HEADING_HOLD_MAX);
+                }
+            }
+            
+            leftSpeed  = constrain(speed + totalBias, (int)SPEED_MIN_MOVE, 255);
+            rightSpeed = constrain(speed - totalBias, (int)SPEED_MIN_MOVE, 255);
             break;
+        }
         
-        case NAV_RECOVERY:
-            // Motor direction depends on recovery sub-phase
-            switch (recoveryPhase) {
-                case RECOVERY_ROCK_FWD:
-                case RECOVERY_DIAGONAL_FWD:
-                    leftSpeed = speed;
-                    rightSpeed = speed;
-                    break;
-                case RECOVERY_ROCK_REV:
-                case RECOVERY_FULL_REVERSE:
+        case NAV_AVOID:
+            switch (avoidPhase) {
+                case AVOID_BACKUP:
                     leftSpeed = -speed;
                     rightSpeed = -speed;
                     break;
-                case RECOVERY_DIAGONAL_TURN:
-                    // Turn direction set by recoveryTurnDir
-                    if (recoveryTurnDir == TURN_LEFT) {
-                        leftSpeed = -speed;
-                        rightSpeed = speed;
+                case AVOID_TURN:
+                    if (avoidTurnDir == TURN_LEFT) {
+                        leftSpeed = -speed; rightSpeed = speed;
                     } else {
-                        leftSpeed = speed;
-                        rightSpeed = -speed;
+                        leftSpeed = speed; rightSpeed = -speed;
                     }
                     break;
-                case RECOVERY_DONE:
-                default:
-                    leftSpeed = 0;
-                    rightSpeed = 0;
+                case AVOID_VERIFY:
+                    leftSpeed = speed;
+                    rightSpeed = speed;
                     break;
             }
             break;
-            
+        
+        case NAV_RECOVER:
+            switch (recoveryPhase) {
+                case RECOVERY_ROCK_FWD:
+                case RECOVERY_DIAGONAL_FWD:
+                    leftSpeed = speed; rightSpeed = speed;
+                    break;
+                case RECOVERY_COAST:
+                    leftSpeed = 0; rightSpeed = 0;
+                    break;
+                case RECOVERY_ROCK_REV:
+                case RECOVERY_FULL_REVERSE:
+                    leftSpeed = -speed; rightSpeed = -speed;
+                    break;
+                case RECOVERY_DIAGONAL_TURN:
+                    if (recoveryTurnDir == TURN_LEFT) {
+                        leftSpeed = -speed; rightSpeed = speed;
+                    } else {
+                        leftSpeed = speed; rightSpeed = -speed;
+                    }
+                    break;
+                default:
+                    leftSpeed = 0; rightSpeed = 0;
+                    break;
+            }
+            break;
+        
+        case NAV_HAZARD:
+            switch (hazardPhase) {
+                case HAZARD_BACKUP:
+                    leftSpeed = -speed; rightSpeed = -speed;
+                    break;
+                case HAZARD_TURN:
+                    if (inclineAttempts % 2 == 0) {
+                        leftSpeed = speed; rightSpeed = -speed;
+                    } else {
+                        leftSpeed = -speed; rightSpeed = speed;
+                    }
+                    break;
+            }
+            break;
+        
         case NAV_STOPPED:
         default:
-            leftSpeed = 0;
-            rightSpeed = 0;
+            leftSpeed = 0; rightSpeed = 0;
             break;
     }
-    
-    // NOTE: Upside-down motor inversion is now handled globally in MotorControl::setMotors()
-    // This applies to ALL control modes (UART, Xbox, Autonomous)
 }
+
+// ==================== RESET ====================
 
 void AutonomousNav::reset() {
     currentState = NAV_STOPPED;
-    currentBehavior = BEHAVIOR_EXPLORE;
-    lastTurnDirection = TURN_RANDOM;
     stateStartTime = millis();
-    stateDuration = 0;
+    lastStateChange = 0;
+    lastTurnDirection = TURN_RANDOM;
+    
+    lastDistance = 0;
     stuckCounter = 0;
     currentSpeed = 0;
     targetSpeed = 0;
-    pidIntegral = 0;
-    pidLastError = 0;
     stallStartTime = 0;
+    
     sideDistLeft = 999.0f;
     sideDistRight = 999.0f;
     detectedWallAngle = 0.0f;
-    hasScannedLeft = false;
-    hasScannedRight = false;
-    firstRun = true;
     
-    // Reset heading tracking
     heading = 0;
     headingAtObstacle = 0;
     consecutiveSameDirection = 0;
+    drX = 0; drY = 0;
+    headingTowardStartSince = 0;
+    cruiseHeading = 0;
+    headingLocked = false;
+    cruiseEnteredAt = 0;
+    for (int i = 0; i < 8; i++) obstacleMemory[i] = 0;
     
-    // Clear obstacle memory
-    for (int i = 0; i < 8; i++) {
-        obstacleMemory[i] = 0;
-    }
+    firstRun = true;
     
-    // Reset terrain handling
-    for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) {
-        accelMagHistory[i] = 1.0f;
-    }
+    avoidPhase = AVOID_BACKUP;
+    avoidAttempts = 0;
+    
+    steepInclineStart = 0;
+    onSteepIncline = false;
+    inclineAttempts = 0;
+    
+    for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) accelMagHistory[i] = 1.0f;
     accelMagIndex = 0;
     accelMagFilled = false;
     motionVerified = true;
     noMotionStartTime = 0;
-    steepInclineStart = 0;
-    onSteepIncline = false;
-    inclineAttempts = 0;
+    
     recoveryPhase = RECOVERY_DONE;
     rockCount = 0;
     recentlyStuck = false;
     stuckRecoveryTime = 0;
+    recoveryCooldownUntil = 0;
     
-    // Reset send-it
-    sendItActive = false;
-    sendItUntil = 0;
-    sendItTurnCount = 0;
-    sendItWindowStart = 0;
-    sendItFwdStart = 0;
+    terrainBoostActive = false;
+    terrainBoostUntil = 0;
+    terrainBoostStartX = 0;
+    terrainBoostStartY = 0;
+    terrainBoostStuck = false;
     
-    for (int i = 0; i < 5; i++) {
-        distanceHistory[i] = 999.0f;
+    for (int i = 0; i < 5; i++) distanceHistory[i] = 999.0f;
+    historyIndex = 0;
+    
+    Serial.println("[NAV] Reset — ready to cruise");
+}
+
+// ==================== TERRAIN HANDLING ====================
+
+void AutonomousNav::checkMotionVerification() {
+    float sum = 0;
+    for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) sum += accelMagHistory[i];
+    float mean = sum / MOTION_VERIFY_WINDOW;
+    
+    float variance = 0;
+    for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) {
+        float diff = accelMagHistory[i] - mean;
+        variance += diff * diff;
+    }
+    variance /= MOTION_VERIFY_WINDOW;
+    
+    bool wasVerified = motionVerified;
+    
+    if (currentSpeed < SPEED_MIN_MOVE) {
+        motionVerified = true;
+        noMotionStartTime = 0;
+    } else if (variance > MOTION_ACCEL_VAR_THRESH) {
+        motionVerified = true;
+        noMotionStartTime = 0;
+    } else {
+        motionVerified = false;
+        if (noMotionStartTime == 0) noMotionStartTime = millis();
     }
     
-    Serial.println("[AUTO] Reset - starting exploration");
-}
-
-NavState AutonomousNav::getState() {
-    return currentState;
-}
-
-const char* AutonomousNav::getStateString() {
-    switch (currentState) {
-        case NAV_FORWARD: return "FORWARD";
-        case NAV_FORWARD_SLOW: return "SLOW";
-        case NAV_BACKWARD: return "BACK";
-        case NAV_TURN_LEFT: return "LEFT";
-        case NAV_TURN_RIGHT: return "RIGHT";
-        case NAV_SCAN_LEFT: return "SCAN_L";
-        case NAV_SCAN_RIGHT: return "SCAN_R";
-        case NAV_ESCAPE: return "ESCAPE";
-        case NAV_RECOVERY: return "RECOVERY";
-        case NAV_STOPPED: return "STOP";
-        default: return "?";
+    if (wasVerified && !motionVerified) {
+        Serial.printf("[TERRAIN] Motion lost! var=%.6f\n", variance);
+    } else if (!wasVerified && motionVerified) {
+        Serial.println("[TERRAIN] Motion restored");
+        noMotionStartTime = 0;
     }
 }
 
-void AutonomousNav::setBehavior(NavBehavior behavior) {
-    currentBehavior = behavior;
+void AutonomousNav::startRecovery() {
+    Serial.println("[RECOVER] === Starting recovery ===");
+    currentState = NAV_RECOVER;
+    stateStartTime = millis();
+    lastStateChange = millis();
+    recoveryPhase = RECOVERY_ROCK_FWD;
+    rockCount = 0;
+    recoveryStepStart = millis();
+    recoveryStepDuration = RECOVERY_ROCK_MS;
+    targetSpeed = RECOVERY_SPEED;
+    
+    if (sideDistLeft > sideDistRight + 5.0f) recoveryTurnDir = TURN_LEFT;
+    else if (sideDistRight > sideDistLeft + 5.0f) recoveryTurnDir = TURN_RIGHT;
+    else recoveryTurnDir = (random(2) == 0) ? TURN_LEFT : TURN_RIGHT;
+    
+    Serial.printf("[RECOVER] ROCK_FWD, diag dir: %s\n",
+                  recoveryTurnDir == TURN_LEFT ? "LEFT" : "RIGHT");
 }
 
-NavBehavior AutonomousNav::getBehavior() {
-    return currentBehavior;
+void AutonomousNav::flagRecentlyStuck() {
+    recentlyStuck = true;
+    stuckRecoveryTime = millis();
+    recoveryCooldownUntil = millis() + RECOVERY_COOLDOWN_MS;
+    noMotionStartTime = 0;
+    motionVerified = true;
+    stuckCounter = 0;
+    stallStartTime = 0;
+    Serial.printf("[TERRAIN] Recovery cooldown %dms\n", RECOVERY_COOLDOWN_MS);
 }
 
-int AutonomousNav::randomDirection() {
-    return random(2);
-}
+// ==================== HELPERS ====================
 
 bool AutonomousNav::isStuck() {
-    if (currentState != NAV_FORWARD && currentState != NAV_FORWARD_SLOW) {
+    if (currentState != NAV_CRUISE) {
         stuckCounter = 0;
         return false;
     }
     
-    float minDist = distanceHistory[0];
-    float maxDist = distanceHistory[0];
-    
+    float minD = distanceHistory[0], maxD = distanceHistory[0];
     for (int i = 1; i < 5; i++) {
-        if (distanceHistory[i] < minDist) minDist = distanceHistory[i];
-        if (distanceHistory[i] > maxDist) maxDist = distanceHistory[i];
+        if (distanceHistory[i] < minD) minD = distanceHistory[i];
+        if (distanceHistory[i] > maxD) maxD = distanceHistory[i];
     }
     
-    if ((maxDist - minDist) < STUCK_DISTANCE_TOL && lastDistance < DIST_MEDIUM) {
+    if ((maxD - minD) < STUCK_DISTANCE_TOL && lastDistance < DIST_MEDIUM) {
         stuckCounter++;
-        if (stuckCounter >= STUCK_THRESHOLD) {
-            return true;
-        }
+        return stuckCounter >= STUCK_THRESHOLD;
     } else {
         stuckCounter = 0;
     }
-    
     return false;
 }
 
@@ -1012,299 +1272,23 @@ void AutonomousNav::updateDistanceHistory(float distance) {
 }
 
 int AutonomousNav::calculateSpeed(float distance) {
-    if (distance >= DIST_FAR) {
-        return SPEED_CRUISE;
-    } else if (distance <= DIST_CRITICAL) {
-        return 0;
-    } else {
-        float ratio = (distance - DIST_CRITICAL) / (DIST_FAR - DIST_CRITICAL);
-        return SPEED_SLOW + (int)(ratio * (SPEED_CRUISE - SPEED_SLOW));
+    // During terrain boost, maintain full cruise speed regardless of distance
+    // (slope face can look like a close obstacle to ultrasonic)
+    if (terrainBoostActive) {
+        if (millis() > terrainBoostUntil) {
+            terrainBoostActive = false;
+        } else {
+            return SPEED_CRUISE;
+        }
     }
+    if (distance >= DIST_FAR) return SPEED_CRUISE;
+    if (distance > DIST_CLOSE) {
+        float ratio = (distance - DIST_CLOSE) / (DIST_FAR - DIST_CLOSE);
+        return SPEED_MIN_MOVE + (int)(ratio * (SPEED_CRUISE - SPEED_MIN_MOVE));
+    }
+    return SPEED_MIN_MOVE;
 }
 
 void AutonomousNav::smoothSpeed() {
-    // Adaptive ramp: use slower ramp after recent stuck event
-    // to prevent track dig-in on soft terrain (sand, loose gravel)
-    int rampRate = recentlyStuck ? ADAPTIVE_RAMP_SLOW : ADAPTIVE_RAMP_NORMAL;
-    
-    if (currentSpeed < targetSpeed) {
-        currentSpeed += rampRate;
-        if (currentSpeed > targetSpeed) currentSpeed = targetSpeed;
-    } else if (currentSpeed > targetSpeed) {
-        currentSpeed -= rampRate;
-        if (currentSpeed < targetSpeed) currentSpeed = targetSpeed;
-    }
-    currentSpeed = constrain(currentSpeed, 0, SPEED_MAX);
-}
-
-// ============================================================
-// TERRAIN HANDLING METHODS
-// ============================================================
-
-// --- Public accessors ---
-
-bool AutonomousNav::isMotionVerified() {
-    return motionVerified;
-}
-
-bool AutonomousNav::isOnSteepIncline() {
-    return onSteepIncline;
-}
-
-RecoveryPhase AutonomousNav::getRecoveryPhase() {
-    return recoveryPhase;
-}
-
-bool AutonomousNav::isRecentlyStuck() {
-    return recentlyStuck;
-}
-
-bool AutonomousNav::isSendItActive() {
-    return sendItActive;
-}
-
-// --- Movement verification ---
-// Computes variance of accel magnitude over rolling window.
-// When robot is actually moving on terrain, vibration causes variance.
-// When stuck (wheels spinning in sand), accelerometer reads ~steady 1g.
-void AutonomousNav::checkMotionVerification() {
-    // Compute mean
-    float sum = 0;
-    for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) {
-        sum += accelMagHistory[i];
-    }
-    float mean = sum / MOTION_VERIFY_WINDOW;
-    
-    // Compute variance
-    float variance = 0;
-    for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) {
-        float diff = accelMagHistory[i] - mean;
-        variance += diff * diff;
-    }
-    variance /= MOTION_VERIFY_WINDOW;
-    
-    // Also check gyro during turns: if we command a turn but gyro shows nothing
-    bool turningButNoGyro = false;
-    if ((currentState == NAV_TURN_LEFT || currentState == NAV_TURN_RIGHT) &&
-        abs(gyroZ) < MOTION_GYRO_TURN_THRESH && currentSpeed > SPEED_MIN_MOVE) {
-        turningButNoGyro = true;
-    }
-    
-    // Motion verified if variance is above threshold, OR we're not trying to move
-    bool wasVerified = motionVerified;
-    
-    if (currentSpeed < SPEED_MIN_MOVE) {
-        // Not trying to move — don't flag
-        motionVerified = true;
-        noMotionStartTime = 0;
-    } else if (variance > MOTION_ACCEL_VAR_THRESH || !turningButNoGyro) {
-        // Some vibration detected — we're moving (or at least not definitively stuck)
-        // Only fully verify if variance is clearly above threshold
-        if (variance > MOTION_ACCEL_VAR_THRESH) {
-            motionVerified = true;
-            noMotionStartTime = 0;
-        } else if (turningButNoGyro) {
-            // Commanding turn but no rotation → stuck
-            motionVerified = false;
-            if (noMotionStartTime == 0) noMotionStartTime = millis();
-        }
-    } else {
-        // Very low variance while commanding movement → likely stuck
-        motionVerified = false;
-        if (noMotionStartTime == 0) {
-            noMotionStartTime = millis();
-        }
-    }
-    
-    // Log transitions
-    if (wasVerified && !motionVerified) {
-        Serial.printf("[TERRAIN] Motion lost! accel_var=%.6f (thresh=%.6f)\n", 
-                      variance, MOTION_ACCEL_VAR_THRESH);
-    } else if (!wasVerified && motionVerified) {
-        Serial.println("[TERRAIN] Motion restored");
-        noMotionStartTime = 0;
-    }
-}
-
-// --- Incline handling ---
-// Track pitch over time. If we've been on a steep slope too long
-// (climbing but not making progress), back off and try diagonal.
-void AutonomousNav::checkIncline(float distance) {
-    float absPitch = abs(pitch);
-    
-    if (absPitch > INCLINE_MAX_PITCH) {
-        if (steepInclineStart == 0) {
-            steepInclineStart = millis();
-            Serial.printf("[TERRAIN] Steep incline detected: pitch=%.1f°\n", pitch);
-        }
-        
-        unsigned long inclineDuration = millis() - steepInclineStart;
-        
-        if (inclineDuration > INCLINE_TIMEOUT_MS) {
-            onSteepIncline = true;
-            
-            if (inclineAttempts < 2) {
-                // Try diagonal approach: back up, turn, try again
-                Serial.printf("[TERRAIN] Incline timeout (%.1fs) — trying diagonal approach #%d\n",
-                              inclineDuration / 1000.0f, inclineAttempts + 1);
-                inclineAttempts++;
-                
-                // Back up first, then turn for diagonal approach
-                // We'll alternate directions
-                setBackward(800);
-                // After backward completes, the next update will see the steep incline
-                // and handleExplore will turn. Set a preferred direction.
-                if (inclineAttempts % 2 == 0) {
-                    preferredDirection = TURN_LEFT;
-                } else {
-                    preferredDirection = TURN_RIGHT;
-                }
-                steepInclineStart = 0;  // Reset timer for retry
-            } else {
-                // Exceeded attempts — incline is unclimbable, fully reverse and turn away
-                Serial.printf("[TERRAIN] Incline UNCLIMBABLE after %d attempts — reversing away\n", inclineAttempts);
-                inclineAttempts = 0;
-                steepInclineStart = 0;
-                onSteepIncline = false;
-                startRecovery();  // Use full recovery to get away
-            }
-        }
-    } else {
-        // Pitch is acceptable
-        if (steepInclineStart > 0) {
-            Serial.printf("[TERRAIN] Incline cleared (pitch=%.1f°)\n", pitch);
-        }
-        steepInclineStart = 0;
-        onSteepIncline = false;
-        inclineAttempts = 0;
-    }
-}
-
-// --- Recovery sequence ---
-// Multi-phase stuck recovery:
-//   1. Rock forward/backward N times (break free from sand/rut)
-//   2. Diagonal approach (turn + forward at different angle)
-//   3. Full reverse escape (last resort)
-void AutonomousNav::startRecovery() {
-    Serial.println("[RECOVERY] === Starting recovery sequence ===");
-    currentState = NAV_RECOVERY;
-    recoveryPhase = RECOVERY_ROCK_FWD;
-    rockCount = 0;
-    recoveryStepStart = millis();
-    recoveryStepDuration = RECOVERY_ROCK_MS;
-    targetSpeed = SPEED_MAX;  // Full power for recovery
-    currentSpeed = SPEED_MAX; // Immediate — no ramp during recovery
-    
-    // Choose diagonal turn direction based on which side has more room
-    if (sideDistLeft > sideDistRight + 5.0f) {
-        recoveryTurnDir = TURN_LEFT;
-    } else if (sideDistRight > sideDistLeft + 5.0f) {
-        recoveryTurnDir = TURN_RIGHT;
-    } else {
-        recoveryTurnDir = (random(2) == 0) ? TURN_LEFT : TURN_RIGHT;
-    }
-    
-    Serial.printf("[RECOVERY] Phase: ROCK_FWD (attempt 1/%d), diag dir: %s\n",
-                  RECOVERY_ROCK_ATTEMPTS, recoveryTurnDir == TURN_LEFT ? "LEFT" : "RIGHT");
-}
-
-void AutonomousNav::handleRecovery(float distance) {
-    unsigned long now = millis();
-    unsigned long elapsed = now - recoveryStepStart;
-    
-    // Wait for current step to complete
-    if (elapsed < recoveryStepDuration) {
-        return;  // Still executing current step
-    }
-    
-    // Current step completed — advance to next phase
-    switch (recoveryPhase) {
-        case RECOVERY_ROCK_FWD:
-            // Forward pulse done → backward pulse
-            recoveryPhase = RECOVERY_ROCK_REV;
-            recoveryStepStart = now;
-            recoveryStepDuration = RECOVERY_ROCK_MS;
-            targetSpeed = SPEED_MAX;
-            currentSpeed = SPEED_MAX;
-            Serial.printf("[RECOVERY] ROCK_REV (cycle %d/%d)\n", rockCount + 1, RECOVERY_ROCK_ATTEMPTS);
-            break;
-            
-        case RECOVERY_ROCK_REV:
-            rockCount++;
-            if (rockCount < RECOVERY_ROCK_ATTEMPTS) {
-                // More rock cycles to go
-                recoveryPhase = RECOVERY_ROCK_FWD;
-                recoveryStepStart = now;
-                recoveryStepDuration = RECOVERY_ROCK_MS;
-                targetSpeed = SPEED_MAX;
-                currentSpeed = SPEED_MAX;
-                Serial.printf("[RECOVERY] ROCK_FWD (cycle %d/%d)\n", rockCount + 1, RECOVERY_ROCK_ATTEMPTS);
-            } else {
-                // Rock cycles exhausted → try diagonal approach
-                recoveryPhase = RECOVERY_DIAGONAL_TURN;
-                recoveryStepStart = now;
-                recoveryStepDuration = RECOVERY_DIAG_TURN_MS;
-                targetSpeed = SPEED_TURN;
-                currentSpeed = SPEED_TURN;
-                Serial.printf("[RECOVERY] DIAGONAL_TURN %s %dms\n", 
-                              recoveryTurnDir == TURN_LEFT ? "LEFT" : "RIGHT", RECOVERY_DIAG_TURN_MS);
-            }
-            break;
-            
-        case RECOVERY_DIAGONAL_TURN:
-            // Turn done → drive forward diagonally
-            recoveryPhase = RECOVERY_DIAGONAL_FWD;
-            recoveryStepStart = now;
-            recoveryStepDuration = RECOVERY_DIAG_FWD_MS;
-            targetSpeed = SPEED_CRUISE;
-            currentSpeed = SPEED_CRUISE;
-            Serial.printf("[RECOVERY] DIAGONAL_FWD %dms\n", RECOVERY_DIAG_FWD_MS);
-            break;
-            
-        case RECOVERY_DIAGONAL_FWD:
-            // Check if we're free (motion verified or distance changed)
-            if (motionVerified && distance > DIST_CLOSE) {
-                // We broke free!
-                Serial.println("[RECOVERY] === FREE! Resuming navigation ===");
-                recoveryPhase = RECOVERY_DONE;
-                flagRecentlyStuck();
-                setForward();
-            } else {
-                // Diagonal didn't work → full reverse escape
-                recoveryPhase = RECOVERY_FULL_REVERSE;
-                recoveryStepStart = now;
-                recoveryStepDuration = RECOVERY_FULL_REV_MS;
-                targetSpeed = SPEED_MAX;
-                currentSpeed = SPEED_MAX;
-                Serial.printf("[RECOVERY] FULL_REVERSE %dms (last resort)\n", RECOVERY_FULL_REV_MS);
-            }
-            break;
-            
-        case RECOVERY_FULL_REVERSE:
-            // Full reverse done — recovery complete, pick a new direction
-            Serial.println("[RECOVERY] === Recovery complete — turning to new heading ===");
-            recoveryPhase = RECOVERY_DONE;
-            flagRecentlyStuck();
-            // Turn away from where we were stuck
-            decideTurnDirection(distance, 800);
-            break;
-            
-        case RECOVERY_DONE:
-        default:
-            // Should not get here — transition to forward
-            setForward();
-            break;
-    }
-}
-
-void AutonomousNav::flagRecentlyStuck() {
-    recentlyStuck = true;
-    stuckRecoveryTime = millis();
-    noMotionStartTime = 0;
-    motionVerified = true;
-    stuckCounter = 0;
-    pidIntegral = 0;
-    pidLastError = 0;
-    stallStartTime = 0;
-    Serial.printf("[TERRAIN] Adaptive ramp active for %ds\n", ADAPTIVE_RAMP_TIMEOUT / 1000);
+    currentSpeed = constrain(targetSpeed, 0, SPEED_MAX);
 }

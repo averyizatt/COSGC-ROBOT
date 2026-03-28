@@ -1,10 +1,10 @@
 #include "path_planner.h"
 #include <math.h>
 
-// Temporary wavefront grid - we'll use a smaller working area
+// Temporary wavefront grid - smaller working area for WROOM DRAM limits
 // to save memory and compute paths in the robot's vicinity
-#define WAVE_SIZE 100  // 100x100 = 10KB working area (5m x 5m)
-#define WAVE_OFFSET 50 // Center offset
+#define WAVE_SIZE 10   // 10x10 = matches map size (5m x 5m at 50cm)
+#define WAVE_OFFSET 5  // Center offset
 
 static uint16_t waveGrid[WAVE_SIZE][WAVE_SIZE];
 #define WAVE_OBSTACLE 65535
@@ -23,6 +23,8 @@ PathPlanner::PathPlanner() {
     currentFrontierIndex = 0;
     homeX = MAP_CENTER_X;
     homeY = MAP_CENTER_Y;
+    exploreStartTime = 0;
+    lastFrontierRetry = 0;
 }
 
 void PathPlanner::begin(OccupancyMap* map) {
@@ -64,6 +66,8 @@ void PathPlanner::startExploration() {
     goalReached = false;
     pathLength = 0;
     frontiersFound = 0;
+    exploreStartTime = millis();
+    lastFrontierRetry = 0;
     
     Serial.println("[PLANNER] Starting frontier exploration");
 }
@@ -87,24 +91,64 @@ const char* PathPlanner::getModeString() {
 
 bool PathPlanner::isTraversable(int x, int y) {
     if (x < 0 || x >= MAP_WIDTH || y < 0 || y >= MAP_HEIGHT) return false;
-    uint8_t cell = occupancyMap->getCell(x, y);
-    // Traversable if free or unknown (we'll explore unknown)
-    return cell < 180;  // Not definitely an obstacle
+    CellType ct = occupancyMap->getCellType(x, y);
+    // Fog of war: only navigate through cells KNOWN to be free.
+    // UNKNOWN cells act as walls — the robot must physically discover an area
+    // before the planner can route through it.
+    return ct == CTYPE_FREE || ct == CTYPE_LIKELY_FREE;
+}
+
+// BFS flood-fill from (startX, startY) through traversable cells.
+// Builds reachable[][] map — used to pre-filter frontiers so the planner
+// never jumps to a disconnected region of the map.
+void PathPlanner::computeReachability(int startX, int startY, bool reachable[MAP_WIDTH][MAP_HEIGHT]) {
+    memset(reachable, 0, MAP_WIDTH * MAP_HEIGHT * sizeof(bool));
+    if (!occupancyMap) return;
+
+    // Clamp start to grid bounds (odometry drift can push robot off slightly)
+    int sx = constrain(startX, 0, MAP_WIDTH - 1);
+    int sy = constrain(startY, 0, MAP_HEIGHT - 1);
+
+    // Ring-buffer BFS queue — grid is 10x10 = 100 cells max
+    uint8_t qx[MAP_WIDTH * MAP_HEIGHT];
+    uint8_t qy[MAP_WIDTH * MAP_HEIGHT];
+    int head = 0, tail = 0;
+
+    // Force start cell reachable regardless of type (robot might sit on an
+    // uncertain cell due to odometry drift — don't lock ourselves out)
+    reachable[sx][sy] = true;
+    qx[tail] = sx; qy[tail] = sy; tail++;
+
+    const int dx[] = {0, 1, 0, -1, 1, 1, -1, -1};
+    const int dy[] = {1, 0, -1, 0, 1, -1, 1, -1};
+
+    while (head < tail) {
+        int cx = qx[head], cy = qy[head]; head++;
+        for (int d = 0; d < 8; d++) {
+            int nx = cx + dx[d], ny = cy + dy[d];
+            if (nx >= 0 && nx < MAP_WIDTH && ny >= 0 && ny < MAP_HEIGHT) {
+                if (!reachable[nx][ny] && isTraversable(nx, ny)) {
+                    reachable[nx][ny] = true;
+                    qx[tail] = nx; qy[tail] = ny; tail++;
+                }
+            }
+        }
+    }
 }
 
 bool PathPlanner::isFrontier(int x, int y) {
     if (x < 1 || x >= MAP_WIDTH - 1 || y < 1 || y >= MAP_HEIGHT - 1) return false;
     
-    uint8_t cell = occupancyMap->getCell(x, y);
-    // Must be free space
-    if (cell > 60) return false;
+    CellType ct = occupancyMap->getCellType(x, y);
+    // Must be free space (confident or likely)
+    if (ct != CTYPE_FREE && ct != CTYPE_LIKELY_FREE) return false;
     
     // Check if adjacent to unknown
     for (int dx = -1; dx <= 1; dx++) {
         for (int dy = -1; dy <= 1; dy++) {
             if (dx == 0 && dy == 0) continue;
-            uint8_t neighbor = occupancyMap->getCell(x + dx, y + dy);
-            if (neighbor >= 120 && neighbor <= 135) {  // Unknown (around 127)
+            CellType nct = occupancyMap->getCellType(x + dx, y + dy);
+            if (nct == CTYPE_UNKNOWN) {
                 return true;
             }
         }
@@ -181,7 +225,22 @@ float PathPlanner::update(int robotX, int robotY, float currentHeading) {
                     computePath(robotX, robotY, goalX, goalY);
                 }
             } else {
-                Serial.println("[PLANNER] No more frontiers - exploration complete!");
+                // No frontiers found — but don't give up if exploration is young
+                // or if the map is still mostly unknown (sensors haven't populated it yet).
+                // Retry periodically instead of going permanently IDLE.
+                unsigned long elapsed = millis() - exploreStartTime;
+                float explored = occupancyMap->getExplorationPercent();
+                if (elapsed < 30000 || explored < 5.0f) {
+                    // Early exploration or barely mapped — let reactive nav drive
+                    // while sensors populate free cells, then retry
+                    if (millis() - lastFrontierRetry > 3000) {
+                        Serial.printf("[PLANNER] No frontiers yet (%.1f%% explored, %lus) — retrying...\n",
+                                      explored, elapsed / 1000);
+                        lastFrontierRetry = millis();
+                    }
+                    return -999;  // Let reactive nav handle movement
+                }
+                Serial.printf("[PLANNER] No more frontiers - exploration complete! (%.1f%% explored)\n", explored);
                 mode = PLANNER_IDLE;
                 return -999;
             }
@@ -244,13 +303,10 @@ bool PathPlanner::computePath(int startX, int startY, int endX, int endY) {
             
             if (mapX < 0 || mapX >= MAP_WIDTH || mapY < 0 || mapY >= MAP_HEIGHT) {
                 waveGrid[x][y] = WAVE_OBSTACLE;
+            } else if (!isTraversable(mapX, mapY)) {
+                waveGrid[x][y] = WAVE_OBSTACLE;
             } else {
-                uint8_t cell = occupancyMap->getCell(mapX, mapY);
-                if (cell > 180) {
-                    waveGrid[x][y] = WAVE_OBSTACLE;
-                } else {
-                    waveGrid[x][y] = WAVE_UNVISITED;
-                }
+                waveGrid[x][y] = WAVE_UNVISITED;
             }
         }
     }
@@ -276,8 +332,18 @@ bool PathPlanner::computePath(int startX, int startY, int endX, int endY) {
                         int ny = y + dy[d];
                         
                         if (waveGrid[nx][ny] == WAVE_UNVISITED) {
-                            // Cost: 10 for cardinal, 14 for diagonal
+                            // Base cost: 10 for cardinal, 14 for diagonal
                             uint16_t cost = (d < 4) ? 10 : 14;
+                            
+                            // Visit-count penalty: strongly prefer unvisited cells
+                            // Each prior visit adds 10 to cost (up to +100)
+                            int mapNX = nx + offsetX;
+                            int mapNY = ny + offsetY;
+                            if (mapNX >= 0 && mapNX < MAP_WIDTH && mapNY >= 0 && mapNY < MAP_HEIGHT) {
+                                uint8_t vc = occupancyMap->getVisitCount(mapNX, mapNY);
+                                cost += min((uint16_t)(vc * 10), (uint16_t)100);
+                            }
+                            
                             waveGrid[nx][ny] = currentWave + cost;
                             changed = true;
                         }
@@ -387,40 +453,41 @@ void PathPlanner::simplifyPath() {
 
 int PathPlanner::findFrontiers(int robotX, int robotY) {
     frontiersFound = 0;
-    
-    // Search in expanding squares from robot position
-    for (int radius = 10; radius < 200 && frontiersFound < MAX_FRONTIERS; radius += 10) {
-        int startX = max(0, robotX - radius);
-        int endX = min(MAP_WIDTH - 1, robotX + radius);
-        int startY = max(0, robotY - radius);
-        int endY = min(MAP_HEIGHT - 1, robotY + radius);
-        
-        // Sample every 5 cells to speed up search
-        for (int x = startX; x <= endX && frontiersFound < MAX_FRONTIERS; x += 5) {
-            for (int y = startY; y <= endY && frontiersFound < MAX_FRONTIERS; y += 5) {
-                if (isFrontier(x, y)) {
-                    // Check if too close to existing frontier
-                    bool tooClose = false;
-                    for (int f = 0; f < frontiersFound; f++) {
-                        int dx = frontiers[f].x - x;
-                        int dy = frontiers[f].y - y;
-                        if (dx * dx + dy * dy < 400) {  // 20 cells = 1m
-                            tooClose = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!tooClose) {
-                        frontiers[frontiersFound].x = x;
-                        frontiers[frontiersFound].y = y;
-                        frontiers[frontiersFound].reached = false;
-                        frontiersFound++;
-                    }
+
+    // --- Phase 1: BFS flood-fill to find ALL cells reachable through known free space ---
+    // This is the fog-of-war gate: a frontier must be reachable through explored territory.
+    // Without this, the planner could jump to a disconnected region on the other side of
+    // unknown cells, causing the apparent "teleport" the user observed.
+    bool reachable[MAP_WIDTH][MAP_HEIGHT];
+    computeReachability(robotX, robotY, reachable);
+
+    // --- Phase 2: Scan ALL cells for frontiers that are reachable ---
+    for (int x = 1; x < MAP_WIDTH - 1 && frontiersFound < MAX_FRONTIERS; x++) {
+        for (int y = 1; y < MAP_HEIGHT - 1 && frontiersFound < MAX_FRONTIERS; y++) {
+            if (!reachable[x][y]) continue;  // Fog-of-war gate — skip unreachable cells
+            if (!isFrontier(x, y)) continue;
+
+            // Deduplicate: skip if too close to an already-added frontier
+            bool tooClose = false;
+            for (int f = 0; f < frontiersFound; f++) {
+                int dx = frontiers[f].x - x;
+                int dy = frontiers[f].y - y;
+                if (dx * dx + dy * dy < 4) {  // within 2 cells (~1m)
+                    tooClose = true;
+                    break;
                 }
+            }
+
+            if (!tooClose) {
+                frontiers[frontiersFound].x = x;
+                frontiers[frontiersFound].y = y;
+                frontiers[frontiersFound].reached = false;
+                frontiersFound++;
             }
         }
     }
-    
+
+    Serial.printf("[PLANNER] Frontiers: %d reachable found\n", frontiersFound);
     return frontiersFound;
 }
 
@@ -441,8 +508,20 @@ int PathPlanner::selectBestFrontier(int robotX, int robotY) {
         if (distance > 5) {  // At least 25cm away
             score = 1000 - distance;  // Prefer closer
             
-            // Bonus for frontiers roughly ahead of robot
-            // (would need heading info for this - skip for now)
+            // Exploration bonus: prefer frontiers in less-visited areas
+            // Sample visit count in a 5x5 area around the frontier
+            int visitSum = 0;
+            for (int ox = -2; ox <= 2; ox++) {
+                for (int oy = -2; oy <= 2; oy++) {
+                    int gx = frontiers[i].x + ox;
+                    int gy = frontiers[i].y + oy;
+                    if (gx >= 0 && gx < MAP_WIDTH && gy >= 0 && gy < MAP_HEIGHT) {
+                        visitSum += occupancyMap->getVisitCount(gx, gy);
+                    }
+                }
+            }
+            // Less visited = higher bonus (up to +500)
+            score += max(0, 500 - visitSum * 20);
         }
         
         if (score > bestScore) {

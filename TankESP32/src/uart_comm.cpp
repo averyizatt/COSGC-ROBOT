@@ -14,10 +14,6 @@ void UARTComm::begin() {
     Serial.println("UART Communication initialized (Serial1 disabled - use USB Serial)");
 }
 
-bool UARTComm::available() {
-    return Serial1.available() > 0;
-}
-
 uint8_t UARTComm::calculateChecksum(const Message& msg) {
     uint8_t checksum = 0;
     checksum ^= msg.type;

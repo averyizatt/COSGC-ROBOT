@@ -2,36 +2,89 @@
 #define CONFIG_H
 
 // ==================== HARDWARE PINS ====================
+// ESP32 DevKit V1 (WROOM-32, 30-pin)
+// Available GPIOs: 0,1,2,3,4,5,12,13,14,15,16,17,18,19,21,22,23,25,26,27,32,33,34*,35*,36*,39*
+// (* = input only)
+// Avoid: GPIO0 (boot), GPIO1 (TX0), GPIO2 (boot strap), GPIO3 (RX0), GPIO12 (flash voltage strap!)
 
 // Motor Driver Pins (2x DRV8871)
 // DRV8871: IN1=PWM + IN2=LOW for forward, IN1=LOW + IN2=PWM for reverse
 // Motor A (Driver 1) - Left side
-#define MOTOR_A_IN1  15  // Motor A Input 1
-#define MOTOR_A_IN2  5   // Motor A Input 2
+#define MOTOR_A_IN1  33  // Left motor Input 1
+#define MOTOR_A_IN2  25  // Left motor Input 2
 // Motor B (Driver 2) - Right side
-#define MOTOR_B_IN1  7   // Motor B Input 1
-#define MOTOR_B_IN2  6   // Motor B Input 2 (moved from GPIO4 - JTAG conflict)
+// GPIO 32 was dead — moved IN1 to GPIO 4
+#define MOTOR_B_IN1  26   // Right motor Input 1 (was GPIO32, didn't output)
+#define MOTOR_B_IN2  4  // Right motor Input 2
+
+// --- ESP32-S3 pins (commented out) ---
+// #define MOTOR_B_IN1  7   // S3: Motor B Input 1
+// #define MOTOR_B_IN2  6   // S3: Motor B Input 2
 
 // Ultrasonic Sensor Pins (HC-SR04)
-// Sensor 1 (left-angled, ~15° left of center)
-#define ULTRASONIC_TRIG    12
-#define ULTRASONIC_ECHO    11
-// Sensor 2 (right-angled, ~15° right of center)
-#define ULTRASONIC2_TRIG   35
-#define ULTRASONIC2_ECHO   36
+// Sensor 1 (left-angled)
+#define ULTRASONIC_TRIG    13  // Left ultrasonic trigger
+#define ULTRASONIC_ECHO    34  // Left ultrasonic echo (GPIO34 = input-only, safe)
+                               // ** MOVED from GPIO12 — GPIO12 is flash voltage strap! **
+// Sensor 2 (right-angled)
+#define ULTRASONIC2_TRIG   19  // Right ultrasonic trigger
+#define ULTRASONIC2_ECHO   18  // Right ultrasonic echo
+
+// --- ESP32-S3 ultrasonic pins (commented out) ---
+// #define ULTRASONIC_TRIG    12
+// #define ULTRASONIC_ECHO    11
+// #define ULTRASONIC2_TRIG   35
+// #define ULTRASONIC2_ECHO   36
 
 // I2C Pins for MPU6050
-#define I2C_SDA      10
-#define I2C_SCL      3
+#define I2C_SDA      14  // MPU6050 SDA
+#define I2C_SCL      27  // MPU6050 SCL
 
-// Button and LED Pins
-#define BUTTON_PIN   21  // Mode switch / Bluetooth pairing button
-#define LED_PIN      48  // Onboard RGB LED (WS2812 on most ESP32-S3 DevKits)
+// --- ESP32-S3 I2C pins (commented out) ---
+// #define I2C_SDA      10
+// #define I2C_SCL      3
 
-// UART Configuration
-#define UART_TX      43  // Default UART TX for ESP32-S3
-#define UART_RX      44  // Default UART RX for ESP32-S3
+// Button Pin
+#define BUTTON_PIN   5   // Mode switch / Bluetooth pairing button
+
+// RGB LED Pins (4-leg common cathode: R, G, B + GND)
+#define LED_PIN_R    21  // Red leg   (with 220Ω resistor)
+#define LED_PIN_G    22  // Green leg (with 220Ω resistor)
+#define LED_PIN_B    23  // Blue leg  (with 220Ω resistor)
+// Longest leg (common cathode) → GND
+
+// LED PWM channels (motors use 0-3)
+#define PWM_CHANNEL_LED_R  4
+#define PWM_CHANNEL_LED_G  5
+#define PWM_CHANNEL_LED_B  6
+
+// Self-righting servo
+// Mounting: servo on its side, gear output on robot-right (looking forward), centered on robot.
+// Arm sweeps LEFT (0°/SERVO_MIN_US) to RIGHT (180°/SERVO_MAX_US) in the horizontal plane.
+// If physical direction is reversed after installation, swap SERVO_MIN_US and SERVO_MAX_US.
+#define SERVO_PIN          15     // Servo signal wire
+#define PWM_CHANNEL_SERVO  8      // LEDC channel for servo (low-speed group, separate timer from LED ch6)
+#define SERVO_MIN_US       500    // Pulse width (µs) at 0°  — arm at LEFT extreme
+#define SERVO_MAX_US       2500   // Pulse width (µs) at 180° — arm at RIGHT extreme
+
+// Hall effect encoders (A3144, one per output shaft, 10kΩ pull-up to 3.3V)
+#define ENCODER_LEFT_PIN   35  // Left motor hall sensor  (GPIO35 — input-only, D35, external pull-up required)
+#define ENCODER_RIGHT_PIN  32  // Right motor hall sensor (GPIO32 — input, D32, external pull-up required)
+#define ENCODER_MAGNETS    2       // Magnets per shaft revolution
+#define ENCODER_WHEEL_DIA_MM 26.0f // Drive sprocket diameter (mm)
+// Derived: circumference = π × 26mm ≈ 81.7mm, distance per pulse ≈ 40.8mm
+
+// Keep for backward compat (some code references LED_PIN)
+#define LED_PIN      LED_PIN_R
+
+// UART Configuration (WROOM default UART0)
+#define UART_TX      1   // was GPIO43 on S3
+#define UART_RX      3   // was GPIO44 on S3
 #define UART_BAUD    115200
+
+// --- ESP32-S3 UART pins (commented out) ---
+// #define UART_TX      43
+// #define UART_RX      44
 
 // ==================== PWM CONFIG ====================
 
@@ -45,8 +98,8 @@
 // ==================== SENSOR CONFIG ====================
 
 // Ultrasonic Sensor Configuration
-#define MAX_DISTANCE 400  // Maximum distance in cm
-#define TIMEOUT_US   23200  // Timeout for ultrasonic sensor (23200 us = ~400cm)
+#define MAX_DISTANCE 200  // Maximum distance in cm (200cm = plenty for ground rover)
+#define TIMEOUT_US   12000  // Timeout for ultrasonic sensor (12000 us ≈ 200cm)
 
 // MPU6050 Configuration
 #define MPU6050_ADDR 0x68
@@ -55,7 +108,8 @@
 #define IMU_ENABLED 1
 
 // IMU Thresholds
-#define UPSIDE_DOWN_THRESHOLD -0.5f  // AccelZ below this = upside down
+#define UPSIDE_DOWN_THRESHOLD -0.5f  // AccelZ below this = upside down (needs to be solidly inverted)
+#define ON_SIDE_ROLL_THRESHOLD 45.0f // Roll angle (degrees) above which rover is considered on its side
 #define SLOPE_STEEP_THRESHOLD 0.5f   // Tilt angle for steep slope detection
 #define TILT_DANGER_THRESHOLD 0.7f   // About to tip over
 
@@ -95,10 +149,10 @@
 // Motor calibration - adjust if robot drifts left/right
 // Values from 0.8 to 1.2, 1.0 = no adjustment
 #define MOTOR_A_CALIBRATION 1.0f  // Left motor multiplier
-#define MOTOR_B_CALIBRATION 1.0f  // Right motor multiplier
+#define MOTOR_B_CALIBRATION 0.95f // Right motor multiplier (trimmed down — robot drifts right)
 // Set to 1 if motor wiring polarity is reversed
 #define MOTOR_A_INVERTED 1
-#define MOTOR_B_INVERTED 0
+#define MOTOR_B_INVERTED 1  // Changed: new driver has reversed wiring
 
 // ==================== TUNING PARAMETERS ====================
 
@@ -109,43 +163,131 @@
 // Minimum motor speed (motors won't spin below this PWM value)
 #define MIN_MOTOR_SPEED 60
 
-// Maximum PWM cap — lowers peak current draw to prevent brownout
-// Adjust up/down to find the sweet spot (255 = full, 230 = ~90%)
+// Maximum PWM — full 8-bit range available (safety enforced by current limiter)
 #define MAX_PWM 255
+
+// ==================== DRV8871 CURRENT PROTECTION ====================
+// DRV8871 absolute max continuous current = 3.6A
+// We estimate motor current as: I = V_battery * (duty/255) / R_motor
+// and clamp PWM so estimated current never exceeds the limit.
+//
+// If you don't know your motor's winding resistance, start with
+// MOTOR_RESISTANCE_OHM = 1.0 and tune up until robot has enough torque.
+
+#define DRV8871_MAX_CURRENT_A  3.6f   // Absolute max continuous current (A)
+#define DRV8871_SAFE_CURRENT_A 3.3f   // Target operating current (A) — 92% of max, brief peaks OK
+#define MOTOR_RESISTANCE_OHM   4.0f   // Effective stall resistance (ohms)
+                                       // Multimeter reads ~8ohm static, but stall draws ~4A at 16V
+                                       // → effective R = 16V/4A = 4ohm (use this for safety calc)
+                                       // At 4ohm: safe PWM = 210 (82%), brief peaks to 3.6A OK
+
+// Slew rate limiter — max PWM change per update cycle
+// Prevents sudden current spikes that cause voltage sag / brownout
+#define SLEW_RATE_UP    30     // Max PWM increase per cycle (ramp up)
+#define SLEW_RATE_DOWN  35     // Max PWM decrease per cycle (ramp down — faster for safety)
+#define SLEW_INTERVAL_MS 10    // How often slew rate is applied (ms)
+
+// Direction-change dead-time — brief coast between fwd↔rev
+// Prevents both FETs conducting simultaneously (shoot-through)
+#define DIRECTION_DEADTIME_MS  15   // Coast time when reversing direction (non-blocking)
 
 // ==================== TERRAIN HANDLING ====================
 
 // IMU-based movement verification
 #define MOTION_VERIFY_WINDOW    8       // Accel samples in rolling window
-#define MOTION_VERIFY_TIMEOUT   1500    // ms with no motion before flagging stuck
-#define MOTION_ACCEL_VAR_THRESH 0.008f  // Accel variance below this = not moving
+#define MOTION_VERIFY_TIMEOUT   4000    // ms with no motion before flagging stuck (was 2s, raised to avoid false triggers)
+#define MOTION_ACCEL_VAR_THRESH 0.003f  // Accel variance below this = not moving (lower = less sensitive)
 #define MOTION_GYRO_TURN_THRESH 5.0f    // deg/s — expected gyro when turning
 
 // Incline handling
-#define INCLINE_MAX_PITCH       25.0f   // Max climbable pitch (degrees)
-#define INCLINE_TIMEOUT_MS      3000    // Time on steep incline before giving up
-#define INCLINE_DIAG_TURN_MS    400     // Turn duration for diagonal incline attempt
+#define INCLINE_MAX_PITCH       30.0f   // Max climbable pitch (degrees)
+#define INCLINE_TIMEOUT_MS      1000    // Time on steep incline before giving up
+#define INCLINE_DIAG_TURN_MS    200     // Turn duration for diagonal incline attempt
+
+// Pit / drop-off detection
+#define PIT_DIST_JUMP_CM        80.0f   // Distance jump between consecutive readings to flag pit
+#define PIT_PITCH_THRESHOLD    -15.0f   // Negative pitch (nose down) indicates approaching pit edge
+#define PIT_PITCH_SUSTAIN_MS    500     // Sustained negative pitch to confirm pit
+#define PIT_MARK_DEPTH_CELLS    1       // How many cells deep to mark as pit ahead of detection point
+#define PIT_BACKUP_MS           600     // Reverse duration after pit detection
+
+// Hill / slope detection
+#define HILL_PITCH_THRESHOLD    15.0f   // Positive pitch (nose up) indicates climbing a hill
+#define HILL_PITCH_SUSTAIN_MS   500     // Sustained positive pitch to confirm hill
+#define HILL_DIST_DROP_CM       40.0f   // Distance *decrease* between readings (hitting slope face)
+#define HILL_MARK_DEPTH_CELLS   4       // How many cells deep to mark as hill
+#define HILL_BACKUP_MS          600     // Reverse duration after steep hill detection
+#define SENSOR_HEIGHT_CM        7.6f    // Ultrasonic sensor height above ground (76mm)
+
+// Terrain severity classification
+// Minor terrain → traverse with full speed (momentum); Major → avoid (backup + turn)
+#define TERRAIN_MINOR_PITCH      20.0f   // |pitch| below this = minor terrain (traversable)
+#define TERRAIN_MINOR_HEIGHT_CM  15.0f   // Hill below this estimated height = minor (cm)
+#define TERRAIN_MINOR_PIT_JUMP_CM 120.0f // Distance jump below this = minor pit (cm)
+#define TERRAIN_BOOST_DURATION_MS 2000   // Maintain full speed through minor terrain (ms)
 
 // Stuck recovery sequence
-#define RECOVERY_ROCK_MS        500     // Duration of each rock forward/back pulse
-#define RECOVERY_ROCK_ATTEMPTS  3       // Rock back-and-forth cycles before escalating
-#define RECOVERY_DIAG_TURN_MS   600     // Diagonal approach turn duration
-#define RECOVERY_DIAG_FWD_MS    800     // Diagonal approach forward duration
-#define RECOVERY_FULL_REV_MS    1500    // Full reverse escape duration
+#define RECOVERY_ROCK_MS        300     // Duration of each rock forward/back pulse
+#define RECOVERY_ROCK_ATTEMPTS  2       // Rock back-and-forth cycles before escalating
+#define RECOVERY_DIAG_TURN_MS   400     // Diagonal approach turn duration
+#define RECOVERY_DIAG_FWD_MS    1200    // Diagonal approach forward duration
+#define RECOVERY_FULL_REV_MS    2000    // Full reverse escape duration
 
 // Adaptive torque ramp (soft terrain)
-#define ADAPTIVE_RAMP_SLOW      15      // Speed ramp step after stuck (vs normal 50)
+#define RECOVERY_COAST_MS       100     // Coast (motors off) between direction reversals
+#define RECOVERY_SPEED          200     // PWM during recovery rocks (driver clamps to 210 max)
+#define RECOVERY_COOLDOWN_MS    1500    // Ignore stuck detection after recovery exit
+
+#define ADAPTIVE_RAMP_SLOW      30      // Speed ramp step after stuck (vs normal 50)
 #define ADAPTIVE_RAMP_NORMAL    50      // Normal speed ramp step
-#define ADAPTIVE_RAMP_TIMEOUT   5000    // How long slow ramp lasts after stuck (ms)
+#define ADAPTIVE_RAMP_TIMEOUT   3000    // How long slow ramp lasts after stuck (ms)
 
 // Decision pacing
-#define DECISION_COOLDOWN_MS    300     // Min ms between state changes (prevents jitter)
+#define DECISION_COOLDOWN_MS    200     // Min ms between state changes (prevents oscillation)
 
 // Anti-spin "Send It" mode (narrow corridors)
-#define SENDIT_TURN_THRESHOLD   4       // Turns within window to trigger send-it
-#define SENDIT_WINDOW_MS        8000    // Time window for counting turns (ms)
+#define SENDIT_TURN_THRESHOLD   6       // Turns within window to trigger send-it
+#define SENDIT_WINDOW_MS        10000   // Time window for counting turns (ms)
 #define SENDIT_DURATION_MS      2500    // How long to drive forward in send-it (ms)
-#define SENDIT_FWD_PROGRESS_MS  1500    // Sustained forward time to reset turn count
+#define SENDIT_FWD_PROGRESS_MS  2000    // Sustained forward time to reset turn count
+
+// Calibrated rover velocity (measured: 5m in 5s at MAX_PWM = 1 m/s)
+#define ROVER_MAX_SPEED_CM_S    100.0f  // cm/s at MAX_PWM (measured)
+
+// Heading-hold straight-line correction (IMU-based)
+#define HEADING_HOLD_GAIN       1.0f    // PWM per degree of heading error
+#define HEADING_HOLD_MAX        40      // Max steering differential (PWM)
+#define HEADING_HOLD_DEADBAND   2.5f    // Ignore errors smaller than this (degrees)
+#define HEADING_HOLD_SETTLE_MS  500     // Wait this long after entering CRUISE before locking heading
+
+// Dead-reckoning "escape from start" steering
+#define DR_STEER_GAIN           0.15f   // Steering PWM per degree of heading error
+#define DR_STEER_MAX            30      // Max steering differential (PWM)
+#define DR_MIN_DIST_CM          100.0f  // Min distance from start before bias activates (~1s driving)
+#define DR_PROXIMITY_RANGE_CM   1000.0f // Range over which proximity scaling fades out (~10s driving)
+#define DR_HEADING_TOWARD_DEG   60.0f   // Within this many degrees of start = "heading toward"
+#define DR_CORRECT_TIMEOUT_MS   5000    // Heading toward start this long = force correction turn
+#define DR_CORRECT_CLEARANCE_CM 150.0f  // Min front distance to allow correction turn (well into clear space)
+#define DR_CORRECT_TURN_MS      600     // Duration of proactive correction turn
+
+// ==================== SAFETY PROTECTION ====================
+
+// ESP32 internal temperature limits (Celsius)
+#define TEMP_WARNING_C       65.0f   // Start throttling motors
+#define TEMP_CRITICAL_C      75.0f   // Kill motors entirely
+#define TEMP_RESUME_C        55.0f   // Resume after cooldown (hysteresis)
+#define TEMP_CHECK_MS        2000    // How often to read temp sensor (ms)
+
+// Motor duty cycle protection
+#define MOTOR_MAX_FULL_MS    20000   // Max continuous full-speed (20s)
+#define MOTOR_COOLDOWN_MS    3000    // Forced throttle-down period after max
+#define MOTOR_THROTTLE_PCT   50      // % of MAX_PWM during cooldown (0-100)
+
+// Motor watchdog — auto-stop if no new command received
+#define MOTOR_WATCHDOG_MS    500     // Stop motors if no command in 500ms
+
+// Startup safety
+#define MOTOR_STARTUP_DELAY  1000    // Wait 1s after boot before allowing motors
 
 // Debug flags
 // #define DEBUG_SENSORS    // Uncomment to print all sensor readings

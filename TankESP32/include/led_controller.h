@@ -2,7 +2,6 @@
 #define LED_CONTROLLER_H
 
 #include <Arduino.h>
-#include <Adafruit_NeoPixel.h>
 
 enum LEDMode {
     LED_OFF = 0,
@@ -26,15 +25,14 @@ public:
     // Update LED state (call in loop)
     void update();
     
-    // Direct color control
-    void setColor(uint8_t r, uint8_t g, uint8_t b);
     void off();
 
 private:
-    Adafruit_NeoPixel pixel;
+    void writeRGB(uint8_t r, uint8_t g, uint8_t b);
     LEDMode currentMode;
     unsigned long lastBlinkTime;
     bool blinkState;
+    uint8_t brightness;  // 0-255 global brightness scaler
 };
 
 #endif // LED_CONTROLLER_H

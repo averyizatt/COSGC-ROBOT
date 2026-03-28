@@ -1,16 +1,36 @@
 #include "led_controller.h"
 #include "config.h"
 
-LEDController::LEDController() : pixel(1, LED_PIN, NEO_GRB + NEO_KHZ800) {
+LEDController::LEDController() {
     currentMode = LED_OFF;
     lastBlinkTime = 0;
     blinkState = false;
+    brightness = 40;  // ~15% brightness — lower draw to avoid WiFi current-spike brownouts
 }
 
 void LEDController::begin() {
-    pixel.begin();
-    pixel.setBrightness(50);  // 0-255, adjust brightness
-    pixel.show();  // Initialize all pixels to 'off'
+    // Setup PWM channels for each color
+    ledcSetup(PWM_CHANNEL_LED_R, 5000, 8);  // 5kHz, 8-bit
+    ledcSetup(PWM_CHANNEL_LED_G, 5000, 8);
+    ledcSetup(PWM_CHANNEL_LED_B, 5000, 8);
+
+    ledcAttachPin(LED_PIN_R, PWM_CHANNEL_LED_R);
+    ledcAttachPin(LED_PIN_G, PWM_CHANNEL_LED_G);
+    ledcAttachPin(LED_PIN_B, PWM_CHANNEL_LED_B);
+
+    writeRGB(0, 0, 0);
+    Serial.printf("[LED] RGB LED: R=GPIO%d G=GPIO%d B=GPIO%d\n", LED_PIN_R, LED_PIN_G, LED_PIN_B);
+}
+
+void LEDController::writeRGB(uint8_t r, uint8_t g, uint8_t b) {
+    // Scale by brightness
+    r = (r * brightness) / 255;
+    g = (g * brightness) / 255;
+    b = (b * brightness) / 255;
+
+    ledcWrite(PWM_CHANNEL_LED_R, r);
+    ledcWrite(PWM_CHANNEL_LED_G, g);
+    ledcWrite(PWM_CHANNEL_LED_B, b);
 }
 
 void LEDController::setMode(LEDMode mode) {
@@ -21,68 +41,48 @@ void LEDController::setMode(LEDMode mode) {
 
 void LEDController::update() {
     unsigned long currentMillis = millis();
-    
+
     switch (currentMode) {
         case LED_OFF:
-            pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-            pixel.show();
+            writeRGB(0, 0, 0);
             break;
-            
+
         case LED_SOLID_RED:
-            pixel.setPixelColor(0, pixel.Color(255, 0, 0));
-            pixel.show();
+        case LED_SOLID_RED_MODE:
+            writeRGB(255, 0, 0);
             break;
-            
+
         case LED_SOLID_GREEN:
-            pixel.setPixelColor(0, pixel.Color(0, 255, 0));
-            pixel.show();
+            writeRGB(0, 255, 0);
             break;
-            
+
         case LED_SOLID_BLUE:
-            pixel.setPixelColor(0, pixel.Color(0, 0, 255));
-            pixel.show();
+            writeRGB(0, 0, 255);
             break;
-            
+
         case LED_SOLID_ORANGE:
-            pixel.setPixelColor(0, pixel.Color(255, 165, 0));
-            pixel.show();
+            writeRGB(255, 165, 0);
             break;
 
         case LED_SOLID_PURPLE:
-            pixel.setPixelColor(0, pixel.Color(180, 0, 255));
-            pixel.show();
+            writeRGB(180, 0, 255);
             break;
-            
+
         case LED_BLINK_BLUE_FAST:
-            // Fast blink for Bluetooth pairing
             if (currentMillis - lastBlinkTime >= LED_BLINK_FAST) {
                 lastBlinkTime = currentMillis;
                 blinkState = !blinkState;
-                
                 if (blinkState) {
-                    pixel.setPixelColor(0, pixel.Color(0, 0, 255));
+                    writeRGB(0, 0, 255);
                 } else {
-                    pixel.setPixelColor(0, pixel.Color(0, 0, 0));
+                    writeRGB(0, 0, 0);
                 }
-                pixel.show();
             }
-            break;
-            
-        case LED_SOLID_RED_MODE:
-            pixel.setPixelColor(0, pixel.Color(255, 0, 0));
-            pixel.show();
             break;
     }
 }
 
-void LEDController::setColor(uint8_t r, uint8_t g, uint8_t b) {
-    currentMode = LED_OFF;  // Custom mode
-    pixel.setPixelColor(0, pixel.Color(r, g, b));
-    pixel.show();
-}
-
 void LEDController::off() {
     currentMode = LED_OFF;
-    pixel.setPixelColor(0, pixel.Color(0, 0, 0));
-    pixel.show();
+    writeRGB(0, 0, 0);
 }

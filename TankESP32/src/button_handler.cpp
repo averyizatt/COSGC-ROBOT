@@ -65,7 +65,3 @@ ButtonEvent ButtonHandler::update() {
     lastButtonState = reading;
     return BUTTON_NONE;
 }
-
-bool ButtonHandler::isPressed() {
-    return buttonState == LOW;
-}

@@ -24,7 +24,11 @@ static void IRAM_ATTR echoISR() {
 }
 
 UltrasonicSensor::UltrasonicSensor(int trigPin, int echoPin)
-    : _trigPin(trigPin), _echoPin(echoPin) {
+    : _trigPin(trigPin), _echoPin(echoPin),
+      _medianIdx(0), _medianFilled(false),
+      _health(SENSOR_OK), _consecutiveFails(0),
+      _lastValidReading(30.0f), _stuckCount(0) {
+    _medianBuf[0] = _medianBuf[1] = _medianBuf[2] = 0.0f;
 }
 
 void UltrasonicSensor::begin() {
@@ -79,16 +83,59 @@ float UltrasonicSensor::_readOnce() {
     return distance;
 }
 
+float UltrasonicSensor::_median3(float a, float b, float c) {
+    if (a > b) { float t = a; a = b; b = t; }
+    if (b > c) { float t = b; b = c; c = t; }
+    if (a > b) { float t = a; a = b; b = t; }
+    return b;
+}
+
 float UltrasonicSensor::readDistance() {
-    // Try up to 3 times to get a valid reading
-    for (int attempt = 0; attempt < 3; attempt++) {
-        float d = _readOnce();
-        if (d > 0) {
-            return d;
+    float raw = _readOnce();
+    
+    // --- Health monitoring ---
+    if (raw < 0) {
+        _consecutiveFails++;
+        if (_consecutiveFails >= FAIL_THRESHOLD) {
+            if (_health != SENSOR_FAILED) {
+                _health = SENSOR_FAILED;
+                Serial.printf("[SENSOR] Pin %d FAILED (%d consecutive failures)\n",
+                              _echoPin, _consecutiveFails);
+            }
+        } else if (_consecutiveFails >= 3) {
+            _health = SENSOR_DEGRADED;
         }
-        delayMicroseconds(200);  // Brief pause between retries
+        return -1.0f;  // Don't feed bad data into median
     }
-    return -1.0f;
+    
+    // Valid reading — check for stuck sensor (constant value)
+    if (fabs(raw - _lastValidReading) < STUCK_TOLERANCE) {
+        _stuckCount++;
+        if (_stuckCount >= STUCK_THRESHOLD) {
+            if (_health != SENSOR_FAILED) {
+                _health = SENSOR_FAILED;
+                Serial.printf("[SENSOR] Pin %d STUCK at %.1fcm (%d identical reads)\n",
+                              _echoPin, raw, _stuckCount);
+            }
+            return -1.0f;
+        }
+    } else {
+        _stuckCount = 0;
+    }
+    _lastValidReading = raw;
+    _consecutiveFails = 0;
+    if (_health == SENSOR_DEGRADED) _health = SENSOR_OK;
+    // Note: FAILED→OK recovery requires power cycle or begin() call
+    
+    // --- 3-sample median filter ---
+    _medianBuf[_medianIdx] = raw;
+    _medianIdx = (_medianIdx + 1) % 3;
+    if (!_medianFilled && _medianIdx == 0) _medianFilled = true;
+    
+    if (!_medianFilled) {
+        return raw;  // Not enough samples yet
+    }
+    return _median3(_medianBuf[0], _medianBuf[1], _medianBuf[2]);
 }
 
 bool UltrasonicSensor::obstacleDetected(float threshold) {

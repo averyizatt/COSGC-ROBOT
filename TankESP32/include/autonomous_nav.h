@@ -3,39 +3,57 @@
 
 #include <Arduino.h>
 
-// Navigation states
+// ==================== COSGC COMPETITION ROVER ====================
+// High-level autonomous navigation state machine
+//
+// States:
+//   CRUISE    → Normal forward driving, covering maximum ground
+//   AVOID     → 3-phase obstacle avoidance (backup → turn → verify)
+//   RECOVER   → Multi-phase stuck recovery (rock → diagonal → full reverse)
+//   HAZARD    → Steep incline handling (backup → turn → reattempt)
+//   STOPPED   → Motors off (initial / commanded stop)
+//
+// Design principles:
+//   - Each state has ONE job with clear entry/exit conditions
+//   - Sub-phases within states prevent oscillation
+//   - No decisions during timed actions (sequential execution)
+//   - Timeouts on every state prevent infinite loops
+//   - Clean transitions: only the state handler decides the next state
+
+// === Primary navigation states ===
 enum NavState {
-    NAV_FORWARD = 0,
-    NAV_FORWARD_SLOW,
-    NAV_BACKWARD,
-    NAV_TURN_LEFT,
-    NAV_TURN_RIGHT,
-    NAV_SCAN_LEFT,
-    NAV_SCAN_RIGHT,
-    NAV_ESCAPE,
-    NAV_RECOVERY,      // Terrain recovery sequence (sand/stuck)
-    NAV_STOPPED
+    NAV_CRUISE = 0,     // Forward driving — covering ground
+    NAV_AVOID,          // Obstacle avoidance sequence
+    NAV_RECOVER,        // Stuck recovery sequence
+    NAV_HAZARD,         // Steep incline handling
+    NAV_STOPPED         // Motors off
 };
 
-// Recovery sub-phases
+// === Avoidance sub-phases ===
+enum AvoidPhase {
+    AVOID_BACKUP = 0,   // Reversing away from obstacle
+    AVOID_TURN,         // Turning to clear direction
+    AVOID_VERIFY        // Brief forward to confirm path is clear
+};
+
+// === Recovery sub-phases ===
 enum RecoveryPhase {
-    RECOVERY_ROCK_FWD = 0,  // Rock forward pulse
-    RECOVERY_ROCK_REV,      // Rock backward pulse
-    RECOVERY_DIAGONAL_TURN, // Turn for diagonal approach
-    RECOVERY_DIAGONAL_FWD,  // Drive forward diagonally
-    RECOVERY_FULL_REVERSE,  // Full reverse escape
-    RECOVERY_DONE           // Recovery complete
+    RECOVERY_ROCK_FWD = 0,
+    RECOVERY_COAST,
+    RECOVERY_ROCK_REV,
+    RECOVERY_DIAGONAL_TURN,
+    RECOVERY_DIAGONAL_FWD,
+    RECOVERY_FULL_REVERSE,
+    RECOVERY_DONE
 };
 
-// Behavior modes
-enum NavBehavior {
-    BEHAVIOR_EXPLORE = 0,   // Reactive exploration (current system)
-    BEHAVIOR_WALL_FOLLOW,   // Follow walls on right side
-    BEHAVIOR_ESCAPE,        // Escape from stuck situation
-    BEHAVIOR_PATH_FOLLOW,   // Following planned path
-    BEHAVIOR_GOTO_GOAL      // Navigating to specific goal
+// === Hazard sub-phases ===
+enum HazardPhase {
+    HAZARD_BACKUP = 0,  // Reversing from incline
+    HAZARD_TURN         // Turning to try different angle
 };
 
+// Internal turn direction
 enum TurnDirection {
     TURN_LEFT = 0,
     TURN_RIGHT,
@@ -53,187 +71,195 @@ enum Orientation {
 };
 
 class AutonomousNav {
+    // Helper: slip/stall detection
+    bool isSlippingOrStalled();
+    // Odometry input (from encoders)
 public:
     AutonomousNav();
-    
-    // Update navigation based on distance reading
+
+    // Main update — call every loop iteration with front distance (cm)
     void update(float distance);
-    
-    // Set left/right ultrasonic distances for informed turn decisions
+
+    // Sensor inputs
     void setSideDistances(float leftDist, float rightDist);
-    
-    // Set wall angle from trig computation (degrees, +right, -left)
     void setWallAngle(float angle);
-    
-    // Update with IMU data (accelerometer + gyroscope)
     void updateIMU(float accelX, float accelY, float accelZ,
                    float gyroX = 0, float gyroY = 0, float gyroZ = 0);
+    void setEncoderSpeed(float speedCmPerSec);  // From hall effect encoders
+
+    // Odometry input (from encoders)
+    void setOdometry(float x, float y, float theta);
+    float odomX = 0, odomY = 0, odomTheta = 0;
+
+    // Waypoint navigation
+    void setNavTarget(float x_cm, float y_cm);
+    bool hasNavTarget = false;
+    float navTargetX = 0, navTargetY = 0;
+
+    // Command: return to start (origin)
+    void returnToStart();
+
+    // Pit detected externally — enter avoidance backup
+    void enterAvoidFromPit();
+
+    // Hill detected externally — enter avoidance backup
+    void enterAvoidFromHill();
+
+    // Minor terrain detected — maintain full speed to cross it
+    void enterTerrainBoost();
+    bool isTerrainBoostActive();
     
-    // Get current motor speeds for autonomous driving
+    // Terrain learning — check outcome after traversal attempt
+    void checkTerrainOutcome();
+
+    // Command: turn to absolute heading (radians, odometry frame)
+    void turnToHeading(float targetTheta);
+    bool turningToHeading = false;
+    float targetTurnTheta = 0;
+
+    // Motor output
     void getMotorSpeeds(int& leftSpeed, int& rightSpeed);
-    
-    // Reset navigation state
+
+    // Control
     void reset();
-    
-    // Get current state for debugging
-    NavState getState();
+
+    // State access for external emergency handling
+    NavState getCurrentState() { return currentState; }
+    void enterAvoid(bool critical);  // Trigger avoidance from outside (e.g. e-stop)
+
+    // Status
     const char* getStateString();
-    
-    // Set behavior mode
-    void setBehavior(NavBehavior behavior);
-    NavBehavior getBehavior();
-    
-    // Path following mode
-    void setTargetHeading(float heading);  // Set desired heading for path following
-    void clearTargetHeading();             // Return to reactive navigation
-    bool hasTargetHeading() { return useTargetHeading; }
-    
-    // Orientation info
+
+    // Orientation
     bool isUpsideDown();
     Orientation getOrientation();
-    float getPitch();  // Forward/back tilt in degrees
-    float getRoll();   // Left/right tilt in degrees
-    float getHeading(); // Estimated heading from gyro (0-360)
-    
+    float getPitch();
+    float getRoll();
+    float getHeading();
+
     // Terrain awareness
-    bool isMotionVerified();         // Whether IMU confirms actual movement
-    bool isOnSteepIncline();         // Whether pitch exceeds max climbable
-    RecoveryPhase getRecoveryPhase(); // Current recovery sub-phase
-    bool isRecentlyStuck();          // Whether adaptive ramp is active
-    bool isSendItActive();           // Whether anti-spin "send it" mode is active
+    bool isMotionVerified();
+    bool isRecentlyStuck();
 
 private:
+    // === STATE ===
     NavState currentState;
-    NavBehavior currentBehavior;
-    TurnDirection lastTurnDirection;
-    TurnDirection preferredDirection;
-    
-    // Path following
-    float targetHeading;
-    bool useTargetHeading;
-    
     unsigned long stateStartTime;
-    unsigned long stateDuration;
     unsigned long lastStateChange;
     
-    // Distance tracking
+    // === DISTANCE ===
     float lastDistance;
-    float distanceHistory[5];  // Rolling history for stuck detection
+    float distanceHistory[5];
     int historyIndex;
-    
-    // Stuck detection
     int stuckCounter;
-    unsigned long lastMovementTime;
-    float lastMovementDistance;
     
-    // Scan data for smart turning
-    float scanLeftDistance;
-    float scanRightDistance;
-    bool hasScannedLeft;
-    bool hasScannedRight;
-    
-    // Speed control
+    // === SPEED ===
     int currentSpeed;
     int targetSpeed;
     
-    // PID state for distance → speed control
-    float pidIntegral;
-    float pidLastError;
-    
-    // Stall detection
+    // === STALL ===
     unsigned long stallStartTime;
     
-    // Side distances from dual ultrasonics
+    // === ENCODER ===
+    float encoderSpeedCmS;  // Last reported encoder speed (cm/s)
+    
+    // === SENSORS ===
     float sideDistLeft;
     float sideDistRight;
-    float detectedWallAngle;  // Wall angle from trig (degrees)
+    float detectedWallAngle;
     
-    // IMU / Orientation
+    // === IMU ===
     bool upsideDown;
     Orientation currentOrientation;
-    float pitch;  // Forward/back tilt (degrees)
-    float roll;   // Left/right tilt (degrees)
+    float pitch, roll;
     float accelX, accelY, accelZ;
-    float gyroZ;  // Yaw rate (degrees/sec)
+    float gyroZ;
     bool imuAvailable;
     
-    // Heading tracking (gyro-integrated)
-    float heading;           // Current heading estimate (degrees, 0-360)
-    float headingAtObstacle; // Heading when we last hit an obstacle
+    // === HEADING / DEAD RECKONING ===
+    float heading;
+    float headingAtObstacle;
     unsigned long lastIMUUpdate;
+    float drX, drY;
+    unsigned long headingTowardStartSince;
     
-    // Turn tracking
-    float turnStartHeading;  // Heading when turn began
-    int consecutiveSameDirection;  // How many times we turned same way
-    int obstacleMemory[8];   // Obstacle counts in 8 compass directions (45° each)
+    // === HEADING HOLD (straight-line correction) ===
+    float cruiseHeading;        // Target heading locked when entering CRUISE
+    bool headingLocked;         // Whether cruiseHeading is valid
+    unsigned long cruiseEnteredAt; // When we entered CRUISE (for settle delay)
+    
+    // === TURN TRACKING ===
+    TurnDirection lastTurnDirection;
+    float turnStartHeading;
+    int consecutiveSameDirection;
+    int obstacleMemory[8];
     
     bool firstRun;
     
-    // === TERRAIN HANDLING ===
+    // === AVOIDANCE STATE ===
+    AvoidPhase avoidPhase;
+    TurnDirection avoidTurnDir;
+    int avoidAttempts;
+    unsigned long avoidPhaseStart;
+    unsigned long avoidPhaseDuration;
     
-    // IMU movement verification
-    float accelMagHistory[8];        // Rolling window of accel magnitudes
-    int accelMagIndex;               // Current index in window
-    bool accelMagFilled;             // Whether window has filled at least once
-    bool motionVerified;             // Whether IMU confirms actual movement
-    unsigned long noMotionStartTime; // When no-motion was first detected
+    // === HAZARD STATE ===
+    HazardPhase hazardPhase;
+    unsigned long hazardPhaseStart;
+    unsigned long hazardPhaseDuration;
+    int inclineAttempts;
+    unsigned long steepInclineStart;
+    bool onSteepIncline;
     
-    // Incline tracking
-    unsigned long steepInclineStart; // When pitch first exceeded max
-    bool onSteepIncline;             // Currently on an unclimbable slope
-    int inclineAttempts;             // How many diagonal attempts on this incline
+    // === TERRAIN / MOTION VERIFICATION ===
+    float accelMagHistory[8];
+    int accelMagIndex;
+    bool accelMagFilled;
+    bool motionVerified;
+    unsigned long noMotionStartTime;
     
-    // Recovery sequence
-    RecoveryPhase recoveryPhase;     // Current sub-phase of recovery
-    int rockCount;                   // How many rock cycles completed
-    unsigned long recoveryStepStart; // When current recovery step began
-    unsigned long recoveryStepDuration; // Duration of current step
-    TurnDirection recoveryTurnDir;   // Which way to turn for diagonal
+    // === RECOVERY STATE ===
+    RecoveryPhase recoveryPhase;
+    int rockCount;
+    unsigned long recoveryStepStart;
+    unsigned long recoveryStepDuration;
+    TurnDirection recoveryTurnDir;
+    bool coastAfterFwd;
     
-    // Adaptive torque ramp
-    bool recentlyStuck;              // Whether we recently recovered from stuck
-    unsigned long stuckRecoveryTime; // When we last completed a recovery
+    // === ADAPTIVE RAMP ===
+    bool recentlyStuck;
+    unsigned long stuckRecoveryTime;
+    unsigned long recoveryCooldownUntil;
     
-    // Anti-spin "Send It" mode
-    bool sendItActive;               // Whether send-it override is engaged
-    unsigned long sendItUntil;       // When send-it expires
-    int sendItTurnCount;             // Turns counted in current window
-    unsigned long sendItWindowStart; // When turn-counting window began
-    unsigned long sendItFwdStart;    // When sustained forward driving began
+    // === TERRAIN BOOST ===
+    bool terrainBoostActive;
+    unsigned long terrainBoostUntil;
+    int terrainBoostStartX;   // Grid position when boost started
+    int terrainBoostStartY;
+    bool terrainBoostStuck;   // Set if motion fails during boost
     
-    // Decision making
-    void makeDecision(float distance);
-    void handleExplore(float distance);
-    void handleWallFollow(float distance);
-    void handleEscape(float distance);
-    void handlePathFollow(float distance);  // Follow path planner heading
+    // === STATE HANDLERS ===
+    void handleCruise(float distance);
+    void handleAvoid(float distance);
+    void handleRecovery(float distance);
+    void handleHazard(float distance);
     
-    // State transitions
-    void setState(NavState newState, unsigned long duration = 0);
-    void setForward();
-    void setForwardSlow();
-    void setBackward(unsigned long duration = 800);
-    void setTurnLeft(unsigned long duration = 400);
-    void setTurnRight(unsigned long duration = 400);
-    void setScanLeft();
-    void setScanRight();
-    void setEscape();
+    // === STATE TRANSITIONS ===
+    void enterCruise();
+    void enterRecover();
+    void enterHazard();
     
-    // Terrain handling
-    void handleRecovery(float distance);   // Recovery sequence state machine
-    void startRecovery();                  // Enter recovery mode
-    void checkMotionVerification();        // Update motion verification from accel window
-    void checkIncline(float distance);     // Check for steep incline and handle
-    void flagRecentlyStuck();              // Enable adaptive ramp after recovery
+    // === TURN DECISIONS ===
+    TurnDirection pickTurnDirection(float distance);
+    TurnDirection getBestTurnDirection();
+    int getHeadingBin();
     
-    // Turn decision
-    void decideTurnDirection(float distance, unsigned long turnDuration = 500);
-    void smartTurn();
-    int getHeadingBin();  // Get compass direction (0-7)
-    TurnDirection getBestTurnDirection();  // IMU-informed turn decision
+    // === TERRAIN ===
+    void checkMotionVerification();
+    void startRecovery();
+    void flagRecentlyStuck();
     
-    // Helper functions
-    int randomDirection();
+    // === HELPERS ===
     bool isStuck();
     void updateDistanceHistory(float distance);
     int calculateSpeed(float distance);

@@ -3,6 +3,8 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_bt.h"
 #include "config.h"
 #include "motor_control.h"
 #include "ultrasonic_sensor.h"
@@ -12,11 +14,14 @@
 #include "button_handler.h"
 #include "led_controller.h"
 #include "autonomous_nav.h"
+#include "self_righting.h"
 #include "occupancy_map.h"
 #include "path_planner.h"
+#include "hall_encoder.h"
+#include "web_status.h" // Web server for status page
+#include "globals.h"
 
 // Create instances of all components
-MotorControl motors;
 UltrasonicSensor ultrasonicLeft(ULTRASONIC_TRIG, ULTRASONIC_ECHO);    // Left sensor (~15° left)
 UltrasonicSensor ultrasonicRight(ULTRASONIC2_TRIG, ULTRASONIC2_ECHO); // Right sensor (~15° right)
 MPU6050Sensor imu;
@@ -25,11 +30,9 @@ XboxController xbox;
 ButtonHandler button;
 LEDController led;
 AutonomousNav autoNav;
-OccupancyMap envMap;  // 2D occupancy grid map (25m x 25m)
+SelfRightingArm selfRighting;
 PathPlanner pathPlanner;  // Wavefront path planner
 
-// Operation mode
-uint8_t currentMode = MODE_UART_CONTROL;  // Start in UART mode
 
 // Timing variables
 unsigned long lastSensorUpdate = 0;
@@ -86,6 +89,8 @@ static void printResetReason() {
 }
 
 void setup() {
+    // Note: start Serial first so webserver setup can print status to serial
+    // (setupWebServer() is called after Serial.begin below)
     // Disable brownout detector — motor current spikes cause false resets
     // Method 1: Zero entire register (covers all ESP32 variants)
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
@@ -96,7 +101,7 @@ void setup() {
     Serial.begin(115200);
     delay(2000);  // Longer delay to ensure serial port is stable
     Serial.flush();  // Flush any pending serial data
-    Serial.println("\n\nESP32-S3 Rover Control System Starting...");
+    Serial.println("\n\nESP32 Rover Control System Starting...");
     Serial.println("[BOOT] Brownout detector disabled");
     printResetReason();
     
@@ -108,6 +113,10 @@ void setup() {
     Serial.println("Initializing LED...");
     led.begin();
     led.setMode(LED_SOLID_RED);  // Start with red (UART mode)
+    
+    // Initialize self-righting arm
+    Serial.println("Initializing self-righting arm...");
+    selfRighting.begin();
     
     // Initialize motor control
     Serial.println("Initializing motors...");
@@ -152,10 +161,23 @@ void setup() {
     // Set up UART callbacks
     uart.onMotorCommand(handleMotorCommand);
     uart.onCustomCommand(handleCustomCommand);
-    
-    // Initialize Xbox controller (Bluetooth)
-    Serial.println("Initializing Xbox controller support...");
-    xbox.begin();
+
+    // Kill Bluetooth FIRST to free ~60KB heap before WiFi/map allocation.
+    // Bluepad32's framework auto-starts BT during initArduino(), kill it now.
+    // BT will start only when switching to RC Control mode.
+    btStop();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();   // Release all BT memory
+    Serial.printf("Bluetooth fully released (heap free: %u)\n", ESP.getFreeHeap());
+
+    // Start WiFi AP while heap is clean (needs ~40-60KB contiguous)
+    Serial.println("Starting WiFi AP and web server...");
+    setupWebServer();
+    Serial.println("[WiFi] Web dashboard ready at http://192.168.4.1");
+
+    // Allocate occupancy map AFTER WiFi is up (80KB, ok with fragmented heap)
+    Serial.println("Initializing occupancy map...");
+    envMap.begin();
     
     // Initialize path planner with map
     Serial.println("Initializing path planner...");
@@ -218,36 +240,101 @@ void setup() {
         Serial.printf("  Total: %d device(s) found\n", devicesFound);
     }
     
-    // Motor test - simple forward/backward cycle
-    Serial.println("\n--- MOTOR TEST ---");
-    Serial.println("Forward 1s...");
-    motors.forward(200);
-    delay(1000);
-    
-    Serial.println("Backward 1s...");
-    motors.backward(200);
-    delay(1000);
-    
-    motors.stop();
-    Serial.println("========== DIAGNOSTIC TEST COMPLETE ==========");
+    // Motor speed calibration — measure m/s at two PWM levels
+    // Sequence: FWD max → pause → BACK max → pause → FWD half → pause → BACK half
+    // Each phase 5s drive + 5s pause. Mark a start line and measure distance.
+    #ifdef DEBUG_MOTORS
+    {
+        const int HALF_PWM = MAX_PWM / 2;   // ~128 PWM
+        const unsigned long DRIVE_MS = 5000;
+        const unsigned long PAUSE_MS = 5000;
+        
+        Serial.println("\n========== SPEED CALIBRATION TEST ==========");
+        Serial.printf("  MAX_PWM = %d, HALF_PWM = %d\n", MAX_PWM, HALF_PWM);
+        Serial.println("  Each phase: 5s drive, 5s pause");
+        Serial.println("  Place robot on ground at a marked line.\n");
+        
+        // --- Phase 1: FORWARD at MAX_PWM ---
+        Serial.printf("[CAL] Phase 1: FORWARD %d PWM for 5s...\n", MAX_PWM);
+        {
+            unsigned long start = millis();
+            while (millis() - start < DRIVE_MS) {
+                motors.forward(MAX_PWM);
+                delay(SLEW_INTERVAL_MS);
+            }
+        }
+        motors.stop();
+        Serial.println("[CAL] Phase 1 DONE — measure distance from start");
+        delay(PAUSE_MS);
+        
+        // --- Phase 2: BACKWARD at MAX_PWM ---
+        Serial.printf("[CAL] Phase 2: BACKWARD %d PWM for 5s...\n", MAX_PWM);
+        {
+            unsigned long start = millis();
+            while (millis() - start < DRIVE_MS) {
+                motors.backward(MAX_PWM);
+                delay(SLEW_INTERVAL_MS);
+            }
+        }
+        motors.stop();
+        Serial.println("[CAL] Phase 2 DONE — measure distance");
+        delay(PAUSE_MS);
+        
+        // --- Phase 3: FORWARD at HALF_PWM ---
+        Serial.printf("[CAL] Phase 3: FORWARD %d PWM for 5s...\n", HALF_PWM);
+        {
+            unsigned long start = millis();
+            while (millis() - start < DRIVE_MS) {
+                motors.forward(HALF_PWM);
+                delay(SLEW_INTERVAL_MS);
+            }
+        }
+        motors.stop();
+        Serial.println("[CAL] Phase 3 DONE — measure distance");
+        delay(PAUSE_MS);
+        
+        // --- Phase 4: BACKWARD at HALF_PWM ---
+        Serial.printf("[CAL] Phase 4: BACKWARD %d PWM for 5s...\n", HALF_PWM);
+        {
+            unsigned long start = millis();
+            while (millis() - start < DRIVE_MS) {
+                motors.backward(HALF_PWM);
+                delay(SLEW_INTERVAL_MS);
+            }
+        }
+        motors.stop();
+        Serial.println("[CAL] Phase 4 DONE — measure distance");
+        
+        Serial.println("\n========== CALIBRATION COMPLETE ==========");
+        Serial.println("  m/s = distance(m) / 5.0  for each phase");
+        Serial.println("  Record: MAX fwd, MAX back, HALF fwd, HALF back\n");
+    }
+    #endif  // DEBUG_MOTORS
     
     // Send initial status
     uart.sendStatus("READY");
+    
+    // Initialize hall effect encoders
+    encoders.begin();
     
     Serial.println("\n*** SETUP COMPLETE - ENTERING MAIN LOOP ***\n");
 }
 
 void loop() {
+    // Web server is async — no handleClient() needed
     static unsigned long loopCount = 0;
     static unsigned long lastHeartbeat = 0;
     unsigned long currentMillis = millis();
-    
+
     loopCount++;
-    
-    // Print heartbeat every 5 seconds to prove loop is running
-    if (currentMillis - lastHeartbeat >= 5000) {
+
+    // Safety check FIRST — thermal, watchdog, duty cycle
+    motors.safetyCheck();
+
+    // Print heartbeat every 30 seconds (reduced from 5s to cut serial load)
+    if (currentMillis - lastHeartbeat >= 30000) {
         lastHeartbeat = currentMillis;
-        Serial.printf("[HEARTBEAT] Loop running - count: %lu, millis: %lu\n", loopCount, currentMillis);
+        Serial.printf("[HEARTBEAT] Loop count: %lu, uptime: %lus\n", loopCount, currentMillis / 1000);
     }
     
     // Check for serial commands (path planner control)
@@ -328,9 +415,15 @@ void loop() {
     if (currentMillis - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
         lastSensorUpdate = currentMillis;
         updateSensors();
+        // Feed IMU forward acceleration to encoder before update (for complementary filter)
+        if (IMU_ENABLED) {
+            encoders.setForwardAccel(sensorData.accelX);
+        }
+        encoders.update();  // Compute speed/distance from pulse counts
     }
 
-    // Raw ultrasonic debug print every 500ms (uses values from updateSensors, no extra reads)
+    // Raw ultrasonic debug print (gated behind DEBUG_SENSORS to avoid serial overhead)
+    #ifdef DEBUG_SENSORS
     {
         static unsigned long lastUsPrint = 0;
         if (currentMillis - lastUsPrint >= 500) {
@@ -339,6 +432,7 @@ void loop() {
                           lastRawLeft, lastRawRight, sensorData.distanceLeft, sensorData.distanceRight);
         }
     }
+    #endif
 
     // Print telemetry every 10 seconds
     if (currentMillis - lastTelemetryPrint >= TELEMETRY_PRINT_INTERVAL) {
@@ -380,33 +474,46 @@ void loop() {
         }
     }
     
-    // Small delay to prevent watchdog issues
-    delay(1);
+    // Yield to RTOS — reduces CPU heat while keeping responsive timing
+    // All timed work uses millis() checks, so 10ms sleep is fine
+    delay(10);
 }
 
 void updateSensors() {
-    // Read both ultrasonic sensors — use raw values directly, skip invalid reads
+    // Read ultrasonic sensors — ALTERNATE between left and right each cycle
+    // to halve the worst-case blocking time (~12ms max per sensor per cycle
+    // instead of ~24ms for both). Each sensor still updates at 10Hz.
     static float lastGoodLeft = 30.0f;
     static float lastGoodRight = 30.0f;
+    static bool readLeftThisCycle = true;
     
-    // Read left sensor
-    float rawLeft = ultrasonicLeft.readDistance();
-    lastRawLeft = rawLeft;  // Store for debug print
-    if (rawLeft >= 2.0f && rawLeft <= 400.0f) {
-        lastGoodLeft = rawLeft;
+    bool leftHealthy = ultrasonicLeft.isHealthy();
+    bool rightHealthy = ultrasonicRight.isHealthy();
+    
+    if (readLeftThisCycle) {
+        float rawLeft = ultrasonicLeft.readDistance();
+        lastRawLeft = rawLeft;
+        if (rawLeft >= 2.0f && rawLeft <= (float)MAX_DISTANCE) {
+            lastGoodLeft = rawLeft;
+        }
+    } else {
+        float rawRight = ultrasonicRight.readDistance();
+        lastRawRight = rawRight;
+        if (rawRight >= 2.0f && rawRight <= (float)MAX_DISTANCE) {
+            lastGoodRight = rawRight;
+        }
     }
+    readLeftThisCycle = !readLeftThisCycle;
+    
     sensorData.distanceLeft = lastGoodLeft;
-    
-    // Small delay to avoid echo crosstalk between sensors
-    delayMicroseconds(500);
-    
-    // Read right sensor
-    float rawRight = ultrasonicRight.readDistance();
-    lastRawRight = rawRight;  // Store for debug print
-    if (rawRight >= 2.0f && rawRight <= 400.0f) {
-        lastGoodRight = rawRight;
-    }
     sensorData.distanceRight = lastGoodRight;
+    
+    // Sensor failure fallback: if one sensor failed, use the other exclusively
+    if (!leftHealthy && rightHealthy) {
+        sensorData.distanceLeft = lastGoodRight;  // Mirror healthy sensor
+    } else if (!rightHealthy && leftHealthy) {
+        sensorData.distanceRight = lastGoodLeft;  // Mirror healthy sensor
+    }
     
     // Effective forward distance = minimum of both sensors (conservative)
     sensorData.distance = min(sensorData.distanceLeft, sensorData.distanceRight);
@@ -473,9 +580,63 @@ void updateSensors() {
         
         // TANK MODE: Detect upside-down and tell motor controller
         // AccelZ < threshold means gravity is pulling "up" relative to the board
-        // This works for ALL control modes (UART, Xbox, Autonomous)
-        bool isFlipped = (sensorData.accelZ < UPSIDE_DOWN_THRESHOLD);
+        // Debounce: must be sustained for 500ms to avoid false triggers from vibration
+        static unsigned long flipDetectStart = 0;
+        static bool confirmedFlipped = false;
+        bool rawFlipped = (sensorData.accelZ < UPSIDE_DOWN_THRESHOLD);
+        
+        if (rawFlipped) {
+            if (flipDetectStart == 0) {
+                flipDetectStart = millis();
+            } else if (millis() - flipDetectStart > 500) {
+                confirmedFlipped = true;
+            }
+        } else {
+            flipDetectStart = 0;
+            // Require sustained upright to clear (200ms)
+            static unsigned long uprightStart = 0;
+            if (uprightStart == 0) {
+                uprightStart = millis();
+            } else if (millis() - uprightStart > 200) {
+                confirmedFlipped = false;
+                uprightStart = 0;
+            }
+        }
+        
+        bool isFlipped = confirmedFlipped;
         motors.setUpsideDown(isFlipped);
+        
+        // Detect "on side" state using roll angle
+        // Roll = rotation around forward axis; large roll = rover tipped onto its side
+        float imuRoll = atan2(sensorData.accelY, sensorData.accelZ) * 180.0f / PI;
+        static unsigned long sideDetectStart = 0;
+        static bool confirmedOnSide = false;
+        bool rawOnSide = (fabs(imuRoll) > ON_SIDE_ROLL_THRESHOLD);
+        
+        if (rawOnSide && !isFlipped) {
+            if (sideDetectStart == 0) {
+                sideDetectStart = millis();
+            } else if (millis() - sideDetectStart > 500) {
+                confirmedOnSide = true;
+            }
+        } else {
+            sideDetectStart = 0;
+            static unsigned long sideUprightStart = 0;
+            if (confirmedOnSide) {
+                if (sideUprightStart == 0) {
+                    sideUprightStart = millis();
+                } else if (millis() - sideUprightStart > 200) {
+                    confirmedOnSide = false;
+                    sideUprightStart = 0;
+                }
+            }
+        }
+        
+        // Self-righting arm: handle upside-down, on-side, or normal
+        selfRighting.update(isFlipped, confirmedOnSide, imuRoll);
+        
+        // Motors run during both righting and unsticking — helps the arm flip/free the robot.
+        // The upside-down motor inversion in setMotors() already handles direction.
     }
     
     // Debug output (optional)
@@ -497,6 +658,9 @@ void printTelemetry() {
     Serial.printf("Distance: %.2f cm\n", sensorData.distance);
     Serial.printf("Motor Speed A: %d\n", lastMotorSpeedA);
     Serial.printf("Motor Speed B: %d\n", lastMotorSpeedB);
+    Serial.printf("ESP32 Temp: %.1f°C%s%s\n", motors.getESPTemperature(),
+                  motors.isThermalThrottled() ? " [THROTTLED]" : "",
+                  motors.isDutyCycleThrottled() ? " [DUTY-LIM]" : "");
     Serial.printf("Mode: %s\n",
                   currentMode == MODE_RC_CONTROL ? "RC Control" :
                   currentMode == MODE_UART_CONTROL ? "UART Control" :
@@ -504,7 +668,11 @@ void printTelemetry() {
     if (IMU_ENABLED) {
         Serial.printf("Orientation: %s\n", motors.isUpsideDown() ? "UPSIDE DOWN" : "Right-side up");
     }
-    Serial.println("===============================\n");
+    Serial.println("===============================");
+    if (!motors.isMotorsAllowed()) {
+        Serial.println("*** MOTORS DISABLED (safety) ***");
+    }
+    Serial.println();
 }
 
 void handleButtonPress() {
@@ -512,15 +680,22 @@ void handleButtonPress() {
     
     if (event == BUTTON_SHORT_PRESS) {
         // Short press - start Bluetooth pairing
-        Serial.println("\n*** BUTTON SHORT PRESS - Starting Bluetooth pairing ***");
-        xbox.startPairing();
-        led.setMode(LED_BLINK_BLUE_FAST);
+        // Short press — BT pairing only makes sense in RC mode
+        if (currentMode == MODE_RC_CONTROL) {
+            Serial.println("\n*** BUTTON SHORT PRESS - Starting Bluetooth pairing ***");
+            xbox.startPairing();
+            led.setMode(LED_BLINK_BLUE_FAST);
+        } else {
+            Serial.println("\n*** BUTTON SHORT PRESS - (pairing only works in RC mode) ***");
+        }
     }
     else if (event == BUTTON_LONG_PRESS) {
         // Long press - cycle through modes
         motors.stop();  // Stop motors when switching modes
         lastMotorSpeedA = 0;
         lastMotorSpeedB = 0;
+
+        uint8_t prevMode = currentMode;
         
         // Cycle: UART -> RC -> Autonomous -> Simple Auto -> UART
         if (currentMode == MODE_UART_CONTROL) {
@@ -551,6 +726,23 @@ void handleButtonPress() {
             Serial.println("\n========================================");
             Serial.println("MODE SWITCHED TO: UART CONTROL");
             Serial.println("========================================\n");
+        }
+
+        // --- Toggle WiFi / Bluetooth based on mode ---
+        if (currentMode == MODE_RC_CONTROL && prevMode != MODE_RC_CONTROL) {
+            // Entering RC mode: shut down WiFi, start Bluetooth
+            stopWiFi();
+            delay(200);
+            xbox.start();  // Calls begin() first time, btStart() after
+            delay(200);
+            Serial.println("[RADIO] WiFi OFF, Bluetooth ON");
+        } else if (currentMode != MODE_RC_CONTROL && prevMode == MODE_RC_CONTROL) {
+            // Leaving RC mode: shut down Bluetooth, start WiFi
+            xbox.stop();   // btStop()
+            delay(200);
+            startWiFi();
+            delay(200);
+            Serial.println("[RADIO] Bluetooth OFF, WiFi ON");
         }
         
         updateModeIndicator();
@@ -607,20 +799,31 @@ void handleXboxControl() {
         int leftSpeed, rightSpeed;
         xbox.getMotorSpeeds(leftSpeed, rightSpeed);
         
-        // Only update motors if speeds have changed significantly
-        static int lastLeftSpeed = 0;
-        static int lastRightSpeed = 0;
+        // Always write motor commands — no dedup filtering
+        motors.setMotors(leftSpeed, rightSpeed);
+        lastMotorSpeedA = leftSpeed;
+        lastMotorSpeedB = rightSpeed;
         
-        if (abs(leftSpeed - lastLeftSpeed) > 5 || abs(rightSpeed - lastRightSpeed) > 5) {
-            motors.setMotors(leftSpeed, rightSpeed);
-            lastMotorSpeedA = leftSpeed;
-            lastMotorSpeedB = rightSpeed;
-            lastLeftSpeed = leftSpeed;
-            lastRightSpeed = rightSpeed;
-            
-            #ifdef DEBUG_XBOX
-            Serial.printf("Xbox Control - Left: %d, Right: %d\n", leftSpeed, rightSpeed);
-            #endif
+        // === SERVO CONTROL: RT = forward (0→180), LT = reverse (180→0) ===
+        int rt = xbox.getRightTrigger();  // 0-1023
+        int lt = xbox.getLeftTrigger();   // 0-1023
+        if (rt > 20) {  // RT pressed: sweep 0→180
+            int angle = map(rt, 20, 1023, 0, 180);
+            selfRighting.setAngle(angle);
+        } else if (lt > 20) {  // LT pressed: sweep 180→0 (reverse)
+            int angle = map(lt, 20, 1023, 180, 0);
+            selfRighting.setAngle(angle);
+        } else {
+            selfRighting.stow();  // Both released = stow servo
+        }
+        
+        // Debug: print motor commands every 500ms
+        static unsigned long lastRcDbg = 0;
+        if (millis() - lastRcDbg > 500 && (leftSpeed != 0 || rightSpeed != 0)) {
+            lastRcDbg = millis();
+            Serial.printf("[RC] stick_Y=%d stick_X=%d → ML:%d MR:%d\n",
+                          xbox.getLeftStickY(), xbox.getRightStickX(),
+                          leftSpeed, rightSpeed);
         }
     } else {
         // No controller connected - only stop once
@@ -648,12 +851,21 @@ void handleMotorCommand(int speedA, int speedB) {
 }
 
 void handleAutonomousMode() {
-    static unsigned long lastMapUpdate = 0;
-    static unsigned long lastMapPrint = 0;
-    static unsigned long lastPlannerKick = 0;
-    
     // Get current distance from ultrasonic sensor
     float distance = sensorData.distance;
+
+    // === EMERGENCY HARD STOP ===
+    // If critically close, force the nav state machine into AVOID immediately
+    // so the backup is handled as a timed action (not an infinite reverse loop).
+    // Only trigger if we are NOT already in AVOID/RECOVER state.
+    if (distance > 2.0f && distance < 15.0f) {
+        NavState ns = autoNav.getCurrentState();
+        if (ns != NAV_AVOID && ns != NAV_RECOVER) {
+            Serial.printf("[AUTO] EMERGENCY STOP %.0fcm\n", distance);
+            autoNav.enterAvoid(true);  // critical=true → shorter backup, then turn
+        }
+        // Still fall through so the state machine can execute the backup
+    }
     
     // Update IMU data for orientation detection
     #if IMU_ENABLED
@@ -661,44 +873,217 @@ void handleAutonomousMode() {
                       sensorData.gyroX, sensorData.gyroY, sensorData.gyroZ);
     #endif
     
-    // Get motor speeds - will be calculated after path planner update
     int leftSpeed, rightSpeed;
-    
-    // Update occupancy map first
     unsigned long now = millis();
-    float deltaTime = (now - lastMapUpdate) / 1000.0f;
-    
-    // Get heading from gyro-integrated estimate in autoNav
-    #if IMU_ENABLED
-    float heading = autoNav.getHeading();
-    #else
-    float heading = 0;  // No IMU = can't track heading accurately
-    #endif
-    
-    if (lastMapUpdate > 0 && deltaTime < 1.0f) {
-        // Use last frame's motor speeds for position estimation
-        float avgSpeed = (abs(lastMotorSpeedA) + abs(lastMotorSpeedB)) / 2.0f;
-        float speedPercent = (avgSpeed / 255.0f) * 100.0f;
-        
-        // Negative if going backwards
-        if (lastMotorSpeedA < 0 && lastMotorSpeedB < 0) {
-            speedPercent = -speedPercent;
-        }
-        
-        // Update robot position on map
-        envMap.updatePosition(heading, speedPercent, deltaTime);
-        
-        // Add ultrasonic reading to map
-        envMap.addReading(distance, heading);
-    }
-    lastMapUpdate = now;
-    
-    // UPDATE PATH PLANNER - disabled, reactive nav works better
-    autoNav.clearTargetHeading();
     
     // Pass side distances and wall angle for informed turn decisions
     autoNav.setSideDistances(sensorData.distanceLeft, sensorData.distanceRight);
     autoNav.setWallAngle(sensorData.wallAngle);
+    
+    // Feed fused encoder+IMU speed for dead-reckoning
+    autoNav.setEncoderSpeed(encoders.getFusedSpeed());
+    // Feed odometry (x, y, theta) for localization
+    float x = encoders.getX();
+    float y = encoders.getY();
+    float th = encoders.getTheta();
+    autoNav.setOdometry(x, y, th);
+    // Update map with odometry
+    envMap.setOdometryPosition(x, y, th);
+    
+    // Feed ultrasonic readings into the occupancy map for ray-traced cell identification
+    // Front sensor along heading, left at -15°, right at +15°
+    float mapHeading = autoNav.getHeading();
+    if (distance >= 2.0f && distance <= 400.0f) {
+        envMap.addReading(distance, mapHeading);
+    }
+    if (sensorData.distanceLeft >= 2.0f && sensorData.distanceLeft <= 400.0f) {
+        envMap.addReading(sensorData.distanceLeft, mapHeading - 15.0f);
+    }
+    if (sensorData.distanceRight >= 2.0f && sensorData.distanceRight <= 400.0f) {
+        envMap.addReading(sensorData.distanceRight, mapHeading + 15.0f);
+    }
+    
+    // === PIT DETECTION ===
+    // Two signals: (1) sudden distance jump (sensor looks into void beyond ground)
+    //              (2) negative pitch (rover nose tilting down into a pit)
+    {
+        static float prevDistLeft = 0.0f;
+        static float prevDistRight = 0.0f;
+        static unsigned long pitPitchStart = 0;
+        
+        float dL = sensorData.distanceLeft;
+        float dR = sensorData.distanceRight;
+        bool pitDetected = false;
+        bool pitMajor = false;   // true = deep/dangerous, false = shallow/traversable
+        float pitHeading = mapHeading;
+        float pitDist = distance;
+        float pitJump = 0.0f;    // Track largest distance jump for severity
+        
+        // Signal 1: Ultrasonic distance jump — ground dropped away
+        // Previous reading was short (reflecting ground/wall), now suddenly long
+        if (prevDistLeft > 2.0f && prevDistLeft < 100.0f &&
+            dL > prevDistLeft + PIT_DIST_JUMP_CM) {
+            float jump = dL - prevDistLeft;
+            pitDetected = true;
+            pitHeading = mapHeading - 15.0f;
+            pitDist = prevDistLeft;
+            if (jump > pitJump) pitJump = jump;
+            Serial.printf("[PIT] Left sensor jump: %.0f→%.0fcm (Δ%.0f)\n", prevDistLeft, dL, jump);
+        }
+        if (prevDistRight > 2.0f && prevDistRight < 100.0f &&
+            dR > prevDistRight + PIT_DIST_JUMP_CM) {
+            float jump = dR - prevDistRight;
+            pitDetected = true;
+            pitHeading = mapHeading + 15.0f;
+            pitDist = prevDistRight;
+            if (jump > pitJump) pitJump = jump;
+            Serial.printf("[PIT] Right sensor jump: %.0f→%.0fcm (Δ%.0f)\n", prevDistRight, dR, jump);
+        }
+        
+        prevDistLeft = dL;
+        prevDistRight = dR;
+        
+        // Signal 2: Sustained negative pitch (tilting forward into a pit)
+        #if IMU_ENABLED
+        float navPitch = autoNav.getPitch();
+        if (navPitch < PIT_PITCH_THRESHOLD) {
+            if (pitPitchStart == 0) {
+                pitPitchStart = now;
+            } else if (now - pitPitchStart > PIT_PITCH_SUSTAIN_MS) {
+                pitDetected = true;
+                pitDist = distance > 5.0f ? distance : 20.0f;
+                Serial.printf("[PIT] Negative pitch %.1f° sustained → pit ahead\n", navPitch);
+                pitPitchStart = 0;  // Reset after marking
+            }
+        } else {
+            pitPitchStart = 0;
+        }
+        #endif
+        
+        // Classify severity: major if steep pitch OR large distance jump
+        if (pitDetected) {
+            float absPitch = fabs(autoNav.getPitch());
+            pitMajor = (absPitch >= TERRAIN_MINOR_PITCH) ||
+                       (pitJump >= TERRAIN_MINOR_PIT_JUMP_CM);
+        }
+        
+        // React based on severity
+        if (pitDetected && pitMajor) {
+            // Major pit → mark on map + avoid (backup + turn)
+            envMap.markPitAhead(pitHeading, pitDist);
+            autoNav.enterAvoidFromPit();
+            Serial.println("[PIT] MAJOR → AVOID");
+        } else if (pitDetected) {
+            // Minor pit → maintain speed and drive through
+            autoNav.enterTerrainBoost();
+            Serial.printf("[PIT] MINOR (pitch=%.1f° jump=%.0fcm) → TRAVERSE\n",
+                          autoNav.getPitch(), pitJump);
+        }
+    }
+    
+    // === HILL DETECTION ===
+    // Mirror of pit detection: (1) distance *decrease* (hitting slope face)
+    //                          (2) positive pitch (rover tilting back climbing)
+    // Uses pitch + distance to estimate terrain height via trigonometry
+    {
+        static float prevDistLeftH = 0.0f;
+        static float prevDistRightH = 0.0f;
+        static unsigned long hillPitchStart = 0;
+        
+        float dL = sensorData.distanceLeft;
+        float dR = sensorData.distanceRight;
+        bool hillDetected = false;
+        float hillDist = distance;
+        float maxHeightCm = 0.0f;  // Track max estimated height for severity
+        
+        // Signal 1: Ultrasonic distance drop — beam hitting a rising slope
+        // Previous reading was long (flat ground), now suddenly short (slope face)
+        if (prevDistLeftH > 50.0f && prevDistLeftH < 400.0f &&
+            dL < prevDistLeftH - HILL_DIST_DROP_CM && dL > 2.0f) {
+            float pitchRad = autoNav.getPitch() * PI / 180.0f;
+            float heightCm = dL * sin(fabs(pitchRad)) + SENSOR_HEIGHT_CM;
+            hillDetected = true;
+            hillDist = dL;
+            if (heightCm > maxHeightCm) maxHeightCm = heightCm;
+            Serial.printf("[HILL] Left sensor drop: %.0f→%.0fcm, est height %.0fcm\n",
+                          prevDistLeftH, dL, heightCm);
+        }
+        if (prevDistRightH > 50.0f && prevDistRightH < 400.0f &&
+            dR < prevDistRightH - HILL_DIST_DROP_CM && dR > 2.0f) {
+            float pitchRad = autoNav.getPitch() * PI / 180.0f;
+            float heightCm = dR * sin(fabs(pitchRad)) + SENSOR_HEIGHT_CM;
+            hillDetected = true;
+            hillDist = dR;
+            if (heightCm > maxHeightCm) maxHeightCm = heightCm;
+            Serial.printf("[HILL] Right sensor drop: %.0f→%.0fcm, est height %.0fcm\n",
+                          prevDistRightH, dR, heightCm);
+        }
+        
+        prevDistLeftH = dL;
+        prevDistRightH = dR;
+        
+        // Signal 2: Sustained positive pitch (climbing)
+        #if IMU_ENABLED
+        float navPitch = autoNav.getPitch();
+        if (navPitch > HILL_PITCH_THRESHOLD) {
+            if (hillPitchStart == 0) {
+                hillPitchStart = now;
+            } else if (now - hillPitchStart > HILL_PITCH_SUSTAIN_MS) {
+                float pitchRad = navPitch * PI / 180.0f;
+                float heightCm = distance * sin(pitchRad) + SENSOR_HEIGHT_CM;
+                hillDetected = true;
+                if (heightCm > maxHeightCm) maxHeightCm = heightCm;
+                Serial.printf("[HILL] Positive pitch %.1f° sustained, est height %.0fcm\n",
+                              navPitch, heightCm);
+                hillPitchStart = 0;  // Reset after marking
+            }
+        } else {
+            hillPitchStart = 0;
+        }
+        #endif
+        
+        // Classify severity: major if steep pitch OR tall estimated height
+        bool hillMajor = false;
+        if (hillDetected) {
+            float absPitch = fabs(autoNav.getPitch());
+            hillMajor = (absPitch >= TERRAIN_MINOR_PITCH) ||
+                        (maxHeightCm >= TERRAIN_MINOR_HEIGHT_CM);
+        }
+        
+        // React based on severity
+        if (hillDetected && hillMajor) {
+            // Major hill → mark on map + avoid (backup + turn)
+            envMap.markHillAhead(hillDist < distance ? mapHeading : mapHeading,
+                                hillDist > 5.0f ? hillDist : 20.0f, maxHeightCm);
+            autoNav.enterAvoidFromHill();
+            Serial.printf("[HILL] MAJOR (pitch=%.1f° height=%.0fcm) → AVOID\n",
+                          autoNav.getPitch(), maxHeightCm);
+        } else if (hillDetected) {
+            // Minor hill → maintain speed and drive over it
+            autoNav.enterTerrainBoost();
+            Serial.printf("[HILL] MINOR (pitch=%.1f° height=%.0fcm) → TRAVERSE\n",
+                          autoNav.getPitch(), maxHeightCm);
+        }
+    }
+    
+    // === PATH PLANNER INTEGRATION ===
+    // If the planner has a mode (explore, return home, goto goal), run it
+    // and feed waypoints into autoNav for obstacle-aware path following
+    if (pathPlanner.getMode() != PLANNER_IDLE) {
+        int rx = envMap.getRobotX();
+        int ry = envMap.getRobotY();
+        float plannerHeading = pathPlanner.update(rx, ry, autoNav.getHeading());
+        
+        // If planner has a valid waypoint, set it as nav target (in cm from origin)
+        int wpX, wpY;
+        if (pathPlanner.getCurrentWaypoint(wpX, wpY)) {
+            float targetX_cm = (wpX - MAP_CENTER_X) * CELL_SIZE_CM;
+            float targetY_cm = (wpY - MAP_CENTER_Y) * CELL_SIZE_CM;
+            autoNav.setNavTarget(targetX_cm, targetY_cm);
+        } else if (pathPlanner.isGoalReached()) {
+            autoNav.hasNavTarget = false;
+        }
+    }
     
     // Update autonomous navigation logic
     autoNav.update(distance);
@@ -711,32 +1096,35 @@ void handleAutonomousMode() {
     lastMotorSpeedA = leftSpeed;
     lastMotorSpeedB = rightSpeed;
     
-    // Debug output every 500ms
+    // Servo only activates via selfRighting.update(isFlipped) for upside-down/on-side
+    
+    // Debug output every 2s
     static unsigned long lastDebug = 0;
-    if (millis() - lastDebug > 500) {
+    if (millis() - lastDebug > 2000) {
+        float x = encoders.getX();
+        float y = encoders.getY();
+        float th = encoders.getTheta();
+        float lspd = encoders.getLeftSpeed();
+        float rspd = encoders.getRightSpeed();
+        float ldist = encoders.getLeftDistance();
+        float rdist = encoders.getRightDistance();
+        Serial.printf("[ODOM] x=%.1fcm y=%.1fcm th=%.2frad | Lspd=%.1f Rspd=%.1f | Ldist=%.1f Rdist=%.1f\n",
+            x, y, th, lspd, rspd, ldist, rdist);
         #if IMU_ENABLED
         const char* orientStr = 
             autoNav.isUpsideDown() ? "FLIPPED" :
-            autoNav.isOnSteepIncline() ? "STEEP" :
             (abs(autoNav.getPitch()) > 15 || abs(autoNav.getRoll()) > 15) ? "TILTED" : "OK";
-        Serial.printf("[AUTO] %s | Fwd:%.0f L:%.0f R:%.0f | Wall:%.0f° | ML:%d MR:%d | %s%s%s%s\n", 
+        Serial.printf("[AUTO] %s | Fwd:%.0f L:%.0f R:%.0f | Wall:%.0f° | ML:%d MR:%d | %s%s%s\n", 
                       autoNav.getStateString(), distance, sensorData.distanceLeft, sensorData.distanceRight,
                       sensorData.wallAngle, leftSpeed, rightSpeed, orientStr,
                       autoNav.isMotionVerified() ? "" : " NO-MOTION",
-                      autoNav.isRecentlyStuck() ? " SOFT-RAMP" : "",
-                      autoNav.isSendItActive() ? " SEND-IT" : "");
+                      autoNav.isRecentlyStuck() ? " SOFT-RAMP" : "");
         #else
         Serial.printf("[AUTO] %s | Fwd:%.0f L:%.0f R:%.0f | Wall:%.0f° | ML:%d MR:%d\n", 
                       autoNav.getStateString(), distance, sensorData.distanceLeft, sensorData.distanceRight,
                       sensorData.wallAngle, leftSpeed, rightSpeed);
         #endif
         lastDebug = millis();
-    }
-    
-    // Print map periodically
-    if (now - lastMapPrint > MAP_PRINT_INTERVAL) {
-        envMap.printMap();
-        lastMapPrint = now;
     }
 }
 
@@ -762,10 +1150,20 @@ void handleSimpleAutonomousMode() {
     static bool simpleRecentlyStuck = false;
     static unsigned long simpleStuckTime = 0;
     // Recovery sub-state
-    static int recoveryStep = 0;   // 0=rock_fwd,1=rock_rev,2=diag_turn,3=diag_fwd,4=full_rev
+    // Steps: 0=rock_fwd, 1=coast, 2=rock_rev, 3=coast, 4=diag_turn, 5=diag_fwd, 6=full_rev
+    static int recoveryStep = 0;
     static int rockCycles = 0;
     static unsigned long recoveryUntil = 0;
     static int recoveryTurnDir = 0; // 0=right, 1=left
+    static unsigned long simpleRecoveryCooldownUntil = 0;  // Post-recovery cooldown
+    static float simpleLastDist = 999.0f;  // Track distance changes for stuck verify
+    
+    // === DEAD RECKONING: Track position relative to start ===
+    // Simple estimate: integrate heading (from gyro) and speed to get (x, y)
+    // Used to bias turn decisions AWAY from starting point
+    static float drX = 0.0f;           // Estimated X position (cm, right = +)
+    static float drY = 0.0f;           // Estimated Y position (cm, forward = +)
+    static float drHeading = 0.0f;     // Heading in degrees (0 = initial forward)
     
     // Anti-spin "Send It" tracking
     static bool simpleSendItActive = false;
@@ -773,6 +1171,14 @@ void handleSimpleAutonomousMode() {
     static int simpleSendItTurnCount = 0;
     static unsigned long simpleSendItWindowStart = 0;
     static unsigned long simpleSendItFwdStart = 0;
+    
+    // Dead-reckoning heading correction tracking
+    static unsigned long simpleHeadingTowardStart = 0;  // When started heading toward start
+    
+    // Heading-hold straight-line correction
+    static float simpleCruiseHeading = 0.0f;   // Locked heading target
+    static bool simpleHeadingLocked = false;    // Whether heading is locked
+    static unsigned long simplePhase0EnteredAt = 0; // When we last entered phase 0
 
     // PID gains
     const float KP = 5.0f;
@@ -783,12 +1189,12 @@ void handleSimpleAutonomousMode() {
     const float OBSTACLE_CM = 25.0f;
     const float CRITICAL_CM = 10.0f;
     const float STALL_DIST_CM = 50.0f;
-    const unsigned long STALL_MS = 2500;
-    const int TURN_SPEED = MAX_PWM;
-    const int REVERSE_SPEED = MAX_PWM - 10;
-    const int MIN_SPEED = MAX_PWM - 50;
-    const unsigned long TURN_MS = 800;
-    const unsigned long REVERSE_MS = 1000;
+    const unsigned long STALL_MS = 4000;
+    const int TURN_SPEED = (MAX_PWM * 90) / 100;  // 90% power turns
+    const int REVERSE_SPEED = MAX_PWM;             // Clamped to 210 by current limiter
+    const int MIN_SPEED = (MAX_PWM * 80) / 100;   // Minimum to overcome friction
+    const unsigned long TURN_MS = 400;    // Short turn to prevent spinning
+    const unsigned long REVERSE_MS = 300;
     const float TILT_THRESHOLD_DEG = 35.0f;
     const int TILT_DEBOUNCE = 3;
     static unsigned long lastSimpleDecision = 0;
@@ -798,10 +1204,11 @@ void handleSimpleAutonomousMode() {
     float distR = sensorData.distanceRight;
     unsigned long now = millis();
 
-    // Handle invalid distance
+    // Handle invalid distance — side sensors default to FAR (safe/forward-biased)
+    // Only front sensor defaults to close (conservative for collision avoidance)
     if (distance < 0 || distance > 400) distance = OBSTACLE_CM - 1.0f;
-    if (distL < 0 || distL > 400) distL = OBSTACLE_CM - 1.0f;
-    if (distR < 0 || distR > 400) distR = OBSTACLE_CM - 1.0f;
+    if (distL < 0 || distL > 400) distL = 999.0f;  // Unknown = assume clear
+    if (distR < 0 || distR > 400) distR = 999.0f;  // Unknown = assume clear
 
     // Calculate pitch from accelerometer
     float pitch = 0;
@@ -810,6 +1217,27 @@ void handleSimpleAutonomousMode() {
     float ay = sensorData.accelY;
     float az = sensorData.accelZ;
     pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
+    
+    // === DEAD RECKONING UPDATE ===
+    {
+        float gz = sensorData.gyroZ;
+        float dt = 0.05f;  // ~20Hz update
+        drHeading += gz * dt;  // Integrate gyro for heading
+        
+        // Use fused encoder+IMU speed for DR (falls back to PWM estimate if no pulses)
+        if (lastMotorSpeedA > 0 && lastMotorSpeedB > 0 && phase == 0) {
+            float speedCmS = encoders.getFusedSpeed();  // Fused encoder+IMU speed
+            if (speedCmS < 1.0f) {
+                // Encoder not producing pulses — fall back to PWM estimate
+                float speedFrac = (float)min(lastMotorSpeedA, lastMotorSpeedB) / 255.0f;
+                speedCmS = speedFrac * ROVER_MAX_SPEED_CM_S;
+            }
+            float distCm = speedCmS * dt;
+            float headRad = drHeading * PI / 180.0f;
+            drX += distCm * sin(headRad);
+            drY += distCm * cos(headRad);
+        }
+    }
     
     // === IMU MOVEMENT VERIFICATION ===
     float accelMag = sqrt(ax*ax + ay*ay + az*az);
@@ -853,69 +1281,85 @@ void handleSimpleAutonomousMode() {
             // Still executing current recovery step — apply motor commands
             switch (recoveryStep) {
                 case 0: // Rock forward
-                    leftSpeed = MAX_PWM; rightSpeed = MAX_PWM; break;
-                case 1: // Rock backward
-                    leftSpeed = -MAX_PWM; rightSpeed = -MAX_PWM; break;
-                case 2: // Diagonal turn
-                    if (recoveryTurnDir == 1) { leftSpeed = -MAX_PWM; rightSpeed = MAX_PWM; }
-                    else { leftSpeed = MAX_PWM; rightSpeed = -MAX_PWM; }
+                    leftSpeed = RECOVERY_SPEED; rightSpeed = RECOVERY_SPEED; break;
+                case 1: // Coast (fwd→rev transition)
+                case 3: // Coast (rev→fwd or diagonal transition)
+                    leftSpeed = 0; rightSpeed = 0; break;
+                case 2: // Rock backward
+                    leftSpeed = -RECOVERY_SPEED; rightSpeed = -RECOVERY_SPEED; break;
+                case 4: // Diagonal turn
+                    if (recoveryTurnDir == 1) { leftSpeed = -RECOVERY_SPEED; rightSpeed = RECOVERY_SPEED; }
+                    else { leftSpeed = RECOVERY_SPEED; rightSpeed = -RECOVERY_SPEED; }
                     break;
-                case 3: // Diagonal forward
+                case 5: // Diagonal forward
                     leftSpeed = REVERSE_SPEED; rightSpeed = REVERSE_SPEED; break;
-                case 4: // Full reverse
-                    leftSpeed = -MAX_PWM; rightSpeed = -MAX_PWM; break;
+                case 6: // Full reverse
+                    leftSpeed = -RECOVERY_SPEED; rightSpeed = -RECOVERY_SPEED; break;
             }
         } else {
             // Current step done — advance
             switch (recoveryStep) {
-                case 0: // Rock fwd done → rock rev
+                case 0: // Rock fwd done → coast before reversing
                     recoveryStep = 1;
+                    recoveryUntil = now + RECOVERY_COAST_MS;
+                    leftSpeed = 0; rightSpeed = 0;
+                    break;
+                case 1: // Coast done → rock rev
+                    recoveryStep = 2;
                     recoveryUntil = now + RECOVERY_ROCK_MS;
                     Serial.printf("[SIMPLE-REC] Rock REV (%d/%d)\n", rockCycles+1, RECOVERY_ROCK_ATTEMPTS);
-                    leftSpeed = -MAX_PWM; rightSpeed = -MAX_PWM;
+                    leftSpeed = -RECOVERY_SPEED; rightSpeed = -RECOVERY_SPEED;
                     break;
-                case 1: // Rock rev done → more rocks or diagonal
+                case 2: // Rock rev done → coast
+                    recoveryStep = 3;
+                    recoveryUntil = now + RECOVERY_COAST_MS;
+                    leftSpeed = 0; rightSpeed = 0;
+                    break;
+                case 3: // Coast done → more rocks or diagonal
                     rockCycles++;
                     if (rockCycles < RECOVERY_ROCK_ATTEMPTS) {
                         recoveryStep = 0;
                         recoveryUntil = now + RECOVERY_ROCK_MS;
                         Serial.printf("[SIMPLE-REC] Rock FWD (%d/%d)\n", rockCycles+1, RECOVERY_ROCK_ATTEMPTS);
-                        leftSpeed = MAX_PWM; rightSpeed = MAX_PWM;
+                        leftSpeed = RECOVERY_SPEED; rightSpeed = RECOVERY_SPEED;
                     } else {
-                        recoveryStep = 2;
+                        recoveryStep = 4;
                         recoveryUntil = now + RECOVERY_DIAG_TURN_MS;
                         Serial.println("[SIMPLE-REC] Diagonal TURN");
-                        if (recoveryTurnDir == 1) { leftSpeed = -MAX_PWM; rightSpeed = MAX_PWM; }
-                        else { leftSpeed = MAX_PWM; rightSpeed = -MAX_PWM; }
+                        if (recoveryTurnDir == 1) { leftSpeed = -RECOVERY_SPEED; rightSpeed = RECOVERY_SPEED; }
+                        else { leftSpeed = RECOVERY_SPEED; rightSpeed = -RECOVERY_SPEED; }
                     }
                     break;
-                case 2: // Diag turn done → diag forward
-                    recoveryStep = 3;
+                case 4: // Diag turn done → diag forward
+                    recoveryStep = 5;
                     recoveryUntil = now + RECOVERY_DIAG_FWD_MS;
                     Serial.println("[SIMPLE-REC] Diagonal FWD");
                     leftSpeed = REVERSE_SPEED; rightSpeed = REVERSE_SPEED;
                     break;
-                case 3: // Diag fwd done → check if free
+                case 5: // Diag fwd done → check if free
                     if (simpleMotionOK && distance > OBSTACLE_CM) {
                         Serial.println("[SIMPLE-REC] === FREE! ===");
                         phase = 0; pidI = 0; pidLastErr = 0;
+                        simpleHeadingLocked = false; simplePhase0EnteredAt = now;
                         simpleRecentlyStuck = true; simpleStuckTime = now;
                         simpleNoMotionStart = 0;
+                        simpleRecoveryCooldownUntil = now + RECOVERY_COOLDOWN_MS;
                         leftSpeed = MIN_SPEED; rightSpeed = MIN_SPEED;
                     } else {
-                        recoveryStep = 4;
+                        recoveryStep = 6;
                         recoveryUntil = now + RECOVERY_FULL_REV_MS;
                         Serial.println("[SIMPLE-REC] FULL REVERSE");
-                        leftSpeed = -MAX_PWM; rightSpeed = -MAX_PWM;
+                        leftSpeed = -RECOVERY_SPEED; rightSpeed = -RECOVERY_SPEED;
                     }
                     break;
-                case 4: // Full reverse done → recovery complete
+                case 6: // Full reverse done → recovery complete
                     Serial.println("[SIMPLE-REC] === Recovery complete ===");
                     phase = 1; // Turn to new direction
                     actionUntil = now + 800;
                     pidI = 0;
                     simpleRecentlyStuck = true; simpleStuckTime = now;
                     simpleNoMotionStart = 0;
+                    simpleRecoveryCooldownUntil = now + RECOVERY_COOLDOWN_MS;
                     if (distL > distR) { leftSpeed = -TURN_SPEED; rightSpeed = TURN_SPEED; }
                     else { leftSpeed = TURN_SPEED; rightSpeed = -TURN_SPEED; }
                     break;
@@ -926,8 +1370,8 @@ void handleSimpleAutonomousMode() {
         lastMotorSpeedB = rightSpeed;
         // Debug
         static unsigned long lastRecDbg = 0;
-        if (now - lastRecDbg > 500) {
-            const char* stepNames[] = {"ROCK_FWD","ROCK_REV","DIAG_TURN","DIAG_FWD","FULL_REV"};
+        if (now - lastRecDbg > 2000) {
+            const char* stepNames[] = {"ROCK_FWD","COAST","ROCK_REV","COAST","DIAG_TURN","DIAG_FWD","FULL_REV"};
             Serial.printf("[SIMPLE] RECOVERY %s | Fwd:%.0f | ML:%d MR:%d\n",
                           stepNames[recoveryStep], distance, leftSpeed, rightSpeed);
             lastRecDbg = now;
@@ -944,6 +1388,7 @@ void handleSimpleAutonomousMode() {
             simpleSendItWindowStart = 0;
             simpleSendItFwdStart = 0;
             phase = 0; pidI = 0; pidLastErr = 0;
+            simpleHeadingLocked = false; simplePhase0EnteredAt = now;
             Serial.println("[SENDIT] === Send-it complete — resuming normal nav ===");
         } else if (distance < CRITICAL_CM) {
             // Even in send-it, respect collision distance
@@ -962,7 +1407,7 @@ void handleSimpleAutonomousMode() {
             lastMotorSpeedA = leftSpeed; lastMotorSpeedB = rightSpeed;
             // Debug
             static unsigned long lastSendItDbg = 0;
-            if (now - lastSendItDbg > 500) {
+            if (now - lastSendItDbg > 2000) {
                 unsigned long remaining = (simpleSendItUntil > now) ? (simpleSendItUntil - now) : 0;
                 Serial.printf("[SENDIT] DRIVING THROUGH | Fwd:%.0f L:%.0f R:%.0f | %lums left | ML:%d MR:%d\n",
                               distance, distL, distR, remaining, leftSpeed, rightSpeed);
@@ -978,20 +1423,34 @@ void handleSimpleAutonomousMode() {
         pidI = 0;
         pidLastErr = 0;
         lastSimpleDecision = now;
+        // Unlock heading — will re-lock after settle delay
+        simpleHeadingLocked = false;
+        simplePhase0EnteredAt = now;
+        // Reset motion detection — give IMU time to see forward movement
+        // Prevents false no-motion trigger immediately after a turn
+        accelMagReady = false;
+        accelMagIdx = 0;
+        simpleNoMotionStart = 0;
+        // Force a brief forward burst after every turn to prevent endless spinning
+        leftSpeed = MIN_SPEED;
+        rightSpeed = MIN_SPEED;
+        motors.setMotors(leftSpeed, rightSpeed);
+        lastMotorSpeedA = leftSpeed;
+        lastMotorSpeedB = rightSpeed;
+        return;  // Skip decision this cycle — commit to forward
     }
 
     // Decision cooldown — prevent rapid state thrashing
     if (phase == 0 && (now - lastSimpleDecision) < DECISION_COOLDOWN_MS && distance > CRITICAL_CM) {
-        // Keep current motor speeds, just don't make a new decision yet
-        motors.setMotors(leftSpeed, rightSpeed);
-        lastMotorSpeedA = leftSpeed; lastMotorSpeedB = rightSpeed;
+        // Keep LAST motor speeds during cooldown (don't zero them!)
+        motors.setMotors(lastMotorSpeedA, lastMotorSpeedB);
         return;
     }
 
     if (phase == 0) {
         // === ANTI-SPIN: Track forward progress & window expiry ===
         // If driving forward for long enough, we're making progress — reset turn count
-        if (leftSpeed > 0 && rightSpeed > 0) {
+        if (lastMotorSpeedA > 0 && lastMotorSpeedB > 0) {
             if (simpleSendItFwdStart == 0) simpleSendItFwdStart = now;
             if (now - simpleSendItFwdStart > SENDIT_FWD_PROGRESS_MS) {
                 if (simpleSendItTurnCount > 0) {
@@ -1010,8 +1469,13 @@ void handleSimpleAutonomousMode() {
         }
         
         // === IMU MOVEMENT VERIFICATION: Trigger recovery ===
+        // Requires BOTH low IMU variance AND distance not changing
+        // This prevents false triggers on smooth surfaces where IMU variance is naturally low
         #if IMU_ENABLED
-        if (!simpleMotionOK && leftSpeed >= MIN_SPEED) {
+        bool distChanging = (abs(distance - simpleLastDist) > 3.0f);  // >3cm = moving
+        simpleLastDist = distance;
+        
+        if (!simpleMotionOK && !distChanging && lastMotorSpeedA >= MIN_SPEED && now >= simpleRecoveryCooldownUntil) {
             if (simpleNoMotionStart == 0) {
                 simpleNoMotionStart = now;
             } else if (now - simpleNoMotionStart > MOTION_VERIFY_TIMEOUT) {
@@ -1020,9 +1484,11 @@ void handleSimpleAutonomousMode() {
                 recoveryStep = 0; rockCycles = 0;
                 recoveryUntil = now + RECOVERY_ROCK_MS;
                 recoveryTurnDir = (distL > distR) ? 1 : 0;
+                accelMagReady = false; accelMagIdx = 0;  // Reset IMU buffer
+                simpleNoMotionStart = 0;
                 Serial.println("[SIMPLE-REC] === Starting recovery ===");
-                motors.setMotors(MAX_PWM, MAX_PWM);
-                lastMotorSpeedA = MAX_PWM; lastMotorSpeedB = MAX_PWM;
+                motors.setMotors(RECOVERY_SPEED, RECOVERY_SPEED);
+                lastMotorSpeedA = RECOVERY_SPEED; lastMotorSpeedB = RECOVERY_SPEED;
                 return;
             }
         } else {
@@ -1052,8 +1518,10 @@ void handleSimpleAutonomousMode() {
                     recoveryTurnDir = (simpleInclineAttempts % 2 == 0) ? 1 : 0;
                     simpleInclineAttempts = 0;
                     simpleSteepStart = 0;
-                    motors.setMotors(MAX_PWM, MAX_PWM);
-                    lastMotorSpeedA = MAX_PWM; lastMotorSpeedB = MAX_PWM;
+                    accelMagReady = false; accelMagIdx = 0;  // Reset IMU buffer
+                    simpleNoMotionStart = 0;
+                    motors.setMotors(RECOVERY_SPEED, RECOVERY_SPEED);
+                    lastMotorSpeedA = RECOVERY_SPEED; lastMotorSpeedB = RECOVERY_SPEED;
                     return;
                 }
             }
@@ -1065,6 +1533,184 @@ void handleSimpleAutonomousMode() {
             simpleInclineAttempts = 0;
         }
         #endif
+
+        // === PIT DETECTION (Simple mode) ===
+        {
+            static float simplePrevDistL = 0.0f;
+            static float simplePrevDistR = 0.0f;
+            static unsigned long simplePitPitchStart = 0;
+            bool simplePitDetected = false;
+            float simplePitJump = 0.0f;
+            
+            // Signal 1: Ultrasonic distance jump
+            if (simplePrevDistL > 2.0f && simplePrevDistL < 100.0f &&
+                distL > simplePrevDistL + PIT_DIST_JUMP_CM) {
+                float jump = distL - simplePrevDistL;
+                simplePitDetected = true;
+                if (jump > simplePitJump) simplePitJump = jump;
+                Serial.printf("[SIMPLE-PIT] Left jump: %.0f→%.0fcm (Δ%.0f)\n", simplePrevDistL, distL, jump);
+            }
+            if (simplePrevDistR > 2.0f && simplePrevDistR < 100.0f &&
+                distR > simplePrevDistR + PIT_DIST_JUMP_CM) {
+                float jump = distR - simplePrevDistR;
+                simplePitDetected = true;
+                if (jump > simplePitJump) simplePitJump = jump;
+                Serial.printf("[SIMPLE-PIT] Right jump: %.0f→%.0fcm (Δ%.0f)\n", simplePrevDistR, distR, jump);
+            }
+            simplePrevDistL = distL;
+            simplePrevDistR = distR;
+            
+            // Signal 2: Sustained negative pitch
+            #if IMU_ENABLED
+            if (pitch < PIT_PITCH_THRESHOLD) {
+                if (simplePitPitchStart == 0) {
+                    simplePitPitchStart = now;
+                } else if (now - simplePitPitchStart > PIT_PITCH_SUSTAIN_MS) {
+                    simplePitDetected = true;
+                    Serial.printf("[SIMPLE-PIT] Negative pitch %.1f° → pit ahead\n", pitch);
+                    simplePitPitchStart = 0;
+                }
+            } else {
+                simplePitPitchStart = 0;
+            }
+            #endif
+            
+            // Classify severity
+            bool simplePitMajor = false;
+            if (simplePitDetected) {
+                simplePitMajor = (fabs(pitch) >= TERRAIN_MINOR_PITCH) ||
+                                 (simplePitJump >= TERRAIN_MINOR_PIT_JUMP_CM);
+            }
+            
+            // React based on severity
+            if (simplePitDetected && simplePitMajor && phase == 0) {
+                envMap.markPitAhead(drHeading, distance > 5.0f ? distance : 20.0f);
+                phase = 2;  // Reverse
+                actionUntil = now + PIT_BACKUP_MS;
+                pidI = 0;
+                lastSimpleDecision = now;
+                Serial.println("[SIMPLE-PIT] MAJOR → REVERSE");
+            } else if (simplePitDetected && phase == 0) {
+                // Minor pit — keep driving, don't reverse
+                Serial.printf("[SIMPLE-PIT] MINOR (pitch=%.1f° jump=%.0f) → TRAVERSE\n",
+                              pitch, simplePitJump);
+            }
+        }
+
+        // === HILL DETECTION (Simple mode) ===
+        {
+            static float simpleHPrevDistL = 0.0f;
+            static float simpleHPrevDistR = 0.0f;
+            static unsigned long simpleHillPitchStart = 0;
+            bool simpleHillDetected = false;
+            float simpleMaxHeight = 0.0f;
+            
+            // Signal 1: Ultrasonic distance drop (hitting slope face)
+            if (simpleHPrevDistL > 50.0f && simpleHPrevDistL < 400.0f &&
+                distL < simpleHPrevDistL - HILL_DIST_DROP_CM && distL > 2.0f) {
+                float pitchRad = pitch * PI / 180.0f;
+                float heightCm = distL * sin(fabs(pitchRad)) + SENSOR_HEIGHT_CM;
+                simpleHillDetected = true;
+                if (heightCm > simpleMaxHeight) simpleMaxHeight = heightCm;
+                Serial.printf("[SIMPLE-HILL] Left drop: %.0f→%.0fcm, height %.0fcm\n",
+                              simpleHPrevDistL, distL, heightCm);
+            }
+            if (simpleHPrevDistR > 50.0f && simpleHPrevDistR < 400.0f &&
+                distR < simpleHPrevDistR - HILL_DIST_DROP_CM && distR > 2.0f) {
+                float pitchRad = pitch * PI / 180.0f;
+                float heightCm = distR * sin(fabs(pitchRad)) + SENSOR_HEIGHT_CM;
+                simpleHillDetected = true;
+                if (heightCm > simpleMaxHeight) simpleMaxHeight = heightCm;
+                Serial.printf("[SIMPLE-HILL] Right drop: %.0f→%.0fcm, height %.0fcm\n",
+                              simpleHPrevDistR, distR, heightCm);
+            }
+            simpleHPrevDistL = distL;
+            simpleHPrevDistR = distR;
+            
+            // Signal 2: Sustained positive pitch (climbing)
+            #if IMU_ENABLED
+            if (pitch > HILL_PITCH_THRESHOLD) {
+                if (simpleHillPitchStart == 0) {
+                    simpleHillPitchStart = now;
+                } else if (now - simpleHillPitchStart > HILL_PITCH_SUSTAIN_MS) {
+                    float pitchRad = pitch * PI / 180.0f;
+                    float heightCm = distance * sin(pitchRad) + SENSOR_HEIGHT_CM;
+                    simpleHillDetected = true;
+                    if (heightCm > simpleMaxHeight) simpleMaxHeight = heightCm;
+                    Serial.printf("[SIMPLE-HILL] Pitch %.1f° sustained, height %.0fcm\n", pitch, heightCm);
+                    simpleHillPitchStart = 0;
+                }
+            } else {
+                simpleHillPitchStart = 0;
+            }
+            #endif
+            
+            // Classify severity
+            bool simpleHillMajor = false;
+            if (simpleHillDetected) {
+                simpleHillMajor = (fabs(pitch) >= TERRAIN_MINOR_PITCH) ||
+                                  (simpleMaxHeight >= TERRAIN_MINOR_HEIGHT_CM);
+            }
+            
+            // React based on severity
+            if (simpleHillDetected && simpleHillMajor && phase == 0) {
+                envMap.markHillAhead(drHeading, distance > 5.0f ? distance : 20.0f, simpleMaxHeight);
+                phase = 2;  // Reverse
+                actionUntil = now + HILL_BACKUP_MS;
+                pidI = 0;
+                lastSimpleDecision = now;
+                Serial.printf("[SIMPLE-HILL] MAJOR (height=%.0fcm) → REVERSE\n", simpleMaxHeight);
+            } else if (simpleHillDetected && phase == 0) {
+                // Minor hill — keep driving with momentum
+                Serial.printf("[SIMPLE-HILL] MINOR (pitch=%.1f° height=%.0fcm) → TRAVERSE\n",
+                              pitch, simpleMaxHeight);
+            }
+        }
+
+        // === PROACTIVE HEADING CORRECTION ===
+        // If heading roughly toward start for too long with clear path, force a turn
+        {
+            float distFromStart = sqrt(drX * drX + drY * drY);
+            if (distFromStart > DR_MIN_DIST_CM && phase == 0) {
+                float toBearing = atan2(-drX, -drY) * 180.0f / PI;
+                float toError = toBearing - drHeading;
+                while (toError > 180) toError -= 360;
+                while (toError < -180) toError += 360;
+                
+                if (abs(toError) < DR_HEADING_TOWARD_DEG) {
+                    if (simpleHeadingTowardStart == 0) {
+                        simpleHeadingTowardStart = now;
+                    } else if (now - simpleHeadingTowardStart > DR_CORRECT_TIMEOUT_MS &&
+                               distance > DR_CORRECT_CLEARANCE_CM) {
+                        // Force correction turn away from start
+                        float awayBearing = atan2(drX, drY) * 180.0f / PI;
+                        float awayError = awayBearing - drHeading;
+                        while (awayError > 180) awayError -= 360;
+                        while (awayError < -180) awayError += 360;
+                        
+                        phase = 1;
+                        actionUntil = now + DR_CORRECT_TURN_MS;
+                        pidI = 0;
+                        simpleHeadingTowardStart = 0;
+                        bool turnRight = (awayError > 0);
+                        if (turnRight) {
+                            leftSpeed = TURN_SPEED; rightSpeed = -TURN_SPEED;
+                        } else {
+                            leftSpeed = -TURN_SPEED; rightSpeed = TURN_SPEED;
+                        }
+                        Serial.printf("[DR] Heading toward start >%ds — correction turn %s (dist:%.0f)\n",
+                                      DR_CORRECT_TIMEOUT_MS / 1000, turnRight ? "RIGHT" : "LEFT", distFromStart);
+                        motors.setMotors(leftSpeed, rightSpeed);
+                        lastMotorSpeedA = leftSpeed; lastMotorSpeedB = rightSpeed;
+                        return;
+                    }
+                } else {
+                    simpleHeadingTowardStart = 0;
+                }
+            } else {
+                simpleHeadingTowardStart = 0;
+            }
+        }
 
         // Priority 1: Tilt → reverse
         if (tiltCount >= TILT_DEBOUNCE) {
@@ -1109,7 +1755,36 @@ void handleSimpleAutonomousMode() {
             actionUntil = now + TURN_MS;
             pidI = 0;
             lastSimpleDecision = now;
-            if (distL <= distR) {
+            
+            // Decide turn direction: prefer AWAY from start position
+            // drHeading = current heading, atan2(drX, drY) = bearing TO start
+            // We want to face AWAY from start, so opposite of bearing-to-start
+            bool turnRight;
+            float sideDiff = distR - distL;  // positive = more room on right
+            
+            if (abs(sideDiff) > 8.0f) {
+                // Clear sensor difference — trust sensors
+                turnRight = (sideDiff > 0);
+            } else {
+                // Sensors roughly equal — bias away from start
+                float distFromStart = sqrt(drX * drX + drY * drY);
+                if (distFromStart > 30.0f) {  // Only bias when we have enough tracking data
+                    // Bearing FROM start (direction we should go)
+                    float awayBearing = atan2(drX, drY) * 180.0f / PI;  // degrees
+                    // Difference: which way do we need to turn to face away from start?
+                    float angleDiff = awayBearing - drHeading;
+                    // Normalize to -180..180
+                    while (angleDiff > 180) angleDiff -= 360;
+                    while (angleDiff < -180) angleDiff += 360;
+                    turnRight = (angleDiff > 0);  // Positive = turn right to face away
+                    Serial.printf("[SIMPLE] Bias AWAY from start (%.0f,%.0f) dist=%.0fcm → %s\n",
+                                  drX, drY, distFromStart, turnRight ? "RIGHT" : "LEFT");
+                } else {
+                    turnRight = (distL <= distR);  // Fallback to sensor
+                }
+            }
+            
+            if (turnRight) {
                 leftSpeed = TURN_SPEED;
                 rightSpeed = -TURN_SPEED;
                 Serial.printf("[SIMPLE] Obstacle L:%.0f R:%.0fcm → TURN RIGHT (spin count: %d/%d)\n", 
@@ -1135,23 +1810,64 @@ void handleSimpleAutonomousMode() {
             float output = (KP * error) + (KI * pidI) + (KD * derivative);
             int speed = constrain((int)output, MIN_SPEED, 255);
             
-            // === ADAPTIVE RAMP: softer acceleration after recent stuck ===
-            if (simpleRecentlyStuck) {
-                static int simpleCurrentSpeed = 0;
-                int diff = speed - simpleCurrentSpeed;
-                if (abs(diff) > ADAPTIVE_RAMP_SLOW) {
-                    simpleCurrentSpeed += (diff > 0) ? ADAPTIVE_RAMP_SLOW : -ADAPTIVE_RAMP_SLOW;
-                } else {
-                    simpleCurrentSpeed = speed;
-                }
-                speed = constrain(simpleCurrentSpeed, MIN_SPEED, 255);
-            }
-
+            // Hardware slew rate in motor_control.cpp handles ramping safely
             leftSpeed = speed;
             rightSpeed = speed;
             
-            // Stall detection
-            if (distance < STALL_DIST_CM) {
+            // === HEADING-HOLD: correct drift when going straight ===
+            #if IMU_ENABLED
+            {
+                // Lock heading after settling into phase 0
+                if (!simpleHeadingLocked && simplePhase0EnteredAt > 0 &&
+                    (now - simplePhase0EnteredAt > HEADING_HOLD_SETTLE_MS)) {
+                    simpleCruiseHeading = drHeading;
+                    simpleHeadingLocked = true;
+                }
+                
+                int holdBias = 0;
+                if (simpleHeadingLocked) {
+                    float error = simpleCruiseHeading - drHeading;
+                    while (error > 180) error -= 360;
+                    while (error < -180) error += 360;
+                    if (abs(error) > HEADING_HOLD_DEADBAND) {
+                        holdBias = constrain((int)(error * HEADING_HOLD_GAIN), -HEADING_HOLD_MAX, HEADING_HOLD_MAX);
+                    }
+                }
+                leftSpeed  += holdBias;
+                rightSpeed -= holdBias;
+                leftSpeed  = constrain(leftSpeed, MIN_SPEED, 255);
+                rightSpeed = constrain(rightSpeed, MIN_SPEED, 255);
+            }
+            #endif
+            
+            // === DEAD-RECKONING STEERING: gently arc away from start ===
+            // Only apply in clear space — don't fight obstacle avoidance
+            {
+                float distFromStart = sqrt(drX * drX + drY * drY);
+                if (distFromStart > DR_MIN_DIST_CM && distance > STALL_DIST_CM) {
+                    float awayBearing = atan2(drX, drY) * 180.0f / PI;
+                    float headingError = awayBearing - drHeading;
+                    while (headingError > 180) headingError -= 360;
+                    while (headingError < -180) headingError += 360;
+                    // Stronger correction near start, fades with distance
+                    float proxScale = constrain(1.0f - (distFromStart - DR_MIN_DIST_CM) / DR_PROXIMITY_RANGE_CM, 0.2f, 1.0f);
+                    int steerBias = constrain((int)(headingError * DR_STEER_GAIN * proxScale), -DR_STEER_MAX, DR_STEER_MAX);
+                    leftSpeed  += steerBias;
+                    rightSpeed -= steerBias;
+                    leftSpeed  = constrain(leftSpeed, MIN_SPEED, 255);
+                    rightSpeed = constrain(rightSpeed, MIN_SPEED, 255);
+                    
+                    // Shift locked heading so heading-hold doesn't fight DR
+                    if (abs(steerBias) > 5 && simpleHeadingLocked) {
+                        simpleCruiseHeading += steerBias * 0.02f;
+                        while (simpleCruiseHeading >= 360) simpleCruiseHeading -= 360;
+                        while (simpleCruiseHeading < 0) simpleCruiseHeading += 360;
+                    }
+                }
+            }
+            
+            // Stall detection (skip if within post-recovery cooldown)
+            if (distance < STALL_DIST_CM && now >= simpleRecoveryCooldownUntil) {
                 if (stallStart == 0) {
                     stallStart = now;
                 } else if (now - stallStart > STALL_MS) {
@@ -1162,8 +1878,10 @@ void handleSimpleAutonomousMode() {
                     recoveryUntil = now + RECOVERY_ROCK_MS;
                     recoveryTurnDir = (distL > distR) ? 1 : 0;
                     stallStart = 0;
-                    motors.setMotors(MAX_PWM, MAX_PWM);
-                    lastMotorSpeedA = MAX_PWM; lastMotorSpeedB = MAX_PWM;
+                    accelMagReady = false; accelMagIdx = 0;  // Reset IMU buffer
+                    simpleNoMotionStart = 0;
+                    motors.setMotors(RECOVERY_SPEED, RECOVERY_SPEED);
+                    lastMotorSpeedA = RECOVERY_SPEED; lastMotorSpeedB = RECOVERY_SPEED;
                     return;
                 }
             } else {
@@ -1194,9 +1912,18 @@ void handleSimpleAutonomousMode() {
     lastMotorSpeedB = rightSpeed;
 
     static unsigned long lastDebug = 0;
-    if (now - lastDebug > 500) {
+    if (now - lastDebug > 2000) {
         const char* stateStr = (phase == 0) ? "PID-FWD" : (phase == 1) ? "TURN" : "REVERSE";
         #if IMU_ENABLED
+        float x = encoders.getX();
+        float y = encoders.getY();
+        float th = encoders.getTheta();
+        float lspd = encoders.getLeftSpeed();
+        float rspd = encoders.getRightSpeed();
+        float ldist = encoders.getLeftDistance();
+        float rdist = encoders.getRightDistance();
+        Serial.printf("[ODOM] x=%.1fcm y=%.1fcm th=%.2frad | Lspd=%.1f Rspd=%.1f | Ldist=%.1f Rdist=%.1f\n",
+            x, y, th, lspd, rspd, ldist, rdist);
         Serial.printf("[SIMPLE] %s | Fwd:%.0f L:%.0f R:%.0f | pitch:%.0f° | %s%s%s | ML:%d MR:%d\n",
                       stateStr, distance, distL, distR, pitch,
                       simpleMotionOK ? "" : "NO-MOTION ",
