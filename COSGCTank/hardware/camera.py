@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 import json
 from pathlib import Path
+import platform
 
 try:
     from picamera2 import Picamera2
@@ -50,6 +51,8 @@ class FrameProvider:
         self._last_time = 0.0
 
         self._use_picam = False
+        self._use_gst = False
+        self._cap_backend = None
         if _HAS_PICAM2:
             try:
                 self.picam = Picamera2()
@@ -63,21 +66,42 @@ class FrameProvider:
                 self._use_picam = False
 
         if not self._use_picam:
-            # OpenCV fallback. `camera_index` may be an int or a path to a video file.
+            # OpenCV capture (USB cams / files) for Raspberry Pi
             try:
-                self.cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+                self.cap = cv2.VideoCapture(camera_index)
+                self._cap_backend = None
             except Exception:
                 self.cap = cv2.VideoCapture(camera_index)
-
-            # Prefer MJPG for USB cams (lower USB bandwidth); harmless if unsupported.
+                self._cap_backend = None
+            # Prefer MJPG first; then fall back to YUYV if MJPG fails.
             try:
                 self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+                self.cap.set(cv2.CAP_PROP_FPS, float(fps))
             except Exception:
                 pass
-            # try to set preferred size/fps
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            self.cap.set(cv2.CAP_PROP_FPS, float(fps))
+
+            # Probe a frame; if failure, re-open with YUYV
+            try:
+                ok, test = self.cap.read()
+            except Exception:
+                ok, test = False, None
+            if not ok or test is None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                try:
+                    self.cap = cv2.VideoCapture(camera_index)
+                    self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+                    self.cap.set(cv2.CAP_PROP_FPS, float(fps))
+                except Exception:
+                    pass
+
+    # Jetson-specific helpers removed; Pi-only implementation
 
     def _preprocess(self, frame, to_rgb=True, resize=True):
         """Apply basic preprocessing: convert to RGB and resize to target size."""
@@ -133,6 +157,12 @@ class FrameProvider:
         if self._use_picam:
             try:
                 self.picam.stop()
+            except Exception:
+                pass
+        else:
+            try:
+                if hasattr(self, 'cap') and self.cap is not None:
+                    self.cap.release()
             except Exception:
                 pass
 
@@ -191,19 +221,51 @@ class StereoFrameProvider:
         self.fps = float(fps)
         self._last_time = 0.0
 
-        self.capL = cv2.VideoCapture(left_index, cv2.CAP_V4L2)
-        self.capR = cv2.VideoCapture(right_index, cv2.CAP_V4L2)
+        self.capL = cv2.VideoCapture(left_index)
+        self.capR = cv2.VideoCapture(right_index)
         if not self.capL.isOpened() or not self.capR.isOpened():
             raise RuntimeError(f'Failed to open stereo cameras: {left_index}, {right_index}')
 
+        # Prefer MJPG, then fall back to YUYV if probe fails
         for cap in (self.capL, self.capR):
             try:
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.width))
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.height))
+                cap.set(cv2.CAP_PROP_FPS, float(self.fps))
             except Exception:
                 pass
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.width))
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.height))
-            cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+
+        # Probe both; if either fails, re-open both with YUYV
+        try:
+            okL, tL = self.capL.read()
+        except Exception:
+            okL, tL = False, None
+        try:
+            okR, tR = self.capR.read()
+        except Exception:
+            okR, tR = False, None
+        if (not okL or tL is None) or (not okR or tR is None):
+            try:
+                self.capL.release()
+            except Exception:
+                pass
+            try:
+                self.capR.release()
+            except Exception:
+                pass
+            self.capL = cv2.VideoCapture(left_index)
+            self.capR = cv2.VideoCapture(right_index)
+            for cap in (self.capL, self.capR):
+                try:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(self.width))
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(self.height))
+                    cap.set(cv2.CAP_PROP_FPS, float(self.fps))
+                except Exception:
+                    pass
+            if not self.capL.isOpened() or not self.capR.isOpened():
+                raise RuntimeError(f'Failed to open stereo cameras with YUYV: {left_index}, {right_index}')
 
         self.calib = None
         self._maps = None
@@ -287,7 +349,8 @@ if __name__ == "__main__":
     # Quick test: stream frames and show with overlay FPS
     provider = FrameProvider(width=640, height=480, fps=20)
     import time
-    from overlay import OverlayDrawer
+    from objectDetection.overlay import OverlayDrawer
+
 
     drawer = OverlayDrawer()
     last = time.time()

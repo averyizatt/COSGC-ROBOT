@@ -15,15 +15,11 @@ import math
 import requests
 from collections import deque
 
-# Robust imports: prefer package paths, fallback to local modules
-try:
-    from hardware.motor_control import MotorController
-    from hardware.camera import FrameProvider
-except Exception:
-    from motor_control import MotorController
-    from camera import FrameProvider
+from hardware.motor_control import MotorController
+from hardware.camera import FrameProvider
 
-app = Flask(__name__, template_folder="templates")
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / 'templates'
+app = Flask(__name__, template_folder=str(TEMPLATES_DIR))
 
 
 def _parse_camera_device(device):
@@ -138,11 +134,11 @@ def _autonomy_loop():
 
     # Lazy imports: keep server start fast and allow partial installs.
     try:
-        from boundaries import BoundaryDetector
-        from terrain import TerrainAnalyzer
-        from decision import DecisionMaker
-        from overlay import OverlayDrawer
-        from navigator import Navigator
+        from objectDetection.boundaries import BoundaryDetector
+        from objectDetection.terrain import TerrainAnalyzer
+        from slam.decision import DecisionMaker
+        from objectDetection.overlay import OverlayDrawer
+        from slam.navigator import Navigator
     except Exception as e:
         _autonomy_last_error = f"import_failed:{type(e).__name__}:{e}"
         try:
@@ -156,7 +152,7 @@ def _autonomy_loop():
     det_available = False
     if bool(SETTINGS.get('det_use_tflite', False)):
         try:
-            from detector import ObstacleDetector
+            from slam.detector import ObstacleDetector
             det = ObstacleDetector(settings=SETTINGS)
             det_available = True
         except Exception as e:
@@ -184,7 +180,7 @@ def _autonomy_loop():
     # Optional ultrasonic
     us = None
     try:
-        from ultrasonic import Ultrasonic
+        from hardware.ultrasonic import Ultrasonic
         us = Ultrasonic(trig_pin=24, echo_pin=25)
     except Exception:
         us = None
@@ -691,7 +687,6 @@ motor = MotorController(
     pins={"AIN1": 17, "AIN2": 27, "BIN1": 23, "BIN2": 18, "STBY": 4},
     invert_left=True,
     invert_right=True,
-    # Use SoftPWM on direction pins for consistent control across Pi setups
     pwm_mode='in_pins',
 )
 

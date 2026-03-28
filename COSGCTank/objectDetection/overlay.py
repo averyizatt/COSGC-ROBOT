@@ -14,13 +14,21 @@ class OverlayDrawer:
             label = obj.get('label', str(obj.get('class')))
             score = obj.get('score', 0.0)
             rock = obj.get('rock_score', None)
-            # contour detections in orange; model detections in green
-            color = (0, 200, 255) if label == 'contour' else (0, 255, 0)
+            tid = obj.get('id', None)
+            # contour detections in orange; model detections in green; barriers in magenta
+            if label == 'contour':
+                color = (0, 200, 255)
+            elif label == 'barrier':
+                color = (255, 0, 255)
+            else:
+                color = (0, 255, 0)
             cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
             if rock is None:
                 txt = f"{label} {score:.2f}"
             else:
                 txt = f"{label} {score:.2f} rock={float(rock):.2f}"
+            if tid is not None:
+                txt = f"#{int(tid)} " + txt
             cv2.putText(frame, txt,
                         (xmin, ymin - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
@@ -35,6 +43,13 @@ class OverlayDrawer:
             x1, y1, x2, y2 = line
             cv2.line(frame, (x1,y1), (x2,y2), (0,0,255), 2)
 
+        # show confidence if available
+        cl = boundary.get('confidence_left', None)
+        cr = boundary.get('confidence_right', None)
+        if cl is not None or cr is not None:
+            txt = f"Lconf: {0.0 if cl is None else float(cl):.2f}  Rconf: {0.0 if cr is None else float(cr):.2f}"
+            cv2.putText(frame, txt, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180,180,255), 2)
+
         return frame
 
     def draw_terrain(self, frame, terrain):
@@ -47,6 +62,15 @@ class OverlayDrawer:
             text = f"Dip: {dip}  Incline: {inc}  Rough: {rough:.1f}"
         cv2.putText(frame, text, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2)
+        return frame
+
+    def draw_ground(self, frame, ground):
+        if not isinstance(ground, dict):
+            return frame
+        gtype = ground.get('type', 'unknown')
+        conf = float(ground.get('confidence', 0.0))
+        txt = f"Ground: {gtype} ({conf:.2f})"
+        cv2.putText(frame, txt, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,200), 2)
         return frame
 
     def draw_decision(self, frame, decision):
@@ -141,9 +165,11 @@ class OverlayDrawer:
         frame[y_off:y_off+map_size, x_off:x_off+map_size] = cv2.addWeighted(frame[y_off:y_off+map_size, x_off:x_off+map_size], 0.2, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), 0.8, 0)
         return frame
 
-    def apply(self, frame, obstacles, boundary, terrain, decision):
+    def apply(self, frame, obstacles, boundary, terrain, decision, ground=None):
         frame = self.draw_obstacles(frame, obstacles)
         frame = self.draw_boundaries(frame, boundary)
         frame = self.draw_terrain(frame, terrain)
+        if ground is not None:
+            frame = self.draw_ground(frame, ground)
         frame = self.draw_decision(frame, decision)
         return frame

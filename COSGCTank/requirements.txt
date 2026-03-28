@@ -1,9 +1,26 @@
 flask
 requests
 numpy
-opencv-python
+opencv-python; platform_machine != "aarch64"
 smbus2
+# TFT LCD (ST7735) + drawing
+Pillow
+luma.core
+luma.lcd
+spidev; python_version >= "3.7"
+# CircuitPython fallback for TFT (skip on Python < 3.7)
+Adafruit-Blinka; python_version >= "3.7"
+adafruit-circuitpython-st7735r; python_version >= "3.7"
+# Local Bluetooth/Xbox controller (Pi/Linux)
+evdev
 # Optional (Pi-only)
 # RPi.GPIO
 # picamera2
 # tflite-runtime
+# On Raspberry Pi enable Camera + SPI via raspi-config:
+#   sudo raspi-config  (Interface Options)
+# Install GPIO/SPI system libs on Raspberry Pi:
+#   sudo apt install -y python3-rpi.gpio python3-spidev python3-picamera2
+# On Raspberry Pi, prefer system OpenCV via apt: `sudo apt install -y python3-opencv`.
+# Optional CircuitPython fallback (on Python >= 3.7):
+#   python3 -m pip install Adafruit-Blinka adafruit-circuitpython-st7735r

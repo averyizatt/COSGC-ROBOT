@@ -19,7 +19,7 @@ This README documents the current architecture, module responsibilities, endpoin
 
 ## What it does (quick)
 
-- **RC driving from a webpage:** press-and-hold WASD/buttons, plus Xbox controller support.
+ - **RC driving:** from the webpage (WASD/buttons + Xbox via browser) or offline on the Pi with a Bluetooth‑paired Xbox controller.
 - **Autonomous driving pipeline:** camera → obstacle detection + boundary detection + terrain analysis → decision → motor control.
 - **SLAM integration hooks:** polls a separate SLAM process via `slam/bridge.py` (`GET /pose`) and uses pose for navigation/stuck detection.
 - **Dynamic obstacle tracking (debug):** tracks moving obstacles in world space using a lightweight Kalman filter + Hungarian assignment.
@@ -42,7 +42,7 @@ The system is organized into five layers:
 
 The rover supports multiple modes selectable from the web UI:
 
-- `rc`: Manual RC control from the browser (WASD/buttons or Xbox controller).
+- `rc`: Manual RC control. With the web UI, inputs are sent to `/joystick`. Offline, a paired Xbox controller is read locally on the Pi.
 - `autonomous`: General autonomous mode (your autonomy loop decides how to use it).
 - `single_cam`: Autonomous mode intended for a single camera pipeline.
 - `stereo_cam`: Autonomous mode intended for a stereo pipeline (debugging/expansion).
@@ -120,6 +120,36 @@ Current tuning keys include:
   - `rc_speed`
   - `rc_turn_gain`
 
+## Offline RC (Bluetooth Xbox)
+
+Drive without the web UI or Wi‑Fi using a Bluetooth‑paired Xbox controller. The Pi reads the controller locally via `evdev`.
+
+- Dependencies:
+  - System: `sudo apt install -y bluetooth bluez`
+  - Python: `evdev` (included in `requirements.txt`).
+- Pairing (quick helper): press the controller pair button, then press the physical BTN1 (GPIO5) to start a 12‑second `bluetoothctl` scan/pair cycle. Or pair manually:
+
+```
+bluetoothctl
+agent on
+default-agent
+scan on
+# wait to see "Xbox Wireless Controller" MAC
+pair AA:BB:CC:DD:EE:FF
+trust AA:BB:CC:DD:EE:FF
+connect AA:BB:CC:DD:EE:FF
+scan off
+exit
+```
+
+- Usage:
+  - Flip the SPDT to RC (grounds GPIO16). The pipeline stops autonomy and reads the controller locally.
+  - Controls:
+    - Steering: left stick X.
+    - Throttle: RT forward, LT reverse (combined to [-1,1]).
+    - E‑stop: A button.
+  - The TFT shows mode/status; autonomous commands are suppressed while in RC.
+
 The main loop (`main.py`) polls `/settings` about once per second and:
 
 - injects `perception['settings']` for modules that read it (navigator/decision)
@@ -130,26 +160,18 @@ The main loop (`main.py`) polls `/settings` about once per second and:
 `rover_server.py` now loads/saves settings to `COSGCTank/settings.json`.
 
 - On startup, it loads known keys from `settings.json` if present.
-- On `POST /settings`, it clamps values to safe ranges and writes them back to disk.
-
-### Enforced min/max ranges
-
 The server clamps these keys to prevent unsafe/invalid values:
 
 - `rc_speed`: $[0.2, 1.0]$
-- `rc_turn_gain`: $[0.2, 2.5]$
-- `det_gamma`: $[0.5, 1.5]$
 - `det_contour_min_area`: $[50, 20000]$
 - `det_clahe_clip`: $[0.5, 10.0]$
 - `det_rock_score_threshold`: $[0.0, 1.0]$
 - `dec_obstacle_stop_ymin`: $[0.0, 1.0]$
 - `dec_ultra_stop_cm`: $[2, 200]$
-- `dec_ultra_turn_cm`: $[5, 300]$
 - `dec_stuck_dx_m`: $[0.0, 1.0]$
 - `dec_stuck_frames`: $[1, 50]$
 - `auto_speed`, `auto_speed_slow`, `auto_speed_turn`, `auto_speed_stuck`: $[0.0, 1.0]$
 
-## Ultrasonic sensor (HC-SR04)
 
 The autonomy stack supports an HC-SR04-style ultrasonic rangefinder mounted near the camera.
 
@@ -163,21 +185,15 @@ To avoid conflicts with the DRV8833 motor pins (`17, 27, 23, 18, 4`), the rover 
 These are the defaults in `ultrasonic.py`, and `main.py` initializes the sensor with these pins.
 
 ### Wiring (important)
-
-- HC-SR04 power: **VCC = 5V**, **GND = GND**
-- **TRIG** (5V-tolerant input on sensor) can be driven directly from Pi `GPIO 24`.
 - **ECHO is typically 5V** and **must be level-shifted** down to **3.3V** for Pi `GPIO 25`.
   - Use a voltage divider (example: 1k (top) + 2k (bottom) gives ~3.3V), or a logic-level shifter.
 
 ### Usage in code
 
 `main.py` reads the sensor and injects:
-
 - `perception['distance_cm']` (float cm or `None`)
 
 `decision.py` uses `distance_cm` with these tunables:
-
-- `dec_ultra_stop_cm`: if distance is below this, trigger an emergency escape
 - `dec_ultra_turn_cm`: if distance is below this (but above stop), bias turning/avoidance
 
 The reader uses a small median filter (`samples=3`) and timeouts to avoid blocking the main loop.
@@ -186,44 +202,26 @@ The reader uses a small median filter (`samples=3`) and timeouts to avoid blocki
 
 You mentioned a **USB stereo camera** with:
 
-- Dual lens, **1080p** over USB
-- **60mm baseline** between the two cameras
-- Ultrasonic sensor mounted with the camera assembly
 
 Current code treats `stereo_cam` as a *mode flag* and does not yet perform true stereo depth.
-The baseline is noted here so future depth/range fusion can use it consistently.
-
-## IMU (GY-521 / MPU-6050)
-
-The rover supports an I2C IMU (GY-521 breakout with MPU-6050) for roll/pitch estimation and motion smoothing.
-
-### Pins (I2C)
 
 MPU-6050 uses the Raspberry Pi's I2C bus (not arbitrary GPIO):
 
 - **SDA**: `GPIO 2` (physical pin 3)
-- **SCL**: `GPIO 3` (physical pin 5)
 - **3.3V**: physical pin 1 (or 17)
 - **GND**: physical pin 6 (or any GND)
-
 Address selection:
 
-- `AD0` LOW → `0x68` (default)
 - `AD0` HIGH → `0x69`
 
-`INT` can be left unconnected (this code polls).
 
 ### Enable I2C on the Pi
 
-On Raspberry Pi OS:
 
 ```bash
 sudo raspi-config
 ```
 
-Enable **Interface Options → I2C**, then reboot.
-
-Optional sanity check:
 
 ```bash
 sudo apt-get update
@@ -259,11 +257,35 @@ These keys are exposed under autonomy tuning and are persisted via `settings.jso
 - `imu_sample_div` (0..255, default 4)
 - `imu_gyro_calib_seconds` (0.2..10.0, default 1.0)
 
-## Combined pin map (quick reference)
+## GPIO Map (Raspberry Pi, BCM)
 
-- **DRV8833 motor driver (BCM)**: `AIN1=17`, `AIN2=27`, `BIN1=23`, `BIN2=18`, `STBY=4`
-- **Ultrasonic HC-SR04 (BCM)**: `TRIG=24`, `ECHO=25` (ECHO must be level-shifted)
-- **I2C (IMU MPU-6050)**: `SDA=2`, `SCL=3`
+- SPI0 Bus:
+  - SCLK: GPIO11 (pin 23)
+  - MOSI: GPIO10 (pin 19)
+  - MISO: GPIO9 (pin 21)
+  - CS (CE0): GPIO8 (pin 24) [used]
+  - CS (CE1): GPIO7 (pin 26) [optional]
+
+- TFT ST7735 (Vendor labels → GPIO):
+  - SCL → GPIO11 (SPI SCLK)
+  - SDA → GPIO10 (SPI MOSI)
+  - CS  → CE0 (GPIO8)
+  - DEC (D/C) → GPIO20 (pin 38)
+  - RES (Reset) → GPIO21 (pin 40)
+  - Backlight → 3V3 or a spare GPIO (optional)
+
+- Inputs (active‑low to GND):
+  - BTN1 (momentary) → GPIO5 (pin 29) — toggles Bluetooth pairing helper
+  - SPDT switch throws → GPIO16 (pin 36) for RC, GPIO27 (pin 13) for NAV (common to GND)
+
+- Ultrasonic HC‑SR04:
+  - TRIG → GPIO6 (pin 31)
+  - ECHO → GPIO12 (pin 32) — MUST be level‑shifted to 3.3V
+
+- I2C (IMU MPU‑6050):
+  - SDA → GPIO2 (pin 3)
+  - SCL → GPIO3 (pin 5)
+  - Bus: `/dev/i2c-1` (default)
 
 ## Motor control and safety
 
@@ -397,6 +419,126 @@ python3 main.py
 ```
 
 RC control tips
+## Raspberry Pi Setup
+
+This project is optimized for Raspberry Pi. Enable required interfaces and install packages:
+
+### Enable interfaces
+
+```bash
+sudo raspi-config
+# Interface Options → enable Camera and SPI
+```
+
+### Install system packages
+
+```bash
+sudo apt update
+sudo apt install -y python3-opencv python3-pip python3-picamera2 python3-rpi.gpio python3-spidev
+```
+
+### Python packages
+
+```bash
+pip3 install --upgrade pip
+pip3 install -r requirements.txt
+```
+
+### Camera notes
+
+- Picamera2 is preferred; `FrameProvider` uses it automatically when available.
+- USB cameras use V4L2; ensure `/dev/video0` exists.
+
+### TFT + Switches (SPI)
+
+- Enable SPI via `raspi-config` → Interface Options → SPI
+- Vendor labels → Pi pins:
+  - SCL → SPI SCLK (BCM11, pin 23)
+  - SDA → SPI MOSI (BCM10, pin 19)
+  - CS  → CE0/CE1 (device 0/1; CE0 = BCM8, pin 24)
+  - DEC → D/C GPIO (BCM20, pin 38)
+  - RES → RESET GPIO (BCM21, pin 40)
+- Inputs (active‑low to GND): BTN1=BCM5 (pin 29), SW1=BCM16 (pin 36), SW2=BCM27 (pin 13)
+- Files: `tft_display.py`, `hardware_switches.py` (integrated in `main.py`)
+
+### Raspberry Pi Pinout (40‑pin Header)
+
+Use BCM numbering in code (e.g., `GPIO.setmode(GPIO.BCM)`). Below, we list pins in the style “GPIO N (Function)” with their physical pin numbers for clarity.
+
+- Power:
+  - 3.3V: pin 1, pin 17
+  - 5V: pin 2, pin 4
+  - GND: pins 6, 9, 14, 20, 25, 30, 34, 39
+- I2C1 (IMU bus):
+  - GPIO 2 (SDA) → pin 3
+  - GPIO 3 (SCL) → pin 5
+- HAT EEPROM I2C:
+  - GPIO 0 (ID_SD) → pin 27
+  - GPIO 1 (ID_SC) → pin 28
+- UART0:
+  - GPIO 14 (TXD) → pin 8
+  - GPIO 15 (RXD) → pin 10
+- SPI0:
+  - GPIO 11 (SCLK) → pin 23
+  - GPIO 10 (MOSI) → pin 19
+  - GPIO 9  (MISO) → pin 21
+  - GPIO 8  (CE0)  → pin 24
+  - GPIO 7  (CE1)  → pin 26
+- PWM:
+  - GPIO 18 (PWM0) → pin 12
+  - GPIO 12 (PWM0 alt) → pin 32
+  - GPIO 13 (PWM1) → pin 33
+- Common GPIO (usable):
+  - GPIO 4 → pin 7
+  - GPIO 17 → pin 11
+  - GPIO 18 → pin 12
+  - GPIO 27 → pin 13
+  - GPIO 22 → pin 15
+  - GPIO 23 → pin 16
+  - GPIO 24 → pin 18
+  - GPIO 25 → pin 22
+  - GPIO 5  → pin 29
+  - GPIO 6  → pin 31
+  - GPIO 19 → pin 35
+  - GPIO 16 → pin 36
+  - GPIO 26 → pin 37
+  - GPIO 20 (TFT D/C) → pin 38
+  - GPIO 21 (TFT RESET) → pin 40
+
+Notes:
+- GPIOs are 3.3V‑only; level-shift any 5V signals (e.g., ultrasonic ECHO).
+- GPIO 18/19/20/21 also serve PCM/I2S (CLK/FS/DIN/DOUT).
+
+### Project Wiring Summary (BCM)
+- Camera: Picamera2 (CSI), or USB cam on `/dev/video0`.
+- TFT ST7735 (SPI0):
+  - SCLK → GPIO 11 (pin 23)
+  - MOSI → GPIO 10 (pin 19)
+  - CS   → CE0 (GPIO 8, pin 24) [or CE1 GPIO 7, pin 26]
+  - D/C  → GPIO 20 (pin 38)
+  - RESET → GPIO 21 (pin 40)
+- Inputs (active‑low to GND):
+  - BTN1 (pairing) → GPIO 5 (pin 29)
+  - RC mode throw → GPIO 16 (pin 36)
+  - NAV mode throw → GPIO 27 (pin 13)
+- Ultrasonic HC‑SR04:
+  - TRIG → GPIO 6 (pin 31)
+  - ECHO → GPIO 12 (pin 32) — MUST be level‑shifted to 3.3V
+- IMU (MPU‑6050 via I2C1):
+  - SDA → GPIO 2 (pin 3)
+  - SCL → GPIO 3 (pin 5)
+  - Bus: `/dev/i2c-1`
+- Motor Driver (DRV8833 default in code):
+  - AIN1 → GPIO 12 (pin 32)
+  - AIN2 → GPIO 13 (pin 33)
+  - BIN1 → GPIO 24 (pin 18)
+  - BIN2 → GPIO 23 (pin 16)
+  - STBY → GPIO 26 (pin 37)
+
+<!-- Jetson-specific documentation removed for Raspberry Pi-only setup -->
+
+<!-- TensorRT/CUDA references removed for Raspberry Pi-only setup -->
+
 
 - **WASD/buttons**: press-and-hold sends keepalives; release stops.
 - **Xbox controller**: connect it to your laptop/browser; the page will send joystick updates while in `rc` mode.

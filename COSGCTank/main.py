@@ -1,10 +1,21 @@
-from camera import FrameProvider
-from detector import ObstacleDetector
-from boundaries import BoundaryDetector
-from terrain import TerrainAnalyzer
-from decision import DecisionMaker
-from overlay import OverlayDrawer
-from motor_control import MotorController
+from hardware.camera import FrameProvider
+import argparse
+import os
+import subprocess
+from slam.detector import ObstacleDetector
+from objectDetection.boundaries import BoundaryDetector
+from objectDetection.terrain import TerrainAnalyzer
+from slam.decision import DecisionMaker
+from objectDetection.overlay import OverlayDrawer
+from objectDetection.ground_classifier import GroundClassifier
+from objectDetection.barrier_detector import BarrierDetector
+from hardware.motor_control import MotorController
+from hardware.tft_display import TFTDisplay
+from hardware.hardware_switches import Switches
+try:
+    from hardware.rc_controller import RCController  # local offline Xbox controller
+except Exception:
+    RCController = None  # type: ignore
 
 import cv2
 import time
@@ -12,7 +23,7 @@ import requests
 import math
 
 try:
-    from power_monitor import PowerMonitor, PowerMonitorSettings
+    from hardware.power_monitor import PowerMonitor, PowerMonitorSettings
 except Exception:
     PowerMonitor = None  # type: ignore
     PowerMonitorSettings = None  # type: ignore
@@ -29,28 +40,62 @@ def send_log_to_server(data):
 
 
 def main():
+    # CLI args: allow video file input for demos/tests
+    parser = argparse.ArgumentParser(description="COSGC Tank Rover Pipeline")
+    parser.add_argument("--video", type=str, default=None, help="Path to a video file for offline testing")
+    parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index (ignored if --video provided)")
+    parser.add_argument("--width", type=int, default=640, help="Output frame width")
+    parser.add_argument("--height", type=int, default=480, help="Output frame height")
+    parser.add_argument("--fps", type=int, default=20, help="Target processing FPS")
+    parser.add_argument("--headless", action="store_true", default=False, help="Run without GUI display (for systemd)")
+    args, unknown = parser.parse_known_args()
+
+    # Auto-enable headless if DISPLAY is unavailable (e.g., running under sudo or SSH without X forwarding)
+    if not args.headless and not os.environ.get('DISPLAY'):
+        args.headless = True
+        print("Headless enabled: DISPLAY not found; skipping GUI windows.")
+
     print("Starting rover perception system...")
 
-    provider = FrameProvider(width=640, height=480, fps=20)
-    det = ObstacleDetector(settings={})
+    cam_source = args.video if (args.video and os.path.exists(args.video)) else args.camera_index
+    provider = FrameProvider(width=args.width, height=args.height, fps=args.fps, camera_index=cam_source)
+    # Raspberry Pi defaults; CPU/OpenCV only
+    det_settings = {
+        'use_cuda_resize': False,
+        'cv_threads': 2,
+    }
+    det = ObstacleDetector(settings=det_settings)
     bounds = BoundaryDetector()
     terrain = TerrainAnalyzer()
     decider = DecisionMaker()
     overlay = OverlayDrawer()
     motor = MotorController()
     try:
-        from ultrasonic import Ultrasonic
-        # HC-SR04 wiring (BCM): TRIG=24, ECHO=25 (ECHO must be level-shifted to 3.3V)
-        us = Ultrasonic(trig_pin=24, echo_pin=25)
+        from hardware.ultrasonic import Ultrasonic
+        # HC-SR04 wiring (BCM): TRIG=6 (pin31), ECHO=12 (pin32). Level-shift ECHO to 3.3V.
+        us = Ultrasonic(trig_pin=6, echo_pin=12)
     except Exception:
         us = None
-    from navigator import Navigator
-    from scale_estimator import ScaleEstimator
+    from slam.navigator import Navigator
+    from objectDetection.scale_estimator import ScaleEstimator
     nav = Navigator(grid_size=40, resolution=0.2)
     # Default local navigation behavior: keep a short-horizon goal ahead.
     # This makes the planner generate a corridor-following waypoint even without a global map.
     nav_goal_dist_m = 1.2
     scale_est = ScaleEstimator(window=80)
+    # Additional perception modules
+    ground_cls = GroundClassifier(roi_fraction=0.55)
+    barrier_det = BarrierDetector(roi_fraction=0.6)
+
+    # Hardware UI (TFT + switches)
+    # GPIO mappings chosen to avoid common motor/ultrasonic pins
+    # TFT DEC=20 (pin 38), RES=21 (pin 40); SPI0 CE0 used for CS
+    tft = TFTDisplay(dec_pin=20, res_pin=21, spi_port=0, spi_device=0, width=160, height=80, rotate=90)
+    # Buttons/Switches: BTN1=5 (pin 29), SW1=16 (pin 36), SW2=27 (pin 13)
+    switches = Switches(btn1_pin=5, rc_pin=16, nav_pin=27, debounce_s=0.03)
+    last_mode_sent = None
+    rc = None  # offline RC controller instance
+    pair_scan_until = 0.0  # show 'pairing' while scan helper is active
 
     frame_iter = provider.frames()
     last_time = time.time()
@@ -76,15 +121,53 @@ def main():
             frame = data["frame"]
             ts = data["timestamp"]
 
+            # Poll hardware switches (debounced)
+            try:
+                switches.poll()
+            except Exception:
+                pass
+
+            # Apply hardware-driven modes into settings and server
+            is_rc = (switches.mode == 'RC')
+            settings_cache['mode'] = 'rc' if is_rc else 'autonomous'
+            settings_cache['nav_explore_enabled'] = False if is_rc else bool(settings_cache.get('nav_explore_enabled', False))
+            # Notify server of mode change (best-effort)
+            try:
+                mode_val = settings_cache['mode']
+                if last_mode_sent != mode_val:
+                    r = requests.post('http://127.0.0.1:5000/mode', json={'mode': mode_val}, timeout=0.25)
+                    if r.status_code == 200:
+                        last_mode_sent = mode_val
+            except Exception:
+                pass
+
+            # Pairing toggle via BTN1 press: start simple Bluetooth scan/pair helper
+            try:
+                if switches.consume_pair_toggle():
+                    # Best-effort: attempt to start bluetoothctl scan for 12s
+                    try:
+                        subprocess.Popen(['bash', '-lc', 'bluetoothctl scan on; sleep 12; bluetoothctl scan off'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        pair_scan_until = time.time() + 12.0
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             obstacles = det.detect(frame)
             boundary_info = bounds.detect(frame)
             terrain_info = terrain.analyze(frame)
+            # ground classification and barrier detection
+            ground_info = ground_cls.analyze(frame)
+            barrier_dets = barrier_det.detect(frame)
+            if barrier_dets:
+                obstacles = list(obstacles) + list(barrier_dets)
 
             perception = {
                 "timestamp": ts,
                 "obstacles": obstacles,
                 "boundary": boundary_info,
-                "terrain": terrain_info
+                "terrain": terrain_info,
+                "ground": ground_info,
             }
 
             # read ultrasonic when available (non-blocking)
@@ -183,7 +266,7 @@ def main():
             else:
                 if imu is None:
                     try:
-                        from imu import MPU6050, ImuSettings
+                        from hardware.imu import MPU6050, ImuSettings
                         imu = MPU6050(ImuSettings(
                             i2c_bus=int(settings_cache.get('imu_i2c_bus', 1)),
                             i2c_addr=int(settings_cache.get('imu_i2c_addr', 0x68)),
@@ -296,6 +379,52 @@ def main():
 
             decision = decider.decide(perception)
 
+            # RC mode: if offline controller available, drive motors directly.
+            try:
+                if settings_cache.get('mode') == 'rc':
+                    # Lazy init controller on entering RC mode
+                    if rc is None and RCController is not None:
+                        try:
+                            rc = RCController()
+                        except Exception:
+                            rc = None
+                    # If controller present, read state and mix to motor outputs
+                    rc_status = None
+                    rc_debug = None
+                    if rc is not None and getattr(rc, 'available', False):
+                        thr, steer, estop = rc.get()
+                        name = getattr(rc, 'device_name', None)
+                        rc_status = f"paired{(' ('+name+')') if name else ''}"
+                        rc_debug = f"thr {thr:.2f} steer {steer:.2f} estop {'Y' if estop else 'N'}"
+                        if estop or abs(thr) < 1e-3 and abs(steer) < 1e-3:
+                            motor.stop()
+                        else:
+                            # Mix to differential speeds: left = thr + steer, right = thr - steer
+                            left = max(-1.0, min(1.0, float(thr + steer)))
+                            right = max(-1.0, min(1.0, float(thr - steer)))
+                            motor._drive(left_forward=(left >= 0.0), right_forward=(right >= 0.0),
+                                         left_speed=abs(left), right_speed=abs(right))
+                        # Skip autonomy mapping
+                        decision = {'command': 'STOP', 'reason': 'RC mode (offline controller)'}
+                    else:
+                        # No local controller — fall back to server-based RC semantics
+                        decision = {'command': 'STOP', 'reason': 'RC mode'}
+                        # Show pairing status while scan helper active
+                        if time.time() < pair_scan_until:
+                            rc_status = 'pairing'
+                        else:
+                            rc_status = 'not paired'
+                else:
+                    # Leaving RC mode: clean up controller if present
+                    if rc is not None:
+                        try:
+                            rc.close()
+                        except Exception:
+                            pass
+                        rc = None
+            except Exception:
+                pass
+
             # Recovery-aware exploration: if we trigger recovery while exploring,
             # temporarily blacklist the current explore frontier goal.
             try:
@@ -308,8 +437,9 @@ def main():
             except Exception:
                 pass
 
-            # execute mapped motor action
-            action, params = decider.map_to_motor(decision["command"], speed=decision.get('speed'))
+            # execute mapped motor action (robust to missing command)
+            cmd = decision.get("command", "STOP") if isinstance(decision, dict) else "STOP"
+            action, params = decider.map_to_motor(cmd, speed=decision.get('speed') if isinstance(decision, dict) else None)
             if hasattr(motor, action):
                 try:
                     getattr(motor, action)(**params)
@@ -317,8 +447,11 @@ def main():
                     # method signature mismatch, call without params
                     getattr(motor, action)()
 
-            # overlays and display
-            frame_overlay = overlay.apply(frame.copy(), obstacles, boundary_info, terrain_info, decision)
+            # overlays and display (guard if frame is None)
+            if frame is not None:
+                frame_overlay = overlay.apply(frame.copy(), obstacles, boundary_info, terrain_info, decision, ground=ground_info)
+            else:
+                frame_overlay = None
 
             # compute simple FPS
             fps_count += 1
@@ -329,12 +462,34 @@ def main():
             else:
                 fps = 0.0
 
-            frame_overlay = overlay.draw_fps(frame_overlay, fps)
-            frame_overlay = overlay.draw_center_line(frame_overlay)
+            if frame_overlay is not None:
+                frame_overlay = overlay.draw_fps(frame_overlay, fps)
+                frame_overlay = overlay.draw_center_line(frame_overlay)
 
-            cv2.imshow("Rover Vision", cv2.cvtColor(frame_overlay, cv2.COLOR_RGB2BGR))
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if not args.headless and frame_overlay is not None:
+                cv2.imshow("Rover Vision", cv2.cvtColor(frame_overlay, cv2.COLOR_RGB2BGR))
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            # Update hardware TFT status (best-effort)
+            try:
+                if getattr(tft, 'available', False):
+                    # Compute RC status/debug only when in RC mode
+                    mode_str = switches.mode
+                    if mode_str == 'RC':
+                        # rc_status and rc_debug from above scope if defined
+                        pass
+                    tft.draw_status(
+                        mode=mode_str,
+                        explore=bool(settings_cache.get('nav_explore_enabled', False)),
+                        safe=bool(settings_cache.get('safe_mode', False)),
+                        fps=float(fps),
+                        distance_cm=perception.get('distance_cm'),
+                        power=perception.get('power'),
+                        rc_status=locals().get('rc_status'),
+                        rc_debug=locals().get('rc_debug'))
+            except Exception:
+                pass
 
             # send log asynchronously (best-effort)
             log = overlay.export_log(perception, decision)
@@ -364,11 +519,16 @@ def main():
         provider.release()
         motor.cleanup()
         try:
+            switches.cleanup()
+        except Exception:
+            pass
+        try:
             if imu is not None:
                 imu.close()
         except Exception:
             pass
-        cv2.destroyAllWindows()
+        if not args.headless:
+            cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
