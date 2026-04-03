@@ -47,29 +47,18 @@ void AutonomousNav::setNavTarget(float x_cm, float y_cm) {
 }
 
 // ==================== NAVIGATION CONSTANTS ====================
+// Distance/timing thresholds are in config.h (DIST_CRITICAL, DIST_CLOSE_ADV, etc.)
 
-// Distance thresholds (cm) — ultrasonic is 76mm above ground
-#define DIST_CRITICAL   15.0f   // Emergency — must reverse immediately
-#define DIST_CLOSE      35.0f   // Obstacle — enter avoidance (was 25, too late to react)
-#define DIST_MEDIUM     60.0f   // Caution — speed reduction zone
-#define DIST_FAR        100.0f  // Cruising — full speed
+// Local aliases — map config.h names to the names used in this file
+#define DIST_CLOSE   DIST_CLOSE_ADV
+#define DIST_MEDIUM  DIST_MEDIUM_ADV
+#define DIST_FAR     DIST_FAR_ADV
 
 // Speed settings (PWM 0-255, hardware clamps to maxSafePWM=210)
 #define SPEED_MAX       MAX_PWM
 #define SPEED_CRUISE    MAX_PWM
 #define SPEED_TURN      MAX_PWM
 #define SPEED_MIN_MOVE  (MAX_PWM * 80 / 100)  // Minimum to overcome friction
-
-// Avoidance timing
-#define AVOID_BACKUP_MS       250   // Reverse duration on obstacle detect (short nudge back)
-#define AVOID_BACKUP_CRIT_MS  350   // Reverse duration on critical obstacle
-#define AVOID_VERIFY_MS       300   // Forward check duration after turn
-#define AVOID_MAX_CYCLES      4     // Max avoid cycles before escalating to recovery
-
-// Stall detection
-#define STALL_TIMEOUT_MS      2500  // Distance stuck under DIST_MEDIUM → avoidance
-#define STUCK_THRESHOLD       8     // History readings to consider stuck
-#define STUCK_DISTANCE_TOL    5.0f  // Distance tolerance (cm)
 
 // ==================== CONSTRUCTOR ====================
 
@@ -171,9 +160,9 @@ void AutonomousNav::updateIMU(float ax, float ay, float az, float gx, float gy, 
     gyroZ = gz;
     imuAvailable = true;
     
-    // Integrate gyroscope for heading
+    // Integrate gyroscope for heading (subtract configured drift offset)
     if (dt > 0 && dt < 0.5f) {
-        heading += gz * dt;
+        heading += (gz - GYRO_DRIFT_COMPENSATION) * dt;
         while (heading >= 360) heading -= 360;
         while (heading < 0) heading += 360;
         
@@ -1259,7 +1248,7 @@ bool AutonomousNav::isStuck() {
     
     if ((maxD - minD) < STUCK_DISTANCE_TOL && lastDistance < DIST_MEDIUM) {
         stuckCounter++;
-        return stuckCounter >= STUCK_THRESHOLD;
+        return stuckCounter >= STUCK_COUNT_THRESHOLD;
     } else {
         stuckCounter = 0;
     }

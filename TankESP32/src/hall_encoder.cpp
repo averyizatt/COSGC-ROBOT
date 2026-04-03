@@ -1,10 +1,8 @@
 
 #include "hall_encoder.h"
 #include "config.h"
-// Wheelbase (distance between left/right wheels, cm)
-#ifndef ENCODER_WHEELBASE_CM
-#define ENCODER_WHEELBASE_CM 10.0f  // <-- Set to your actual track width!
-#endif
+// Wheelbase: use TRACK_WIDTH_MM from config.h, converted to cm
+#define ENCODER_WHEELBASE_CM (TRACK_WIDTH_MM / 10.0f)
 
 // ==================== HALL EFFECT ENCODER ====================
 // A3144 sensors on output shafts — interrupt-driven pulse counting.
@@ -15,34 +13,27 @@ static const float CM_PER_PULSE = (PI * ENCODER_WHEEL_DIA_MM / 10.0f) / ENCODER_
 // π × 26mm / 10 = 8.168cm circumference, / 2 magnets = 4.084 cm/pulse
 
 // Stall: no pulse for this long while motors should be running
-static const unsigned long STALL_TIMEOUT_MS = 500;
+static const unsigned long ENCODER_STALL_TIMEOUT_MS = 500;
 
 // ISR pulse counters (must be volatile + static)
 volatile unsigned long HallEncoder::leftPulseCount = 0;
 volatile unsigned long HallEncoder::rightPulseCount = 0;
 
-// Debounce — ignore pulses faster than this (prevents noise from motor PWM / EMI)
-static const unsigned long DEBOUNCE_US = 5000;  // 5ms — with 2 magnets, max legit freq ~33Hz at 1000RPM
+// Debounce, smoothing, and filter constants — pulled from config.h
+// ENCODER_DEBOUNCE_US, ENCODER_SPEED_EMA_ALPHA, ENCODER_COMP_ALPHA
 static volatile unsigned long lastLeftISR_us = 0;
 static volatile unsigned long lastRightISR_us = 0;
 
-// Speed smoothing — exponential moving average to tolerate missed / spurious pulses
-static const float SPEED_EMA_ALPHA = 0.3f;  // 0.0 = ignore new, 1.0 = no smoothing
-
 // Max physically possible speed (cm/s). Anything above this is EMI noise.
-// At 1500 RPM, 2 magnets, 4.08 cm/pulse → 1500/60*2*4.08 ≈ 204 cm/s. Use generous cap.
+// At 1500 RPM, 2 magnets, 4.08 cm/pulse → 1500/60*2*4.08 ≈ 204 cm/s
 static const float MAX_SPEED_CM_S = 250.0f;
-
-// Complementary filter: blend encoder (low-freq truth) with IMU-integrated velocity (high-freq responsiveness)
-// Higher = trust encoder more.  0.85 works well for coarse (2-magnet) encoders.
-static const float COMP_FILTER_ALPHA = 0.85f;
 static const float G_TO_CM_S2 = 980.665f;  // 1 g = 980.665 cm/s²
 
 // ==================== ISRs ====================
 
 void IRAM_ATTR HallEncoder::leftISR() {
     unsigned long now = micros();
-    if (now - lastLeftISR_us > DEBOUNCE_US) {
+    if (now - lastLeftISR_us > ENCODER_DEBOUNCE_US) {
         leftPulseCount++;
         lastLeftISR_us = now;
     }
@@ -50,7 +41,7 @@ void IRAM_ATTR HallEncoder::leftISR() {
 
 void IRAM_ATTR HallEncoder::rightISR() {
     unsigned long now = micros();
-    if (now - lastRightISR_us > DEBOUNCE_US) {
+    if (now - lastRightISR_us > ENCODER_DEBOUNCE_US) {
         rightPulseCount++;
         lastRightISR_us = now;
     }
@@ -142,8 +133,8 @@ void HallEncoder::update() {
     if (rawRightSpeed > MAX_SPEED_CM_S) rawRightSpeed = rightSpeedCmS;
 
     // Exponential moving average
-    leftSpeedCmS  = SPEED_EMA_ALPHA * rawLeftSpeed  + (1.0f - SPEED_EMA_ALPHA) * leftSpeedCmS;
-    rightSpeedCmS = SPEED_EMA_ALPHA * rawRightSpeed + (1.0f - SPEED_EMA_ALPHA) * rightSpeedCmS;
+    leftSpeedCmS  = ENCODER_SPEED_EMA_ALPHA * rawLeftSpeed  + (1.0f - ENCODER_SPEED_EMA_ALPHA) * leftSpeedCmS;
+    rightSpeedCmS = ENCODER_SPEED_EMA_ALPHA * rawRightSpeed + (1.0f - ENCODER_SPEED_EMA_ALPHA) * rightSpeedCmS;
 
     // Kill residual drift when truly stopped
     if (leftDelta == 0 && leftSpeedCmS < 0.5f)  leftSpeedCmS = 0;
@@ -164,7 +155,7 @@ void HallEncoder::update() {
     // Integrate IMU acceleration to get IMU-predicted velocity
     imuSpeed += forwardAccelG * G_TO_CM_S2 * dt;
     // Blend: trust encoder for long-term, IMU for short-term changes
-    fusedSpeedCmS = COMP_FILTER_ALPHA * encoderSpeed + (1.0f - COMP_FILTER_ALPHA) * imuSpeed;
+    fusedSpeedCmS = ENCODER_COMP_ALPHA * encoderSpeed + (1.0f - ENCODER_COMP_ALPHA) * imuSpeed;
     // Anchor IMU integrator to fused value (prevents unbounded drift)
     imuSpeed = fusedSpeedCmS;
     // Clamp negative (robot doesn't report reverse as negative speed here)
@@ -199,9 +190,9 @@ float HallEncoder::getLeftRPM()  { return leftRPM; }
 float HallEncoder::getRightRPM() { return rightRPM; }
 
 bool HallEncoder::isLeftStalled() {
-    return (millis() - lastLeftPulseTime) > STALL_TIMEOUT_MS;
+    return (millis() - lastLeftPulseTime) > ENCODER_STALL_TIMEOUT_MS;
 }
 
 bool HallEncoder::isRightStalled() {
-    return (millis() - lastRightPulseTime) > STALL_TIMEOUT_MS;
+    return (millis() - lastRightPulseTime) > ENCODER_STALL_TIMEOUT_MS;
 }

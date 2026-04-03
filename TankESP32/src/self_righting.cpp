@@ -1,32 +1,25 @@
 #include "self_righting.h"
 #include "config.h"
 
-// Servo timing: standard servo expects 50Hz PWM
-// With 16-bit resolution at 50Hz: period = 20ms = 65536 counts
-// SERVO_MIN_US/MAX_US are defined in config.h and map to 0°/180°
+// Servo timing: SERVO_FREQ_HZ, SERVO_MIN_US, SERVO_MAX_US are all defined in config.h
+// With 16-bit resolution the period = 1,000,000/SERVO_FREQ_HZ µs = 65536 counts
 
-#define SERVO_FREQ       50
 #define SERVO_RESOLUTION 16
 
-// Self-righting / unsticking parameters (aggressive full sweep)
+// Self-righting / unsticking parameters — tuning values are in config.h
 // Servo mounted on side, gear output on robot-right. 0°=LEFT extreme, 90°=CENTER, 180°=RIGHT extreme.
-#define ARM_STOW_ANGLE      90   // Arm centered (pointing forward) — stow/park position
-#define ARM_SWEEP_MIN        0   // Full sweep left
-#define ARM_SWEEP_MAX      180   // Full sweep right
-#define ARM_SWEEP_STEP       3   // Degrees per step (slower but strong)
-#define ARM_SWEEP_DELAY_MS  25   // Milliseconds between steps (slower sweep)
-#define ARM_MAX_ATTEMPTS    40   // Max full sweeps before giving up temporarily
-#define ARM_COOLDOWN_MS   2000   // Pause after max attempts before retrying
-#define ARM_HOLD_AT_EXTREME_MS 7000 // Hold at 0° or 180° for 7 seconds
+#define ARM_STOW_ANGLE   90   // Arm centered (pointing forward) — stow/park position
+#define ARM_SWEEP_MIN     0   // Full sweep left
+#define ARM_SWEEP_MAX   180   // Full sweep right
+// ARM_SWEEP_STEP, ARM_SWEEP_DELAY_MS, ARM_HOLD_AT_EXTREME_MS, ARM_COOLDOWN_MS → config.h
 
-// Unstick parameters (same aggressive sweep, fewer attempts since robot is upright)
-#define ARM_UNSTICK_MAX      12  // Max sweeps during unstick before cooldown
-#define ARM_UNSTICK_COOLDOWN 1500 // Shorter cooldown for unstick
+// Unstick parameters
+// ARM_UNSTICK_MAX, ARM_UNSTICK_COOLDOWN_MS → config.h
 
 // Side-righting parameters
 #define SIDE_PUSH_HOLD_MS    3000 // Hold at extreme for 3s per push attempt
 #define SIDE_MAX_PUSHES      6    // Max push attempts before falling back to full sweep
-#define SIDE_ROCK_ANGLE      40   // Degrees to rock back before re-pushing
+#define SIDE_ROCK_ANGLE      25   // Degrees to rock back before re-pushing
 
 // Idle oscillation parameters (gentle)
 #define IDLE_AMPLITUDE       10  // ±10° from center
@@ -51,7 +44,7 @@ SelfRightingArm::SelfRightingArm() {
 }
 
 void SelfRightingArm::begin() {
-    ledcSetup(PWM_CHANNEL_SERVO, SERVO_FREQ, SERVO_RESOLUTION);
+    ledcSetup(PWM_CHANNEL_SERVO, SERVO_FREQ_HZ, SERVO_RESOLUTION);
     ledcAttachPin(SERVO_PIN, PWM_CHANNEL_SERVO);
 
     // Move to stow position briefly, then kill PWM to save power
@@ -68,9 +61,11 @@ void SelfRightingArm::writeAngle(int angle) {
     // Convert angle to pulse width in microseconds
     long pulseUs = map(angle, 0, 180, SERVO_MIN_US, SERVO_MAX_US);
 
-    // Convert pulse width to LEDC duty (16-bit at 50Hz → 20ms period)
-    // duty = pulseUs / 20000 * 65536
-    uint32_t duty = (uint32_t)(pulseUs * 65536L / 20000L);
+    // Convert pulse width to LEDC duty (16-bit resolution)
+    // Period (µs) = 1,000,000 / SERVO_FREQ_HZ
+    // duty = pulseUs / period_us * 65536
+    uint32_t periodUs = 1000000UL / SERVO_FREQ_HZ;
+    uint32_t duty = (uint32_t)(pulseUs * 65536UL / periodUs);
     ledcWrite(PWM_CHANNEL_SERVO, duty);
 }
 
@@ -106,19 +101,15 @@ void SelfRightingArm::update(bool isUpsideDown, bool isOnSide, float rollDeg) {
         sweepCount = 0;
         holdingAtExtreme = false;
         holdStartTime = 0;
-        // Start on the side that is DOWN so the first push immediately applies leverage.
-        // rollDeg > 0 → tilted right → right side is ground → start at RIGHT extreme (180°)
-        // rollDeg < 0 → tilted left  → left side is ground  → start at LEFT  extreme (0°)
-        if (rollDeg > 0) {
-            currentAngle = ARM_SWEEP_MAX;  // Right extreme — push off right side
-            sweepDirection = -1;           // Sweep toward left
-        } else {
-            currentAngle = ARM_SWEEP_MIN;  // Left extreme — push off left side
-            sweepDirection = 1;            // Sweep toward right
-        }
+        // Start from center. Use roll sign to sweep toward the correct extreme first:
+        // rollDeg > 0 → right side down → sweep right (to 180°) first so arm pushes off ground
+        // rollDeg < 0 → left side down  → sweep left  (to 0°)  first so arm pushes off ground
+        currentAngle = ARM_STOW_ANGLE;
+        sweepDirection = (rollDeg >= 0) ? 1 : -1;
         writeAngle(currentAngle);
         lastSweepTime = now;
-        Serial.printf("[SERVO] *** ON SIDE (roll=%.1f°) — starting full sweeps from %d° ***\n", rollDeg, currentAngle);
+        Serial.printf("[SERVO] *** ON SIDE (roll=%.1f°) — sweeping %s first ***\n",
+                      rollDeg, sweepDirection > 0 ? "RIGHT" : "LEFT");
     }
 
     switch (state) {
@@ -319,7 +310,7 @@ void SelfRightingArm::update(bool isUpsideDown, bool isOnSide, float rollDeg) {
                     Serial.println("[SERVO] Unstick max sweeps — cooldown");
                     stow();
                     state = ARM_COOLDOWN;
-                    cooldownUntil = now + ARM_UNSTICK_COOLDOWN;
+                    cooldownUntil = now + ARM_UNSTICK_COOLDOWN_MS;
                 }
             }
             break;
@@ -327,7 +318,7 @@ void SelfRightingArm::update(bool isUpsideDown, bool isOnSide, float rollDeg) {
         case ARM_COOLDOWN:
             if (now >= cooldownUntil) {
                 if (isUpsideDown) {
-                    // Still flipped — try again
+                    // Still flipped — try again from correct start angle
                     state = ARM_RIGHTING;
                     rightingStartTime = now;
                     sweepCount = 0;
@@ -335,18 +326,22 @@ void SelfRightingArm::update(bool isUpsideDown, bool isOnSide, float rollDeg) {
                     holdingAtExtreme = false;
                     holdStartTime = 0;
                     lastSweepTime = now;
+                    currentAngle = ARM_SWEEP_MIN;
+                    writeAngle(currentAngle);
                     Serial.println("[SERVO] Still upside down — retrying self-righting");
                 } else if (isOnSide) {
-                    // Still on side — try side-righting again
+                    // Still on side — re-read rollDeg so we push off the correct side again
                     state = ARM_SIDE_RIGHTING;
                     sideStartTime = now;
                     sweepCount = 0;
-                    sweepDirection = 1;
                     holdingAtExtreme = false;
                     holdStartTime = 0;
                     lastSweepTime = now;
                     currentAngle = ARM_STOW_ANGLE;
-                    Serial.printf("[SERVO] Still on side (roll=%.1f°) — retrying full sweeps\n", rollDeg);
+                    sweepDirection = (rollDeg >= 0) ? 1 : -1;
+                    writeAngle(currentAngle);
+                    Serial.printf("[SERVO] Still on side (roll=%.1f°) — retrying, sweeping %s first\n",
+                                  rollDeg, sweepDirection > 0 ? "RIGHT" : "LEFT");
                 } else {
                     // We're upright — go to stowed
                     state = ARM_STOWED;

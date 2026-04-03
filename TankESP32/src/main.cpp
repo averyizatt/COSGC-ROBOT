@@ -58,6 +58,11 @@ float lastRawRight = 0;
 int lastMotorSpeedA = 0;
 int lastMotorSpeedB = 0;
 
+// === RUNTIME FAULT FLAGS ===
+// Set when a sensor produces implausible data at runtime; cleared on recovery.
+bool imuFaultDetected   = false;  // IMU accel magnitude near-zero (frozen/disconnected)
+bool encoderFaultDetected = false; // Both encoders silent while motors commanded high
+
 // Function prototypes
 void handleMotorCommand(int speedA, int speedB);
 void handleCustomCommand(uint8_t cmd, uint8_t* data, uint8_t length);
@@ -130,9 +135,9 @@ void setup() {
     Serial.println("Initializing ultrasonic sensors...");
     Serial.flush();
     ultrasonicLeft.begin();
-    Serial.println("Ultrasonic LEFT (GPIO12/11) initialized OK");
+    Serial.printf("Ultrasonic LEFT  (TRIG=GPIO%d ECHO=GPIO%d) initialized OK\n", ULTRASONIC_TRIG, ULTRASONIC_ECHO);
     ultrasonicRight.begin();
-    Serial.println("Ultrasonic RIGHT (GPIO38/37) initialized OK");
+    Serial.printf("Ultrasonic RIGHT (TRIG=GPIO%d ECHO=GPIO%d) initialized OK\n", ULTRASONIC2_TRIG, ULTRASONIC2_ECHO);
     Serial.flush();
     
     // Initialize IMU
@@ -577,8 +582,36 @@ void updateSensors() {
         sensorData.gyroY = imu.getGyroY();
         sensorData.gyroZ = imu.getGyroZ();
         sensorData.temperature = imu.getTemperature();
-        
-        // TANK MODE: Detect upside-down and tell motor controller
+
+        // === IMU PLAUSIBILITY / FAULT DETECTION ===
+        // When upright and in 1g gravity, accel magnitude should be close to 1.0.
+        // If it reads near-zero for >2s the IMU has frozen or lost I2C comms.
+        {
+            static unsigned long imuFlatStart = 0;
+            float imuMag = sqrt(sensorData.accelX * sensorData.accelX +
+                                sensorData.accelY * sensorData.accelY +
+                                sensorData.accelZ * sensorData.accelZ);
+            bool imuFlat = (imuMag < 0.15f);  // <0.15g is physically impossible in gravity
+            if (imuFlat) {
+                if (imuFlatStart == 0) imuFlatStart = millis();
+                if (!imuFaultDetected && millis() - imuFlatStart > 2000) {
+                    imuFaultDetected = true;
+                    Serial.println("[FAULT] IMU accel magnitude near-zero >2s — IMU may be disconnected. Disabling IMU-dependent features.");
+                }
+            } else {
+                imuFlatStart = 0;
+                if (imuFaultDetected) {
+                    imuFaultDetected = false;
+                    Serial.printf("[FAULT] IMU recovered (mag=%.2f) — re-enabling IMU features.\n", imuMag);
+                }
+            }
+        }
+        // Guard all orientation-dependent logic against IMU faults.
+        // If the IMU is returning garbage, keep motors normal and arm stowed.
+        if (imuFaultDetected) {
+            motors.setUpsideDown(false);
+            selfRighting.update(false, false, 0.0f);
+        } else {
         // AccelZ < threshold means gravity is pulling "up" relative to the board
         // Debounce: must be sustained for 500ms to avoid false triggers from vibration
         static unsigned long flipDetectStart = 0;
@@ -606,9 +639,9 @@ void updateSensors() {
         bool isFlipped = confirmedFlipped;
         motors.setUpsideDown(isFlipped);
         
-        // Detect "on side" state using roll angle
-        // Roll = rotation around forward axis; large roll = rover tipped onto its side
-        float imuRoll = atan2(sensorData.accelY, sensorData.accelZ) * 180.0f / PI;
+        // Detect "on side" state using roll angle.
+        // accelX is the lateral axis: +1g = right side down, -1g = left side down.
+        float imuRoll = atan2(sensorData.accelX, sensorData.accelZ) * 180.0f / PI;
         static unsigned long sideDetectStart = 0;
         static bool confirmedOnSide = false;
         bool rawOnSide = (fabs(imuRoll) > ON_SIDE_ROLL_THRESHOLD);
@@ -634,11 +667,11 @@ void updateSensors() {
         
         // Self-righting arm: handle upside-down, on-side, or normal
         selfRighting.update(isFlipped, confirmedOnSide, imuRoll);
-        
+        } // end !imuFaultDetected
+
         // Motors run during both righting and unsticking — helps the arm flip/free the robot.
         // The upside-down motor inversion in setMotors() already handles direction.
-    }
-    
+    } // end IMU_ENABLED
     // Debug output (optional)
     #ifdef DEBUG_SENSORS
     Serial.printf("Distance: %.2f cm | ", sensorData.distance);
@@ -869,10 +902,183 @@ void handleAutonomousMode() {
     
     // Update IMU data for orientation detection
     #if IMU_ENABLED
+    if (!imuFaultDetected) {
     autoNav.updateIMU(sensorData.accelX, sensorData.accelY, sensorData.accelZ,
                       sensorData.gyroX, sensorData.gyroY, sensorData.gyroZ);
+    }
     #endif
-    
+
+    // === TRACTION CONTROL ===
+    // Detects free-spin: encoder sees high wheel speed but IMU sees no body movement.
+    // Response stages:
+    //   Stage 1 — cut power to TC_REDUCE_PWM to let wheels regain grip, hold for TC_HOLD_MS
+    //   Stage 2 — slowly ramp back up; if still spinning, repeat stage 1 up to TC_MAX_CUTS times
+    //   Stage 3 — after TC_MAX_CUTS failed cuts, fall back to full avoidance (back up + turn)
+    #if IMU_ENABLED
+    {
+        static float fsMagBuf[MOTION_VERIFY_WINDOW];
+        static int   fsMagIdx   = 0;
+        static bool  fsMagReady = false;
+        static unsigned long fsSpinStart    = 0;   // When continuous spin was first detected
+        static unsigned long tcCutUntil     = 0;   // Hold reduced power until this time
+        static int           tcCutCount     = 0;   // How many power cuts have been applied
+        static bool          tcActive       = false; // Currently in a power-cut hold
+        static unsigned long fsCooldownUntil = 0;  // Post-recovery cooldown
+
+        // Traction control tuning
+        const int   TC_REDUCE_PWM  = 80;    // Reduced power during traction cut (0-255)
+        const unsigned long TC_HOLD_MS    = 400;  // How long to hold reduced power (ms)
+        const unsigned long TC_CONFIRM_MS = 600;  // Spin must persist this long before cutting
+        const int   TC_MAX_CUTS    = 4;     // Max cuts before escalating to avoidance
+
+        float fsAx = sensorData.accelX, fsAy = sensorData.accelY, fsAz = sensorData.accelZ;
+        float fsMag = sqrt(fsAx*fsAx + fsAy*fsAy + fsAz*fsAz);
+        fsMagBuf[fsMagIdx] = fsMag;
+        fsMagIdx = (fsMagIdx + 1) % MOTION_VERIFY_WINDOW;
+        if (fsMagIdx == 0) fsMagReady = true;
+
+        bool fsMotionOK = true;
+        if (fsMagReady) {
+            float sum = 0;
+            for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) sum += fsMagBuf[i];
+            float mean = sum / MOTION_VERIFY_WINDOW;
+            float var  = 0;
+            for (int i = 0; i < MOTION_VERIFY_WINDOW; i++) {
+                float d = fsMagBuf[i] - mean; var += d * d;
+            }
+            var /= MOTION_VERIFY_WINDOW;
+            fsMotionOK = (var > MOTION_ACCEL_VAR_THRESH);
+        }
+
+        // === ENCODER FAULT GUARD ===
+        // If both encoders have been silent for >2s while motors are commanded high,
+        // the encoder data is unreliable. Disable TC to avoid false free-spin triggers.
+        {
+            static unsigned long encoderSilentStart = 0;
+            bool motorsHigh = (lastMotorSpeedA >= 80 && lastMotorSpeedB >= 80);
+            bool leftStalled  = encoders.isLeftStalled();
+            bool rightStalled = encoders.isRightStalled();
+            bool bothStalled  = leftStalled && rightStalled;
+            // Warn on single-side dropout (one reading, one silent) — asymmetric traction
+            if (motorsHigh && !bothStalled && (leftStalled || rightStalled)) {
+                static unsigned long singleDropWarnAt = 0;
+                if (millis() - singleDropWarnAt > 5000) {
+                    Serial.printf("[WARN] Encoder dropout on %s side — asymmetric reading.\n",
+                                  leftStalled ? "LEFT" : "RIGHT");
+                    singleDropWarnAt = millis();
+                }
+            }
+            if (motorsHigh && bothStalled) {
+                if (encoderSilentStart == 0) encoderSilentStart = millis();
+                if (!encoderFaultDetected && millis() - encoderSilentStart > 2000) {
+                    encoderFaultDetected = true;
+                    Serial.println("[FAULT] Both encoders silent >2s while motors active — disabling traction control.");
+                }
+            } else {
+                encoderSilentStart = 0;
+                if (encoderFaultDetected) {
+                    encoderFaultDetected = false;
+                    Serial.println("[FAULT] Encoders recovered — re-enabling traction control.");
+                }
+            }
+        }
+
+        float encoderSpd = encoders.getFusedSpeed();
+        // Free-spin: wheels spinning fast, but IMU shows robot body not moving
+        bool wheelsSpin = (encoderSpd > 5.0f && lastMotorSpeedA >= 80 && lastMotorSpeedB >= 80);
+        NavState ns = autoNav.getCurrentState();
+        bool drivingForward = (ns == NAV_CRUISE);
+        unsigned long nowTc = millis();
+
+        // Skip TC entirely if either IMU or encoder data can't be trusted
+        if (imuFaultDetected || encoderFaultDetected) goto tc_skip;
+
+        if (drivingForward && nowTc >= fsCooldownUntil) {
+            if (!fsMotionOK && wheelsSpin) {
+                // --- Spin detected ---
+                if (tcActive) {
+                    // Currently holding reduced power — check if grip has recovered
+                    if (nowTc >= tcCutUntil) {
+                        tcActive = false;
+                        if (fsMotionOK || !wheelsSpin) {
+                            // Grip recovered — reset cut count and resume
+                            Serial.println("[TC] Grip recovered — resuming normal power");
+                            tcCutCount = 0;
+                            fsSpinStart = 0;
+                        }
+                        // If still spinning after cut, will re-enter below on next loop
+                    }
+                    // While cutting: override motor output with reduced power
+                    motors.setMotors(TC_REDUCE_PWM, TC_REDUCE_PWM);
+                    lastMotorSpeedA = TC_REDUCE_PWM;
+                    lastMotorSpeedB = TC_REDUCE_PWM;
+                } else {
+                    // Not yet cutting — start/continue the confirmation timer
+                    if (fsSpinStart == 0) fsSpinStart = nowTc;
+
+                    if (nowTc - fsSpinStart >= TC_CONFIRM_MS) {
+                        // Confirmed spin — apply power cut
+                        tcCutCount++;
+                        if (tcCutCount > TC_MAX_CUTS) {
+                            // Exceeded max cuts — escalate to avoidance
+                            Serial.printf("[TC] %d cuts failed — escalating to recovery\n", TC_MAX_CUTS);
+                            autoNav.enterAvoid(false);
+                            fsCooldownUntil = nowTc + 5000;
+                            fsMagReady = false; fsMagIdx = 0;
+                            fsSpinStart = 0; tcCutCount = 0; tcActive = false;
+                        } else {
+                            Serial.printf("[TC] Free-spin! Cut #%d — reducing to %d PWM for %lums\n",
+                                          tcCutCount, TC_REDUCE_PWM, TC_HOLD_MS);
+                            tcActive   = true;
+                            tcCutUntil = nowTc + TC_HOLD_MS;
+                            motors.setMotors(TC_REDUCE_PWM, TC_REDUCE_PWM);
+                            lastMotorSpeedA = TC_REDUCE_PWM;
+                            lastMotorSpeedB = TC_REDUCE_PWM;
+                        }
+                    }
+                }
+            } else {
+                // No spin — clear state
+                if (!tcActive) {
+                    fsSpinStart = 0;
+                    if (tcCutCount > 0) tcCutCount = 0;
+                }
+            }
+        } else {
+            fsSpinStart = 0;
+            tcActive = false;
+        }
+        tc_skip:;
+    }
+    #endif
+
+    // === DUAL ULTRASONIC FAILURE FALLBACK ===
+    // If both sensors are returning invalid readings, we have no obstacle data.
+    // Reduce cruise speed to a safe crawl and log periodically.
+    {
+        static unsigned long bothFailedLogAt = 0;
+        bool leftBad  = (sensorData.distanceLeft  < 0.0f);
+        bool rightBad = (sensorData.distanceRight < 0.0f);
+        if (leftBad && rightBad) {
+            NavState ns2 = autoNav.getCurrentState();
+            if (ns2 == NAV_CRUISE) {
+                // Throttle to 40% max so the robot creeps rather than cruising blind
+                const int BLIND_CRAWL_PWM = 100;
+                if (lastMotorSpeedA > BLIND_CRAWL_PWM || lastMotorSpeedB > BLIND_CRAWL_PWM) {
+                    motors.setMotors(BLIND_CRAWL_PWM, BLIND_CRAWL_PWM);
+                    lastMotorSpeedA = BLIND_CRAWL_PWM;
+                    lastMotorSpeedB = BLIND_CRAWL_PWM;
+                }
+                if (millis() - bothFailedLogAt > 5000) {
+                    Serial.println("[FAULT] Both ultrasonic sensors FAILED — crawling at reduced speed.");
+                    bothFailedLogAt = millis();
+                }
+            }
+        } else {
+            bothFailedLogAt = 0;  // Reset log timer once a sensor recovers
+        }
+    }
+
     int leftSpeed, rightSpeed;
     unsigned long now = millis();
     
@@ -910,7 +1116,8 @@ void handleAutonomousMode() {
         static float prevDistLeft = 0.0f;
         static float prevDistRight = 0.0f;
         static unsigned long pitPitchStart = 0;
-        
+        static unsigned long pitCooldownUntil = 0;  // Don't re-trigger while recovering
+
         float dL = sensorData.distanceLeft;
         float dR = sensorData.distanceRight;
         bool pitDetected = false;
@@ -918,10 +1125,12 @@ void handleAutonomousMode() {
         float pitHeading = mapHeading;
         float pitDist = distance;
         float pitJump = 0.0f;    // Track largest distance jump for severity
-        
+
+        bool pitInCooldown = (millis() < pitCooldownUntil);
+
         // Signal 1: Ultrasonic distance jump — ground dropped away
         // Previous reading was short (reflecting ground/wall), now suddenly long
-        if (prevDistLeft > 2.0f && prevDistLeft < 100.0f &&
+        if (!pitInCooldown && prevDistLeft > 2.0f && prevDistLeft < 100.0f &&
             dL > prevDistLeft + PIT_DIST_JUMP_CM) {
             float jump = dL - prevDistLeft;
             pitDetected = true;
@@ -930,7 +1139,7 @@ void handleAutonomousMode() {
             if (jump > pitJump) pitJump = jump;
             Serial.printf("[PIT] Left sensor jump: %.0f→%.0fcm (Δ%.0f)\n", prevDistLeft, dL, jump);
         }
-        if (prevDistRight > 2.0f && prevDistRight < 100.0f &&
+        if (!pitInCooldown && prevDistRight > 2.0f && prevDistRight < 100.0f &&
             dR > prevDistRight + PIT_DIST_JUMP_CM) {
             float jump = dR - prevDistRight;
             pitDetected = true;
@@ -939,14 +1148,14 @@ void handleAutonomousMode() {
             if (jump > pitJump) pitJump = jump;
             Serial.printf("[PIT] Right sensor jump: %.0f→%.0fcm (Δ%.0f)\n", prevDistRight, dR, jump);
         }
-        
+
         prevDistLeft = dL;
         prevDistRight = dR;
-        
+
         // Signal 2: Sustained negative pitch (tilting forward into a pit)
         #if IMU_ENABLED
         float navPitch = autoNav.getPitch();
-        if (navPitch < PIT_PITCH_THRESHOLD) {
+        if (!pitInCooldown && !imuFaultDetected && navPitch < PIT_PITCH_THRESHOLD) {
             if (pitPitchStart == 0) {
                 pitPitchStart = now;
             } else if (now - pitPitchStart > PIT_PITCH_SUSTAIN_MS) {
@@ -959,22 +1168,22 @@ void handleAutonomousMode() {
             pitPitchStart = 0;
         }
         #endif
-        
+
         // Classify severity: major if steep pitch OR large distance jump
         if (pitDetected) {
             float absPitch = fabs(autoNav.getPitch());
             pitMajor = (absPitch >= TERRAIN_MINOR_PITCH) ||
                        (pitJump >= TERRAIN_MINOR_PIT_JUMP_CM);
         }
-        
+
         // React based on severity
         if (pitDetected && pitMajor) {
-            // Major pit → mark on map + avoid (backup + turn)
+            pitCooldownUntil = millis() + 4000;  // 4s cooldown — let backup/turn complete
             envMap.markPitAhead(pitHeading, pitDist);
             autoNav.enterAvoidFromPit();
             Serial.println("[PIT] MAJOR → AVOID");
         } else if (pitDetected) {
-            // Minor pit → maintain speed and drive through
+            pitCooldownUntil = millis() + 2000;  // 2s cooldown — let it traverse
             autoNav.enterTerrainBoost();
             Serial.printf("[PIT] MINOR (pitch=%.1f° jump=%.0fcm) → TRAVERSE\n",
                           autoNav.getPitch(), pitJump);
@@ -989,16 +1198,20 @@ void handleAutonomousMode() {
         static float prevDistLeftH = 0.0f;
         static float prevDistRightH = 0.0f;
         static unsigned long hillPitchStart = 0;
-        
+        static unsigned long hillCooldownUntil = 0;  // Don't re-trigger while recovering
+
         float dL = sensorData.distanceLeft;
         float dR = sensorData.distanceRight;
         bool hillDetected = false;
         float hillDist = distance;
         float maxHeightCm = 0.0f;  // Track max estimated height for severity
-        
+
+        // Suppress new hill detections while in cooldown
+        bool hillInCooldown = (millis() < hillCooldownUntil);
         // Signal 1: Ultrasonic distance drop — beam hitting a rising slope
         // Previous reading was long (flat ground), now suddenly short (slope face)
-        if (prevDistLeftH > 50.0f && prevDistLeftH < 400.0f &&
+        if (!hillInCooldown &&
+            prevDistLeftH > 50.0f && prevDistLeftH < 400.0f &&
             dL < prevDistLeftH - HILL_DIST_DROP_CM && dL > 2.0f) {
             float pitchRad = autoNav.getPitch() * PI / 180.0f;
             float heightCm = dL * sin(fabs(pitchRad)) + SENSOR_HEIGHT_CM;
@@ -1008,7 +1221,8 @@ void handleAutonomousMode() {
             Serial.printf("[HILL] Left sensor drop: %.0f→%.0fcm, est height %.0fcm\n",
                           prevDistLeftH, dL, heightCm);
         }
-        if (prevDistRightH > 50.0f && prevDistRightH < 400.0f &&
+        if (!hillInCooldown &&
+            prevDistRightH > 50.0f && prevDistRightH < 400.0f &&
             dR < prevDistRightH - HILL_DIST_DROP_CM && dR > 2.0f) {
             float pitchRad = autoNav.getPitch() * PI / 180.0f;
             float heightCm = dR * sin(fabs(pitchRad)) + SENSOR_HEIGHT_CM;
@@ -1025,7 +1239,7 @@ void handleAutonomousMode() {
         // Signal 2: Sustained positive pitch (climbing)
         #if IMU_ENABLED
         float navPitch = autoNav.getPitch();
-        if (navPitch > HILL_PITCH_THRESHOLD) {
+        if (!hillInCooldown && !imuFaultDetected && navPitch > HILL_PITCH_THRESHOLD) {
             if (hillPitchStart == 0) {
                 hillPitchStart = now;
             } else if (now - hillPitchStart > HILL_PITCH_SUSTAIN_MS) {
@@ -1053,6 +1267,7 @@ void handleAutonomousMode() {
         // React based on severity
         if (hillDetected && hillMajor) {
             // Major hill → mark on map + avoid (backup + turn)
+            hillCooldownUntil = millis() + 4000;  // 4s cooldown — let backup/turn complete
             envMap.markHillAhead(hillDist < distance ? mapHeading : mapHeading,
                                 hillDist > 5.0f ? hillDist : 20.0f, maxHeightCm);
             autoNav.enterAvoidFromHill();
@@ -1060,6 +1275,7 @@ void handleAutonomousMode() {
                           autoNav.getPitch(), maxHeightCm);
         } else if (hillDetected) {
             // Minor hill → maintain speed and drive over it
+            hillCooldownUntil = millis() + 2000;  // 2s cooldown — let it traverse
             autoNav.enterTerrainBoost();
             Serial.printf("[HILL] MINOR (pitch=%.1f° height=%.0fcm) → TRAVERSE\n",
                           autoNav.getPitch(), maxHeightCm);

@@ -64,6 +64,11 @@
 // If physical direction is reversed after installation, swap SERVO_MIN_US and SERVO_MAX_US.
 #define SERVO_PIN          15     // Servo signal wire
 #define PWM_CHANNEL_SERVO  8      // LEDC channel for servo (low-speed group, separate timer from LED ch6)
+// Servo PWM frequency:
+//   Analog servo  → use 50  Hz only (going higher damages analog servos)
+//   Digital servo → 50-333 Hz (200-330 Hz gives faster response & smoother hold)
+//   If unsure: leave at 50 Hz — works safely for both types
+#define SERVO_FREQ_HZ      330    // Hz — DS3235 digital servo supports up to 330Hz
 #define SERVO_MIN_US       500    // Pulse width (µs) at 0°  — arm at LEFT extreme
 #define SERVO_MAX_US       2500   // Pulse width (µs) at 180° — arm at RIGHT extreme
 
@@ -140,11 +145,28 @@
 
 // ==================== AUTONOMOUS NAV CONFIG ====================
 
-// Distance thresholds (cm)
-#define DISTANCE_CLOSE    20.0   // cm - back up
-#define DISTANCE_MEDIUM   50.0   // cm - turn
-#define DISTANCE_FAR      100.0  // cm - go forward
+// Distance thresholds (cm) — used by advanced autonomous nav
+#define DISTANCE_CLOSE    20.0   // cm - back up  (simple auto)
+#define DISTANCE_MEDIUM   50.0   // cm - turn      (simple auto)
+#define DISTANCE_FAR      100.0  // cm - go forward (simple auto)
 #define AUTONOMOUS_SPEED  255    // Base speed for autonomous mode (0-255)
+
+// Advanced autonomous distance thresholds (cm)
+#define DIST_CRITICAL         15.0f  // Emergency — reverse immediately
+#define DIST_CLOSE_ADV        35.0f  // Obstacle — enter avoidance
+#define DIST_MEDIUM_ADV       60.0f  // Caution — speed reduction zone
+#define DIST_FAR_ADV         100.0f  // Cruising — full speed
+
+// Avoidance timing
+#define AVOID_BACKUP_MS       250    // Reverse duration on normal obstacle (ms)
+#define AVOID_BACKUP_CRIT_MS  350    // Reverse duration on critical obstacle (ms)
+#define AVOID_VERIFY_MS       300    // Forward check duration after turn (ms)
+#define AVOID_MAX_CYCLES      4      // Avoid attempts before escalating to recovery
+
+// Stall / stuck detection
+#define STALL_TIMEOUT_MS      2500   // Time stuck under DIST_MEDIUM before avoidance (ms)
+#define STUCK_COUNT_THRESHOLD  8      // Consecutive history readings to flag stuck
+#define STUCK_DISTANCE_TOL     5.0f   // Distance change tolerance to consider stuck (cm)
 
 // Motor calibration - adjust if robot drifts left/right
 // Values from 0.8 to 1.2, 1.0 = no adjustment
@@ -269,6 +291,26 @@
 #define DR_CORRECT_TIMEOUT_MS   5000    // Heading toward start this long = force correction turn
 #define DR_CORRECT_CLEARANCE_CM 150.0f  // Min front distance to allow correction turn (well into clear space)
 #define DR_CORRECT_TURN_MS      600     // Duration of proactive correction turn
+
+// ==================== SELF-RIGHTING SERVO TUNING ====================
+// Servo sweeps LEFT (0°) → CENTER (90°) → RIGHT (180°) in horizontal plane.
+// Stow angle is 90° (centered / pointing forward).
+
+#define ARM_SWEEP_STEP          3     // Degrees per step — lower = slower but more torque
+#define ARM_SWEEP_DELAY_MS      25    // Milliseconds between steps — lower = faster sweep
+#define ARM_HOLD_AT_EXTREME_MS  7000  // How long to hold at 0° or 180° extremes (ms)
+#define ARM_COOLDOWN_MS         2000  // Pause between righting attempt cycles (ms)
+#define ARM_MAX_ATTEMPTS        40    // Max full sweeps before cooldown
+#define ARM_UNSTICK_MAX         12    // Max sweeps during unstick mode before cooldown
+#define ARM_UNSTICK_COOLDOWN_MS 1500  // Cooldown after unstick max attempts (ms)
+
+// ==================== ENCODER / ODOMETRY TUNING ====================
+
+#define ENCODER_DEBOUNCE_US     5000  // ISR noise filter — min µs between valid pulses
+                                      // Lower = more sensitive, higher = rejects more noise
+                                      // With 2 magnets at 1000 RPM, max legit period = ~30000µs
+#define ENCODER_SPEED_EMA_ALPHA 0.3f  // Speed smoothing factor (0.0=max smooth, 1.0=no smooth)
+#define ENCODER_COMP_ALPHA      0.85f // Encoder vs IMU speed blend (higher = trust encoder more)
 
 // ==================== SAFETY PROTECTION ====================
 

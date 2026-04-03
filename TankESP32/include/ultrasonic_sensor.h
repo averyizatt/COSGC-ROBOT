@@ -44,8 +44,8 @@ private:
     float _lastValidReading;    // Last known-good value
     int _stuckCount;            // How many identical readings in a row
     static constexpr int FAIL_THRESHOLD = 10;  // Consecutive fails → FAILED
-    static constexpr int STUCK_THRESHOLD = 20; // Identical readings → FAILED
-    static constexpr float STUCK_TOLERANCE = 0.5f; // cm tolerance for "identical"
+    static constexpr int STUCK_THRESHOLD = 60; // Identical readings → FAILED (raised: walls give same reading legitimately)
+    static constexpr float STUCK_TOLERANCE = 0.3f; // cm tolerance for "identical" (tightened so small changes count as movement)
 };
 
 #endif // ULTRASONIC_SENSOR_H
