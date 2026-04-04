@@ -8,3 +8,4 @@ HallEncoder encoders;
 OccupancyMap envMap;
 uint8_t currentMode = 0;
 float odomX = 0, odomY = 0, odomTheta = 0;
+float batteryVoltage = 0.0f;

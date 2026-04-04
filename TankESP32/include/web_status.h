@@ -1,8 +1,8 @@
-#ifndef WEB_STATUS_H
-#define WEB_STATUS_H
-
-void setupWebServer();  // Register routes + start WiFi AP (call once)
-void startWiFi();       // Start WiFi AP + web server
-void stopWiFi();        // Stop web server + WiFi radio
-
-#endif // WEB_STATUS_H
+#pragma once
+// Compatibility header — functionality is split into dedicated modules:
+//   wifi_manager.h  — WiFi AP start/stop
+//   web_api.h       — HTTP route registration
+//   web_dashboard.h — Dashboard HTML handler
+#include "wifi_manager.h"
+#include "web_api.h"
+#include "web_dashboard.h"

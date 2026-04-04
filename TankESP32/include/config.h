@@ -72,6 +72,21 @@
 #define SERVO_MIN_US       500    // Pulse width (µs) at 0°  — arm at LEFT extreme
 #define SERVO_MAX_US       2500   // Pulse width (µs) at 180° — arm at RIGHT extreme
 
+// Battery voltage monitor
+// Wire a voltage divider from battery+ → R1 → GPIO36 → R2 → GND
+// GPIO 36 (VP) is input-only ADC1_CH0 — safe for this use.
+// Default divider: R1=100kΩ, R2=47kΩ → max safe input ≈ 10.8V.
+// Adjust BATTERY_FULL_V / BATTERY_EMPTY_V to match your pack:
+//   1S LiPo: 4.2 / 3.3    2S LiPo: 8.4 / 6.6
+//   3S LiPo: 12.6 / 9.9   NiMH 6V: 7.2 / 5.4
+#define BATTERY_ADC_PIN    36       // GPIO 36 (VP) — input-only, ADC1
+#define BATTERY_R1         100000.0f // Ohms — top resistor (battery+ side)
+#define BATTERY_R2         47000.0f  // Ohms — bottom resistor (GND side)
+#define BATTERY_FULL_V     8.4f      // Voltage = 100%  (2S LiPo fully charged)
+#define BATTERY_EMPTY_V    6.6f      // Voltage =   0%  (2S LiPo safe cutoff)
+#define BATTERY_WARN_V     7.2f      // Voltage = warn  (flash LED orange below this)
+#define BATTERY_ADC_SAMPLES 8        // ADC readings to average for noise reduction
+
 // Hall effect encoders (A3144, one per output shaft, 10kΩ pull-up to 3.3V)
 #define ENCODER_LEFT_PIN   35  // Left motor hall sensor  (GPIO35 — input-only, D35, external pull-up required)
 #define ENCODER_RIGHT_PIN  32  // Right motor hall sensor (GPIO32 — input, D32, external pull-up required)
@@ -134,6 +149,24 @@
 #define MODE_UART_CONTROL 1  // UART commands
 #define MODE_AUTONOMOUS   2  // Autonomous navigation
 #define MODE_SIMPLE_AUTO  3  // Simple autonomous (distance-only)
+#define MODE_WALL_FOLLOW  4  // Wall-following perimeter mode (left-hand rule)
+#define MODE_PREMAP_NAV   5  // Pre-mapped autonomous: map drawn from web UI before run
+
+// === WALL FOLLOW MODE TUNING ===
+#define WF_TARGET_DIST_CM   28.0f  // Desired distance to keep from left wall (cm)
+#define WF_WALL_LOST_CM    100.0f  // If left sensor reads > this, we've lost the wall → corner turn
+#define WF_FRONT_STOP_CM    30.0f  // If front sensor < this, blocked ahead → turn right
+#define WF_FRONT_SLOW_CM    55.0f  // Slow down approaching obstacle this far out
+#define WF_SEARCH_SPEED      90    // PWM while spinning to find initial wall
+#define WF_CRUISE_SPEED     160    // PWM while following wall normally
+#define WF_SLOW_SPEED        80    // PWM while approaching an obstacle
+#define WF_TURN_SPEED       120    // PWM for inner wheel during turns
+#define WF_PID_KP           4.5f  // Wall-distance PID proportional gain
+#define WF_PID_KD           1.8f  // Wall-distance PID derivative gain
+#define WF_PID_KI           0.04f // Wall-distance PID integral gain (small — prevents windup)
+#define WF_CORNER_TURN_MS   650   // How long to turn left at a corner (ms)
+#define WF_BLOCK_TURN_MS    700   // How long to turn right when blocked ahead (ms)
+#define WF_SEARCH_TIMEOUT_MS 8000 // Give up spinning if no wall found after this long; cruise instead
 
 // ==================== ROBOT PHYSICAL SPECS ====================
 
@@ -158,9 +191,9 @@
 #define DIST_FAR_ADV         100.0f  // Cruising — full speed
 
 // Avoidance timing
-#define AVOID_BACKUP_MS       250    // Reverse duration on normal obstacle (ms)
-#define AVOID_BACKUP_CRIT_MS  350    // Reverse duration on critical obstacle (ms)
-#define AVOID_VERIFY_MS       300    // Forward check duration after turn (ms)
+#define AVOID_BACKUP_MS       400    // Reverse duration on normal obstacle (ms)
+#define AVOID_BACKUP_CRIT_MS  550    // Reverse duration on critical obstacle (ms)
+#define AVOID_VERIFY_MS       400    // Forward check duration after turn (ms)
 #define AVOID_MAX_CYCLES      4      // Avoid attempts before escalating to recovery
 
 // Stall / stuck detection

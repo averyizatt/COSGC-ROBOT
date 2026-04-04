@@ -5,99 +5,258 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>ESP32 Rover Dashboard</title>
+<title>TankBot — Dashboard</title>
 <style>
 :root {
-  --bg: #0d1117; --card: #161b22; --border: #21262d; --text: #c9d1d9;
-  --dim: #8b949e; --accent: #58a6ff; --green: #3fb950; --red: #f85149;
-  --orange: #d29922; --purple: #bc8cff;
+  --bg: #080c10; --card: #0f1419; --card2: #131920; --border: #1e252e;
+  --text: #cdd6e0; --dim: #7a8899; --accent: #4da6ff; --green: #34c759;
+  --red: #ff453a; --orange: #ff9f0a; --purple: #bf5af2; --cyan: #00e5cc;
+  --yellow: #ffd60a; --teal: #30d158;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; font-size: 14px; }
-.wrap { max-width: 720px; margin: 0 auto; padding: 12px; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg);
+  background-image: radial-gradient(ellipse at 20% 0%, rgba(77,166,255,0.05) 0%, transparent 60%),
+                    radial-gradient(ellipse at 80% 100%, rgba(191,90,242,0.04) 0%, transparent 60%);
+  color: var(--text);
+  font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+  font-size: 14px;
+  min-height: 100vh;
+}
+.wrap { max-width: 740px; margin: 0 auto; padding: 14px 12px; }
 
-/* Header */
-.hdr { display: flex; align-items: center; justify-content: space-between; padding: 12px 0 8px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-.hdr h1 { color: var(--accent); font-size: 1.4em; letter-spacing: 0.5px; }
-.hdr h1 span { font-size: 0.6em; color: var(--dim); font-weight: 400; display: block; }
-.status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-.dot-ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
-.dot-err { background: var(--red); box-shadow: 0 0 6px var(--red); }
-#connbar { font-size: 0.8em; color: var(--dim); text-align: right; }
+/* ── Header ─────────────────────────────────────────── */
+.hdr {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; margin-bottom: 16px;
+  background: linear-gradient(135deg, #0f1a28 0%, #0f1419 100%);
+  border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 2px 16px rgba(0,0,0,0.4);
+}
+.hdr-left { display: flex; align-items: center; gap: 12px; }
+.hdr-icon { font-size: 1.7em; line-height: 1; }
+.hdr h1 { color: var(--accent); font-size: 1.25em; font-weight: 700; letter-spacing: 0.3px; line-height: 1.1; }
+.hdr h1 span { font-size: 0.62em; color: var(--dim); font-weight: 400; display: block; letter-spacing: 0; }
+.conn-pill {
+  display: flex; align-items: center; gap: 7px;
+  background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+  border-radius: 20px; padding: 5px 12px; font-size: 0.78em; color: var(--dim);
+}
+@keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.35;} }
+.dot-ok { width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green); animation:pulse 2.2s ease-in-out infinite; }
+.dot-err { width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red); }
+.status-dot { display:inline-block; }
 
-/* Cards */
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 12px; }
-.card h2 { color: var(--orange); font-size: 0.85em; text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
-.card h2::before { content: ''; display: inline-block; width: 3px; height: 14px; background: var(--orange); border-radius: 2px; }
+/* ── Cards ──────────────────────────────────────────── */
+.card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px 16px; margin-bottom: 12px;
+  box-shadow: 0 1px 8px rgba(0,0,0,0.3);
+  position: relative; overflow: hidden;
+}
+.card::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; border-radius: 12px 0 0 12px;
+  background: var(--card-accent, var(--accent));
+}
+.card-ctrl   { --card-accent: var(--accent); }
+.card-odom   { --card-accent: var(--teal); }
+.card-enc    { --card-accent: var(--orange); }
+.card-motor  { --card-accent: var(--red); }
+.card-us     { --card-accent: var(--cyan); }
+.card-plan   { --card-accent: var(--purple); }
+.card-imu    { --card-accent: var(--yellow); }
+.card-sys    { --card-accent: var(--green); }
+.card-map    { --card-accent: var(--accent); }
 
-/* Two-column grid */
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 20px; }
-.row { display: flex; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #1c2028; }
+.card h2 {
+  font-size: 0.75em; text-transform: uppercase; letter-spacing: 1.4px;
+  margin-bottom: 11px; padding-left: 8px;
+  display: flex; align-items: center; gap: 7px;
+  color: var(--card-accent, var(--accent));
+}
+.card h2 .ico { font-size: 1.2em; opacity: 0.85; }
+
+/* ── Data rows ──────────────────────────────────────── */
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 16px; }
+.row {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.04);
+}
 .row:last-child { border-bottom: none; }
-.row .k { color: var(--dim); font-size: 0.85em; }
-.row .v { color: #fff; font-weight: 600; font-size: 0.85em; text-align: right; }
+.row .k { color: var(--dim); font-size: 0.82em; }
+.row .v { color: #e8edf2; font-weight: 600; font-size: 0.9em; text-align: right; font-variant-numeric: tabular-nums; }
 .full { grid-column: 1 / -1; }
 
-/* Badges */
-.badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.78em; font-weight: 700; }
-.b-blue { background: #1a2a3a; color: var(--accent); }
-.b-green { background: #1a3a2a; color: var(--green); }
-.b-red { background: #3a1a1a; color: var(--red); }
-.b-orange { background: #3a2a1a; color: var(--orange); }
-.b-purple { background: #2a1a3a; color: var(--purple); }
+/* Big stat variant — mode display */
+.big-stat { padding: 10px 0 6px; }
+.big-stat .k { color: var(--dim); font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 5px; }
+.big-stat .v { display: block; }
 
-/* Progress bar */
-.pbar { height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; margin-top: 4px; }
-.pbar .fill { height: 100%; border-radius: 3px; transition: width 0.5s ease; }
-.fill-green { background: var(--green); }
-.fill-blue { background: var(--accent); }
-.fill-red { background: var(--red); }
+/* ── Badges ─────────────────────────────────────────── */
+.badge {
+  display: inline-block; padding: 3px 11px; border-radius: 20px;
+  font-size: 0.78em; font-weight: 700; letter-spacing: 0.3px;
+  border: 1px solid currentColor;
+}
+.b-blue   { background: rgba(77,166,255,0.12); color: var(--accent); }
+.b-green  { background: rgba(52,199,89,0.12);  color: var(--green); }
+.b-red    { background: rgba(255,69,58,0.12);  color: var(--red); }
+.b-orange { background: rgba(255,159,10,0.12); color: var(--orange); }
+.b-purple { background: rgba(191,90,242,0.12); color: var(--purple); }
+.b-cyan   { background: rgba(0,229,204,0.12);  color: var(--cyan); }
+.b-lime   { background: rgba(128,255,0,0.1);   color: #80ff00; }
 
-/* Map section */
-.map-wrap { text-align: center; }
-.map-wrap canvas { background: #0d1117; border-radius: 6px; border: 1px solid var(--border); max-width: 100%; image-rendering: pixelated; cursor: crosshair; }
-.legend { display: flex; justify-content: center; gap: 14px; margin: 8px 0; font-size: 0.75em; color: var(--dim); }
-.legend i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 4px; vertical-align: middle; }
-.map-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 8px; }
-button { background: var(--card); color: var(--accent); border: 1px solid var(--accent); border-radius: 6px; padding: 6px 16px; cursor: pointer; font-size: 0.82em; transition: background 0.2s; }
-button:hover { background: #1a2a3a; }
-button:active { background: #0d1a2a; }
-.btn-sm { padding: 4px 10px; font-size: 0.75em; }
+/* ── Progress bar ───────────────────────────────────── */
+.pbar { height: 6px; background: rgba(255,255,255,0.06); border-radius: 3px; overflow: hidden; margin-top: 5px; }
+.pbar .fill { height: 100%; border-radius: 3px; transition: width 0.6s ease; }
+.fill-green { background: linear-gradient(90deg, var(--teal), var(--green)); }
+.fill-blue  { background: linear-gradient(90deg, #2c6fad, var(--accent)); }
+.fill-red   { background: var(--red); }
 
-/* Stall warning */
+/* ── Map section ────────────────────────────────────── */
+.map-wrap { text-align: center; margin-top: 4px; }
+.map-wrap canvas {
+  background: #080c10; border-radius: 8px;
+  border: 1px solid var(--border); max-width: 100%;
+  image-rendering: pixelated; cursor: crosshair;
+  box-shadow: 0 0 20px rgba(77,166,255,0.06);
+}
+.legend {
+  display: flex; flex-wrap: wrap; justify-content: center;
+  gap: 8px 14px; margin: 10px 0 8px; font-size: 0.73em; color: var(--dim);
+}
+.legend span { display: flex; align-items: center; gap: 4px; }
+.legend i {
+  display: inline-block; width: 11px; height: 11px;
+  border-radius: 3px; flex-shrink: 0;
+}
+.map-controls { display: flex; justify-content: center; gap: 8px; margin-bottom: 10px; }
+button {
+  background: rgba(77,166,255,0.08); color: var(--accent);
+  border: 1px solid rgba(77,166,255,0.35); border-radius: 8px;
+  padding: 7px 18px; cursor: pointer; font-size: 0.82em; font-weight: 600;
+  transition: background 0.18s, border-color 0.18s;
+}
+button:hover { background: rgba(77,166,255,0.18); border-color: var(--accent); }
+button:active { background: rgba(77,166,255,0.28); }
+.btn-sm { padding: 5px 12px; font-size: 0.76em; }
+
+/* ── Stall ──────────────────────────────────────────── */
 .stall-warn { color: var(--red); font-weight: 700; }
-.stall-ok { color: var(--green); }
+.stall-ok   { color: var(--green); font-weight: 600; }
 
-/* Footer */
-.foot { text-align: center; color: #30363d; font-size: 0.7em; padding: 16px 0 8px; border-top: 1px solid var(--border); margin-top: 8px; }
+/* ── Battery widget ─────────────────────────────────── */
+.batt-card {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 12px 16px; margin-bottom: 16px;
+  box-shadow: 0 1px 8px rgba(0,0,0,0.3);
+  position: relative; overflow: hidden;
+}
+.batt-card::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
+  width: 3px; border-radius: 12px 0 0 12px;
+  background: var(--batt-color, var(--green));
+}
+.batt-icon-wrap {
+  position: relative; display: flex; align-items: center; flex-shrink: 0;
+}
+/* SVG battery drawn via CSS/HTML */
+.batt-body {
+  width: 46px; height: 24px; border: 2px solid var(--batt-color, var(--green));
+  border-radius: 4px; position: relative; overflow: hidden;
+  flex-shrink: 0;
+}
+.batt-body::after {
+  content: ''; position: absolute; right: -6px; top: 50%;
+  transform: translateY(-50%); width: 4px; height: 10px;
+  background: var(--batt-color, var(--green)); border-radius: 0 2px 2px 0;
+}
+.batt-fill {
+  height: 100%; border-radius: 2px; transition: width 0.8s ease, background 0.5s;
+}
+.batt-info { flex: 1; min-width: 0; }
+.batt-pct  { font-size: 1.5em; font-weight: 800; color: var(--batt-color, var(--green)); line-height: 1; font-variant-numeric: tabular-nums; }
+.batt-sub  { font-size: 0.75em; color: var(--dim); margin-top: 2px; }
+.batt-bar-wrap { flex: 1; }
+.batt-bar { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
+.batt-bar .bfill { height: 100%; border-radius: 4px; transition: width 0.8s ease, background 0.5s; }
+.batt-status { font-size: 0.72em; color: var(--dim); margin-top: 4px; text-align: right; }
 
-/* Responsive: single column on narrow screens */
+/* ── Section divider ────────────────────────────────── */
+.section-label {
+  font-size: 0.68em; text-transform: uppercase; letter-spacing: 1.6px;
+  color: #3a4451; margin: 16px 0 8px 2px; padding-left: 4px;
+  border-left: 2px solid #1e252e;
+}
+
+/* ── Footer ─────────────────────────────────────────── */
+.foot {
+  text-align: center; color: #2e3a48; font-size: 0.7em;
+  padding: 18px 0 10px; border-top: 1px solid var(--border); margin-top: 10px;
+  display: flex; align-items: center; justify-content: center; gap: 16px; flex-wrap: wrap;
+}
+.foot a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.foot a:hover { text-decoration: underline; }
+
+/* ── Responsive ─────────────────────────────────────── */
 @media (max-width: 480px) {
   .grid { grid-template-columns: 1fr; }
   .wrap { padding: 8px; }
+  .hdr { padding: 11px 13px; }
 }
 </style>
 </head>
 <body>
 <div class="wrap">
 
+<!-- Header -->
 <div class="hdr">
-  <h1>ESP32 Rover<span>Dashboard</span></h1>
-  <div id="connbar"><span class="status-dot dot-err" id="dot"></span><span id="conntext">Connecting...</span></div>
-</div>
-
-<!-- Mode & Navigation -->
-<div class="card">
-  <h2>Control</h2>
-  <div class="grid">
-    <div class="row full"><span class="k">Mode</span><span class="v" id="mode">--</span></div>
-    <div class="row full"><span class="k">Navigation State</span><span class="v" id="nav">--</span></div>
+  <div class="hdr-left">
+    <div class="hdr-icon">&#128665;</div>
+    <h1>TankBot<span>ESP32 Rover Dashboard</span></h1>
+  </div>
+  <div class="conn-pill">
+    <span class="status-dot dot-err" id="dot"></span>
+    <span id="conntext">Connecting...</span>
   </div>
 </div>
 
-<!-- Odometry & Motion -->
-<div class="card">
-  <h2>Odometry &amp; Motion</h2>
+<!-- Battery indicator -->
+<div class="batt-card" id="battCard">
+  <div class="batt-body">
+    <div class="batt-fill" id="battFill" style="width:0%"></div>
+  </div>
+  <div class="batt-info">
+    <div class="batt-pct" id="battPct">--</div>
+    <div class="batt-sub" id="battSub">Battery not wired</div>
+  </div>
+  <div class="batt-bar-wrap">
+    <div class="batt-bar"><div class="bfill" id="battBar" style="width:0%"></div></div>
+    <div class="batt-status" id="battStatus">-- V</div>
+  </div>
+</div>
+
+<!-- ── MODE & NAVIGATION ──────────────────────────── -->
+<div class="section-label">Control</div>
+<div class="card card-ctrl">
+  <h2><span class="ico">&#127918;</span>Mode &amp; Navigation</h2>
+  <div class="grid">
+    <div class="row big-stat full">
+      <div><div class="k">Current Mode</div><div class="v" id="mode">--</div></div>
+    </div>
+    <div class="row big-stat full">
+      <div><div class="k">Navigation State</div><div class="v" id="nav">--</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── ODOMETRY ───────────────────────────────────── -->
+<div class="section-label">Motion</div>
+<div class="card card-odom">
+  <h2><span class="ico">&#128205;</span>Odometry &amp; Motion</h2>
   <div class="grid">
     <div class="row"><span class="k">Position X</span><span class="v" id="ox">--</span></div>
     <div class="row"><span class="k">Position Y</span><span class="v" id="oy">--</span></div>
@@ -106,9 +265,9 @@ button:active { background: #0d1a2a; }
   </div>
 </div>
 
-<!-- Encoders -->
-<div class="card">
-  <h2>Encoders</h2>
+<!-- ── ENCODERS ───────────────────────────────────── -->
+<div class="card card-enc">
+  <h2><span class="ico">&#128260;</span>Encoders</h2>
   <div class="grid">
     <div class="row"><span class="k">Left Pulses</span><span class="v" id="lp">--</span></div>
     <div class="row"><span class="k">Right Pulses</span><span class="v" id="rp">--</span></div>
@@ -121,9 +280,9 @@ button:active { background: #0d1a2a; }
   </div>
 </div>
 
-<!-- Motors -->
-<div class="card">
-  <h2>Motors</h2>
+<!-- ── MOTORS ─────────────────────────────────────── -->
+<div class="card card-motor">
+  <h2><span class="ico">&#9889;</span>Motors</h2>
   <div class="grid">
     <div class="row"><span class="k">Left Current</span><span class="v" id="mcl">--</span></div>
     <div class="row"><span class="k">Right Current</span><span class="v" id="mcr">--</span></div>
@@ -131,9 +290,10 @@ button:active { background: #0d1a2a; }
   </div>
 </div>
 
-<!-- Ultrasonic Sensors -->
-<div class="card">
-  <h2>Ultrasonics</h2>
+<!-- ── ULTRASONICS ────────────────────────────────── -->
+<div class="section-label">Sensors</div>
+<div class="card card-us">
+  <h2><span class="ico">&#128267;</span>Ultrasonics</h2>
   <div class="grid">
     <div class="row"><span class="k">Left</span><span class="v" id="ul">--</span></div>
     <div class="row"><span class="k">Right</span><span class="v" id="ur">--</span></div>
@@ -145,20 +305,9 @@ button:active { background: #0d1a2a; }
   </div>
 </div>
 
-<!-- Path Planner & Terrain -->
-<div class="card">
-  <h2>Planner &amp; Terrain</h2>
-  <div class="grid">
-    <div class="row full"><span class="k">Planner Mode</span><span class="v" id="pm">--</span></div>
-    <div class="row"><span class="k">Has Path</span><span class="v" id="pp">--</span></div>
-    <div class="row"><span class="k">Dist to Goal</span><span class="v" id="pd">--</span></div>
-    <div class="row full"><span class="k">Terrain Boost</span><span class="v" id="tb">--</span></div>
-  </div>
-</div>
-
-<!-- IMU -->
-<div class="card">
-  <h2>IMU (MPU6050)</h2>
+<!-- ── IMU ────────────────────────────────────────── -->
+<div class="card card-imu">
+  <h2><span class="ico">&#129669;</span>IMU (MPU6050)</h2>
   <div class="grid">
     <div class="row"><span class="k">Accel X</span><span class="v" id="ax">--</span></div>
     <div class="row"><span class="k">Accel Y</span><span class="v" id="ay">--</span></div>
@@ -170,9 +319,22 @@ button:active { background: #0d1a2a; }
   </div>
 </div>
 
-<!-- System -->
-<div class="card">
-  <h2>System</h2>
+<!-- ── PLANNER ────────────────────────────────────── -->
+<div class="section-label">Autonomy</div>
+<div class="card card-plan">
+  <h2><span class="ico">&#128506;</span>Planner &amp; Terrain</h2>
+  <div class="grid">
+    <div class="row full"><span class="k">Planner Mode</span><span class="v" id="pm">--</span></div>
+    <div class="row"><span class="k">Has Path</span><span class="v" id="pp">--</span></div>
+    <div class="row"><span class="k">Dist to Goal</span><span class="v" id="pd">--</span></div>
+    <div class="row full"><span class="k">Terrain Boost</span><span class="v" id="tb">--</span></div>
+  </div>
+</div>
+
+<!-- ── SYSTEM ─────────────────────────────────────── -->
+<div class="section-label">System</div>
+<div class="card card-sys">
+  <h2><span class="ico">&#128187;</span>System</h2>
   <div class="grid">
     <div class="row"><span class="k">ESP32 Temperature</span><span class="v" id="et">--</span></div>
     <div class="row"><span class="k">Free Heap</span><span class="v" id="heap">--</span></div>
@@ -187,45 +349,59 @@ button:active { background: #0d1a2a; }
   </div>
 </div>
 
-<!-- Occupancy Map -->
-<div class="card">
-  <h2>Occupancy Map</h2>
+<!-- ── OCCUPANCY MAP ──────────────────────────────── -->
+<div class="section-label">Map</div>
+<div class="card card-map">
+  <h2><span class="ico">&#128247;</span>Occupancy Map</h2>
   <div class="legend">
     <span><i style="background:#c8c8c8"></i>Free</span>
-    <span><i style="background:#6e7681"></i>Likely&nbsp;Free</span>
-    <span><i style="background:#da6840"></i>Likely&nbsp;Obs</span>
+    <span><i style="background:#6e7681"></i>Likely Free</span>
+    <span><i style="background:#da6840"></i>Likely Obs</span>
     <span><i style="background:#f85149"></i>Obstacle</span>
     <span><i style="background:#d29922"></i>Hazard</span>
     <span><i style="background:#8b5cf6"></i>Pit</span>
     <span><i style="background:#2ea043"></i>Hill</span>
     <span><i style="background:#00bfff"></i>Frontier</span>
-    <span><i style="background:#21262d"></i>Unexplored</span>
-    <span><i style="background:#3fb950"></i>Robot</span>
+    <span><i style="background:#1e252e;border:1px solid #3a4451"></i>Unknown</span>
+    <span><i style="background:#34c759"></i>Robot</span>
   </div>
   <div class="map-controls">
-    <button id="mapBtn" onclick="toggleMap()">Start Map</button>
+    <button id="mapBtn" onclick="toggleMap()">&#9654; Start Map</button>
     <button class="btn-sm" onclick="mapZoom(1)">Zoom +</button>
-    <button class="btn-sm" onclick="mapZoom(-1)">Zoom -</button>
+    <button class="btn-sm" onclick="mapZoom(-1)">Zoom &#8722;</button>
   </div>
   <div class="map-wrap"><canvas id="map" width="320" height="256"></canvas></div>
 </div>
 
-<div class="foot">ESP32 Rover &bull; WiFi Dashboard &bull; Auto-refresh 1.5s</div>
+<!-- Footer -->
+<div class="foot">
+  <span>TankBot &bull; ESP32 Rover</span>
+  <span>Auto-refresh 1.5 s</span>
+  <a href="/map/draw">&#9998; Draw Pre-Map</a>
 </div>
+
+</div><!-- .wrap -->
 
 <script>
 const $=id=>document.getElementById(id);
 function fmt(v,u,d){return v!==undefined&&v!==null?(d!==undefined?v.toFixed(d):v)+(u||''):'--';}
-function stall(v){return v?'<span class="stall-warn">STALLED</span>':'<span class="stall-ok">OK</span>';}
+function stall(v){return v?'<span class="stall-warn">&#9888; STALLED</span>':'<span class="stall-ok">OK</span>';}
 function modeBadge(m){
-  const c={'RC Control':'b-blue','UART Control':'b-orange','Autonomous':'b-green','Simple Auto':'b-purple'};
+  const c={
+    'RC Control':'b-blue',
+    'UART Control':'b-orange',
+    'Autonomous':'b-green',
+    'Simple Auto':'b-purple',
+    'Wall Follow':'b-cyan',
+    'Premap Nav':'b-lime'
+  };
   return '<span class="badge '+(c[m]||'b-blue')+'">'+m+'</span>';
 }
 function navBadge(n){return '<span class="badge b-orange">'+n+'</span>';}
 function healthBadge(h){
-  if(h==='FAILED')return '<span class="badge b-red">FAILED</span>';
-  if(h==='DEGRADED')return '<span class="badge b-orange">DEGRADED</span>';
-  return '<span class="badge b-green">OK</span>';
+  if(h==='FAILED')return '<span class="badge b-red">&#10006; FAILED</span>';
+  if(h==='DEGRADED')return '<span class="badge b-orange">&#9888; DEGRADED</span>';
+  return '<span class="badge b-green">&#10003; OK</span>';
 }
 function fmtTime(sec){
   let s=Math.floor(sec),m=Math.floor(s/60),h=Math.floor(m/60),d=Math.floor(h/24);
@@ -241,6 +417,33 @@ function fmtHeap(b){
   return b+' B';
 }
 function tempColor(t){return t>70?'var(--red)':t>55?'var(--orange)':'var(--green)';}
+
+function updateBattery(v, pct) {
+  const card = $('battCard');
+  // -1 = pin not wired / not yet read
+  if (v < 0.5 || pct === undefined || pct < 0) {
+    $('battPct').textContent = '--';
+    $('battSub').textContent = 'Connect GPIO 36 voltage divider';
+    $('battStatus').textContent = '-- V';
+    $('battFill').style.width = '0%';
+    $('battBar').style.width = '0%';
+    const c = 'var(--dim)';
+    card.style.setProperty('--batt-color', c);
+    $('battFill').style.background = c;
+    $('battBar').style.background = c;
+    return;
+  }
+  const p = Math.max(0, Math.min(100, pct));
+  const color = p > 40 ? 'var(--green)' : p > 20 ? 'var(--orange)' : 'var(--red)';
+  card.style.setProperty('--batt-color', color);
+  $('battPct').textContent = p.toFixed(0) + '%';
+  $('battSub').textContent = p > 40 ? 'Battery good' : p > 20 ? 'Battery low' : '⚠ Battery critical!';
+  $('battStatus').textContent = v.toFixed(2) + ' V';
+  $('battFill').style.width = p + '%';
+  $('battFill').style.background = color;
+  $('battBar').style.width = p + '%';
+  $('battBar').style.background = color;
+}
 
 async function poll(){
   try{
@@ -299,6 +502,9 @@ async function poll(){
     $('cli').textContent=d.clients;
     $('uptime').textContent=fmtTime(d.uptime);
 
+    // Battery widget
+    updateBattery(d.batteryV, d.batteryPct);
+
     $('dot').className='status-dot dot-ok';
     $('conntext').textContent='Updated '+new Date().toLocaleTimeString();
   }catch(e){
@@ -327,39 +533,75 @@ async function pollMap(){
     let r=await fetch('/api/map');
     let m=await r.json();
     let w=m.w, h=m.h, s=mapScale;
-    mapCanvas.width=w*s; mapCanvas.height=h*s;
+    const ML=40, MB=22; // left margin (Y labels), bottom margin (X labels)
+    mapCanvas.width=w*s+ML; mapCanvas.height=h*s+MB;
     ctx.imageSmoothingEnabled=false;
+    // Clear canvas background
+    ctx.fillStyle='#080c10';
+    ctx.fillRect(0,0,mapCanvas.width,mapCanvas.height);
+    ctx.fillStyle='#080c10';
+    ctx.fillRect(0,0,ML,h*s+MB);
+    ctx.fillRect(ML,h*s,w*s,MB);
 
-    // Draw cells — 6 levels of classification
+    // Draw cells (shifted right by ML)
     for(let y=0;y<h;y++){
       for(let x=0;x<w;x++){
         let c=m.d[y*w+x];
-        if(c==='#'){ctx.fillStyle='#f85149';}       // Confident obstacle (red)
-        else if(c==='x'){ctx.fillStyle='#da6840';}   // Likely obstacle (orange)
-        else if(c==='!'){ctx.fillStyle='#d29922';}   // Hazard zone (yellow)
-        else if(c==='v'){ctx.fillStyle='#8b5cf6';}   // Pit / drop-off (purple)
-        else if(c==='^'){ctx.fillStyle='#2ea043';}   // Hill / slope (green)
-        else if(c===' '){ctx.fillStyle='#c8c8c8';}   // Confident free (light gray)
-        else if(c==='-'){ctx.fillStyle='#6e7681';}   // Likely free (mid gray)
-        else if(c==='f'){ctx.fillStyle='#00bfff';}   // Frontier edge (cyan) — fog-of-war boundary
-        else{ctx.fillStyle='#21262d';}               // Unknown / fog (dark)
-        ctx.fillRect(x*s,y*s,s,s);
+        if(c==='#'){ctx.fillStyle='#ff453a';}
+        else if(c==='x'){ctx.fillStyle='#da6840';}
+        else if(c==='!'){ctx.fillStyle='#ff9f0a';}
+        else if(c==='v'){ctx.fillStyle='#bf5af2';}
+        else if(c==='^'){ctx.fillStyle='#30d158';}
+        else if(c===' '){ctx.fillStyle='#c8c8c8';}
+        else if(c==='-'){ctx.fillStyle='#6e7681';}
+        else if(c==='f'){ctx.fillStyle='#00bfff';}
+        else{ctx.fillStyle='#1e252e';}
+        ctx.fillRect(x*s+ML,y*s,s,s);
       }
     }
-    // Grid lines at higher zoom
+    // Grid lines
     if(s>=3){
       ctx.strokeStyle='rgba(255,255,255,0.04)';
       ctx.lineWidth=0.5;
-      for(let x=0;x<=w;x++){ctx.beginPath();ctx.moveTo(x*s,0);ctx.lineTo(x*s,h*s);ctx.stroke();}
-      for(let y=0;y<=h;y++){ctx.beginPath();ctx.moveTo(0,y*s);ctx.lineTo(w*s,y*s);ctx.stroke();}
+      for(let x=0;x<=w;x++){ctx.beginPath();ctx.moveTo(x*s+ML,0);ctx.lineTo(x*s+ML,h*s);ctx.stroke();}
+      for(let y=0;y<=h;y++){ctx.beginPath();ctx.moveTo(ML,y*s);ctx.lineTo(ML+w*s,y*s);ctx.stroke();}
     }
-    // Robot marker
+    // Axis separator lines
+    ctx.strokeStyle='#444';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(ML,0);ctx.lineTo(ML,h*s);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(ML,h*s);ctx.lineTo(ML+w*s,h*s);ctx.stroke();
+
+    // Axis labels — distance from robot start position (50 cm per cell)
+    function fmtD(cm){if(cm===0)return'0';const sg=cm<0?'-':'';const a=Math.abs(cm);return a>=100?sg+(a/100).toFixed(1)+'m':sg+a+'cm';}
+    const step=Math.max(1,Math.ceil(28/s)); // skip labels if cells are too small
+    const fs=Math.max(8,Math.min(11,Math.floor(s*0.28)));
+    ctx.font=fs+'px sans-serif';
+    ctx.fillStyle='#8b949e';
+    ctx.strokeStyle='#555';ctx.lineWidth=0.8;
+
+    // X axis (bottom)
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    for(let x=0;x<=w;x+=step){
+      const dm=(x-m.rx)*50;
+      ctx.beginPath();ctx.moveTo(x*s+ML,h*s);ctx.lineTo(x*s+ML,h*s+4);ctx.stroke();
+      ctx.fillText(fmtD(dm),x*s+ML,h*s+MB/2);
+    }
+
+    // Y axis (left)
+    ctx.textAlign='right';ctx.textBaseline='middle';
+    for(let y=0;y<=h;y+=step){
+      const dm=(m.ry-y)*50;
+      ctx.beginPath();ctx.moveTo(ML-3,y*s);ctx.lineTo(ML,y*s);ctx.stroke();
+      ctx.fillText(fmtD(dm),ML-5,y*s);
+    }
+
+    // Robot marker (shifted by ML)
     ctx.beginPath();
-    ctx.arc(m.rx*s+s/2, m.ry*s+s/2, Math.max(s*1.2,3), 0, Math.PI*2);
-    ctx.fillStyle='#3fb950';
+    ctx.arc(m.rx*s+ML+s/2, m.ry*s+s/2, Math.max(s*1.2,3), 0, Math.PI*2);
+    ctx.fillStyle='#34c759';
     ctx.fill();
-    ctx.strokeStyle='#0d1117';
-    ctx.lineWidth=1;
+    ctx.strokeStyle='#080c10';
+    ctx.lineWidth=1.5;
     ctx.stroke();
   }catch(e){}
 }

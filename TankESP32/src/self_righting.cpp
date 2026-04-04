@@ -105,7 +105,7 @@ void SelfRightingArm::update(bool isUpsideDown, bool isOnSide, float rollDeg) {
         // rollDeg > 0 → right side down → sweep right (to 180°) first so arm pushes off ground
         // rollDeg < 0 → left side down  → sweep left  (to 0°)  first so arm pushes off ground
         currentAngle = ARM_STOW_ANGLE;
-        sweepDirection = (rollDeg >= 0) ? 1 : -1;
+        sweepDirection = (rollDeg >= 0) ? -1 : 1;
         writeAngle(currentAngle);
         lastSweepTime = now;
         Serial.printf("[SERVO] *** ON SIDE (roll=%.1f°) — sweeping %s first ***\n",
@@ -338,7 +338,7 @@ void SelfRightingArm::update(bool isUpsideDown, bool isOnSide, float rollDeg) {
                     holdStartTime = 0;
                     lastSweepTime = now;
                     currentAngle = ARM_STOW_ANGLE;
-                    sweepDirection = (rollDeg >= 0) ? 1 : -1;
+                    sweepDirection = (rollDeg >= 0) ? -1 : 1;
                     writeAngle(currentAngle);
                     Serial.printf("[SERVO] Still on side (roll=%.1f°) — retrying, sweeping %s first\n",
                                   rollDeg, sweepDirection > 0 ? "RIGHT" : "LEFT");

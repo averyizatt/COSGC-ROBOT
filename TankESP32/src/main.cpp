@@ -73,6 +73,8 @@ void updateModeIndicator();
 void handleXboxControl();
 void handleAutonomousMode();
 void handleSimpleAutonomousMode();
+void handleWallFollowMode();
+void handlePremapNavMode();
 void printTelemetry();
 
 // Print human-readable reset reason
@@ -190,9 +192,11 @@ void setup() {
     
     Serial.println("System initialization complete!");
     Serial.printf("Current mode: %s\n", 
-                  currentMode == MODE_RC_CONTROL ? "RC Control" : 
+                  currentMode == MODE_RC_CONTROL   ? "RC Control"   : 
                   currentMode == MODE_UART_CONTROL ? "UART Control" :
-                  currentMode == MODE_AUTONOMOUS ? "Autonomous" : "Simple Auto");
+                  currentMode == MODE_AUTONOMOUS   ? "Autonomous"   :
+                  currentMode == MODE_SIMPLE_AUTO  ? "Simple Auto"  :
+                  currentMode == MODE_WALL_FOLLOW  ? "Wall Follow"  : "Premap Nav");
     Serial.println("Button: Short press = Start pairing, Long press (1.5s) = Switch mode");
     Serial.println("Starting in UART Control mode...");
     
@@ -477,8 +481,41 @@ void loop() {
             lastAutonomousUpdate = currentMillis;
             handleSimpleAutonomousMode();
         }
+    } else if (currentMode == MODE_WALL_FOLLOW) {
+        // Wall-follow mode - same update rate
+        if (currentMillis - lastAutonomousUpdate >= AUTONOMOUS_UPDATE_INTERVAL) {
+            lastAutonomousUpdate = currentMillis;
+            handleWallFollowMode();
+        }
+    } else if (currentMode == MODE_PREMAP_NAV) {
+        // Premap nav — identical behaviour to autonomous but map was pre-seeded via web UI
+        if (currentMillis - lastAutonomousUpdate >= AUTONOMOUS_UPDATE_INTERVAL) {
+            lastAutonomousUpdate = currentMillis;
+            handlePremapNavMode();
+        }
     }
     
+    // Pump DNS captive-portal server so phones get instant responses.
+    // Must run every loop; loopWiFi() is a no-op when WiFi is off.
+    loopWiFi();
+
+    // Sample battery voltage every 5 seconds (8-sample average for noise rejection).
+    // Divider: Vbat -> R1(100kΩ) -> GPIO36 -> R2(47kΩ) -> GND
+    // Vadc = Vbat * R2/(R1+R2)  =>  Vbat = Vadc * (R1+R2)/R2
+    {
+        static unsigned long lastBattRead = 0;
+        if (currentMillis - lastBattRead >= 5000) {
+            lastBattRead = currentMillis;
+            uint32_t sum = 0;
+            for (int i = 0; i < BATTERY_ADC_SAMPLES; i++) {
+                sum += analogReadMilliVolts(BATTERY_ADC_PIN);
+                delayMicroseconds(200);
+            }
+            float vAdc = sum / (float)BATTERY_ADC_SAMPLES / 1000.0f; // V at ADC pin
+            batteryVoltage = vAdc * ((BATTERY_R1 + BATTERY_R2) / BATTERY_R2);
+        }
+    }
+
     // Yield to RTOS — reduces CPU heat while keeping responsive timing
     // All timed work uses millis() checks, so 10ms sleep is fine
     delay(10);
@@ -582,6 +619,9 @@ void updateSensors() {
         sensorData.gyroY = imu.getGyroY();
         sensorData.gyroZ = imu.getGyroZ();
         sensorData.temperature = imu.getTemperature();
+        // Feed MPU6050 temperature into ultrasonic sensors for speed-of-sound compensation
+        ultrasonicLeft.setAmbientTemp(sensorData.temperature);
+        ultrasonicRight.setAmbientTemp(sensorData.temperature);
 
         // === IMU PLAUSIBILITY / FAULT DETECTION ===
         // When upright and in 1g gravity, accel magnitude should be close to 1.0.
@@ -695,9 +735,11 @@ void printTelemetry() {
                   motors.isThermalThrottled() ? " [THROTTLED]" : "",
                   motors.isDutyCycleThrottled() ? " [DUTY-LIM]" : "");
     Serial.printf("Mode: %s\n",
-                  currentMode == MODE_RC_CONTROL ? "RC Control" :
+                  currentMode == MODE_RC_CONTROL   ? "RC Control"   :
                   currentMode == MODE_UART_CONTROL ? "UART Control" :
-                  currentMode == MODE_AUTONOMOUS ? "Autonomous" : "Simple Auto");
+                  currentMode == MODE_AUTONOMOUS   ? "Autonomous"   :
+                  currentMode == MODE_SIMPLE_AUTO  ? "Simple Auto"  :
+                  currentMode == MODE_WALL_FOLLOW  ? "Wall Follow"  : "Premap Nav");
     if (IMU_ENABLED) {
         Serial.printf("Orientation: %s\n", motors.isUpsideDown() ? "UPSIDE DOWN" : "Right-side up");
     }
@@ -730,7 +772,7 @@ void handleButtonPress() {
 
         uint8_t prevMode = currentMode;
         
-        // Cycle: UART -> RC -> Autonomous -> Simple Auto -> UART
+        // Cycle: UART -> RC -> Autonomous -> Simple Auto -> Wall Follow -> UART
         if (currentMode == MODE_UART_CONTROL) {
             currentMode = MODE_RC_CONTROL;
             Serial.println("\n========================================");
@@ -752,6 +794,24 @@ void handleButtonPress() {
             Serial.println("\n========================================");
             Serial.println("MODE SWITCHED TO: SIMPLE AUTONOMOUS");
             Serial.println("Behavior: Forward, turn if obstacle < 25cm");
+            Serial.println("========================================\n");
+        } else if (currentMode == MODE_SIMPLE_AUTO) {
+            currentMode = MODE_WALL_FOLLOW;
+            pathPlanner.stop();
+            lastAutonomousUpdate = 0;
+            Serial.println("\n========================================");
+            Serial.println("MODE SWITCHED TO: WALL FOLLOW");
+            Serial.println("Behavior: Find left wall, trace perimeter (PID)");
+            Serial.println("========================================\n");
+        } else if (currentMode == MODE_WALL_FOLLOW) {
+            currentMode = MODE_PREMAP_NAV;
+            autoNav.reset();
+            pathPlanner.startExploration();
+            lastAutonomousUpdate = 0;
+            Serial.println("\n========================================");
+            Serial.println("MODE SWITCHED TO: PREMAP NAV");
+            Serial.println("Behavior: Autonomous nav using web-drawn map");
+            Serial.println("Draw map at http://192.168.4.1/map/draw");
             Serial.println("========================================\n");
         } else {
             currentMode = MODE_UART_CONTROL;
@@ -803,6 +863,10 @@ void updateModeIndicator() {
         led.setMode(LED_SOLID_ORANGE);  // Orange for autonomous mode
     } else if (currentMode == MODE_SIMPLE_AUTO) {
         led.setMode(LED_SOLID_PURPLE);  // Purple for simple autonomous mode
+    } else if (currentMode == MODE_WALL_FOLLOW) {
+        led.setMode(LED_SOLID_CYAN);    // Cyan for wall-follow mode
+    } else if (currentMode == MODE_PREMAP_NAV) {
+        led.setMode(LED_SOLID_LIME);    // Lime for premap nav mode
     }
 }
 
@@ -1311,8 +1375,27 @@ void handleAutonomousMode() {
     motors.setMotors(leftSpeed, rightSpeed);
     lastMotorSpeedA = leftSpeed;
     lastMotorSpeedB = rightSpeed;
-    
-    // Servo only activates via selfRighting.update(isFlipped) for upside-down/on-side
+
+    // === SELF-RIGHTING MOTOR PAUSE ===
+    // When the arm is actively trying to flip the robot, stop the drive motors so
+    // they don't fight the arm's leverage. Resume once the arm returns to stowed/idle.
+    {
+        static bool rightingMotorsPaused = false;
+        RightingState rs = selfRighting.getState();
+        bool armActive = (rs == ARM_RIGHTING || rs == ARM_SIDE_RIGHTING);
+        if (armActive) {
+            if (!rightingMotorsPaused) {
+                Serial.println("[RIGHTING] Pausing drive motors — arm has control.");
+                rightingMotorsPaused = true;
+            }
+            motors.setMotors(0, 0);
+            lastMotorSpeedA = 0;
+            lastMotorSpeedB = 0;
+        } else if (rightingMotorsPaused) {
+            Serial.println("[RIGHTING] Arm done — resuming drive motors.");
+            rightingMotorsPaused = false;
+        }
+    }
     
     // Debug output every 2s
     static unsigned long lastDebug = 0;
@@ -2153,6 +2236,229 @@ void handleSimpleAutonomousMode() {
         #endif
         lastDebug = now;
     }
+}
+
+// =============================================================================
+// WALL FOLLOW MODE — Left-Hand Rule Perimeter Tracer
+// Strategy: find a wall on the left side, then keep it at WF_TARGET_DIST_CM
+// using a PID controller. Steer right for corners where the wall disappears,
+// or right when the front sensor is blocked. All terrain / self-righting logic
+// still runs via updateSensors() / selfRighting.update().
+//
+// States:
+//   WF_SEARCH  — spinning to find an initial left wall
+//   WF_FOLLOW  — PID wall-distance hold; drive parallel to wall
+//   WF_CORNER  — left wall lost; turning left to wrap around a corner
+//   WF_BLOCKED — front obstacle reached; turning right to go around it
+// =============================================================================
+void handleWallFollowMode() {
+    enum WFState { WF_SEARCH, WF_FOLLOW, WF_CORNER, WF_BLOCKED, WF_CRUISE };
+    static WFState wfState    = WF_SEARCH;
+    static unsigned long wfActionUntil = 0;
+    static unsigned long wfSearchStart = 0;  // When WF_SEARCH began (for timeout)
+    static float wfPidI       = 0.0f;
+    static float wfPrevErr    = 0.0f;
+    static unsigned long lastWFDebug = 0;
+
+    // Self-righting motor pause (same as autonomous mode)
+    {
+        RightingState rs = selfRighting.getState();
+        if (rs == ARM_RIGHTING || rs == ARM_SIDE_RIGHTING) {
+            motors.setMotors(0, 0);
+            lastMotorSpeedA = 0;
+            lastMotorSpeedB = 0;
+            return;
+        }
+    }
+
+    float fwd  = sensorData.distance;         // front sensor
+    float left = sensorData.distanceLeft;     // left sensor (wall reference)
+    unsigned long now = millis();
+
+    // Treat invalid readings as "very far" so they don't trigger false walls
+    if (fwd  < 0) fwd  = 400.0f;
+    if (left < 0) left = 400.0f;
+
+    bool frontBlocked  = (fwd  < WF_FRONT_STOP_CM);
+    bool frontSlow     = (fwd  > WF_FRONT_STOP_CM && fwd < WF_FRONT_SLOW_CM);
+    bool wallPresent   = (left < WF_WALL_LOST_CM);
+    bool inTimedAction = (now < wfActionUntil);
+
+    int leftSpeed = 0, rightSpeed = 0;
+
+    switch (wfState) {
+
+        // ── SEARCH: spin left until we detect a wall on the left ──────────────
+        case WF_SEARCH:
+            if (wfSearchStart == 0) wfSearchStart = now;
+            if (wallPresent) {
+                Serial.printf("[WF] Wall found at %.0fcm — switching to FOLLOW\n", left);
+                wfState = WF_FOLLOW;
+                wfSearchStart = 0;
+                wfPidI  = 0; wfPrevErr = 0;
+            } else if (now - wfSearchStart > WF_SEARCH_TIMEOUT_MS) {
+                // No wall after timeout — open area. Cruise forward looking for one.
+                Serial.println("[WF] No wall found — switching to CRUISE (open area)");
+                wfState = WF_CRUISE;
+                wfSearchStart = 0;
+            } else {
+                // Spin counter-clockwise (left) to sweep until we find something
+                leftSpeed  = -WF_SEARCH_SPEED;
+                rightSpeed =  WF_SEARCH_SPEED;
+            }
+            break;
+
+        // ── CRUISE: open area, drive forward until a wall appears on the left ─
+        case WF_CRUISE:
+            if (wallPresent) {
+                Serial.printf("[WF] Wall acquired at %.0fcm while cruising — FOLLOW\n", left);
+                wfState = WF_FOLLOW;
+                wfPidI = 0; wfPrevErr = 0;
+            } else if (frontBlocked) {
+                // Hit something ahead while cruising — spin to find left wall
+                Serial.println("[WF] Blocked while cruising — SEARCH");
+                wfState = WF_SEARCH;
+                wfSearchStart = 0;
+            } else {
+                // Drive forward at cruise speed
+                leftSpeed  = WF_CRUISE_SPEED;
+                rightSpeed = WF_CRUISE_SPEED;
+            }
+            break;
+
+        // ── FOLLOW: PID to maintain target distance from the left wall ─────────
+        case WF_FOLLOW:
+            if (!wallPresent && !inTimedAction) {
+                // Wall disappeared — corner! Turn left to stay with it
+                Serial.printf("[WF] Wall lost (%.0fcm) — CORNER turn\n", left);
+                wfState = WF_CORNER;
+                wfActionUntil = now + WF_CORNER_TURN_MS;
+                wfPidI = 0; wfPrevErr = 0;
+                break;
+            }
+            if (frontBlocked && !inTimedAction) {
+                // Front blocked while following — turn right
+                Serial.printf("[WF] Front blocked %.0fcm — BLOCKED turn right\n", fwd);
+                wfState = WF_BLOCKED;
+                wfActionUntil = now + WF_BLOCK_TURN_MS;
+                wfPidI = 0; wfPrevErr = 0;
+                break;
+            }
+            {
+                // PID on wall error: positive error → too far from wall → steer left
+                float err = left - WF_TARGET_DIST_CM;
+                wfPidI   += err * 0.05f;  // integrate at ~20Hz update rate
+                wfPidI    = constrain(wfPidI, -40.0f, 40.0f);
+                float derr = err - wfPrevErr;
+                wfPrevErr = err;
+                float correction = WF_PID_KP * err + WF_PID_KI * wfPidI + WF_PID_KD * derr;
+                correction = constrain(correction, -80.0f, 80.0f);
+
+                int baseSpeed = frontSlow ? WF_SLOW_SPEED : WF_CRUISE_SPEED;
+                // Positive correction → too far right of wall → slow left, add right
+                leftSpeed  = constrain((int)(baseSpeed - correction), -255, 255);
+                rightSpeed = constrain((int)(baseSpeed + correction), -255, 255);
+            }
+            break;
+
+        // ── CORNER: left wall gone; turn left to wrap around corner ───────────
+        case WF_CORNER:
+            if (inTimedAction) {
+                leftSpeed  = -WF_TURN_SPEED;
+                rightSpeed =  WF_TURN_SPEED;
+            } else {
+                // After turn, check if we found the wall again
+                if (wallPresent) {
+                    Serial.println("[WF] Wall re-acquired after corner — FOLLOW");
+                    wfState = WF_FOLLOW;
+                    wfPidI = 0; wfPrevErr = 0;
+                } else {
+                    // Still no wall — search (resets timeout)
+                    Serial.println("[WF] Still no wall after corner — SEARCH");
+                    wfState = WF_SEARCH;
+                    wfSearchStart = 0;
+                }
+            }
+            break;
+
+        // ── BLOCKED: front obstacle; turn right to clear path ─────────────────
+        case WF_BLOCKED:
+            if (inTimedAction) {
+                leftSpeed  =  WF_TURN_SPEED;
+                rightSpeed = -WF_TURN_SPEED;
+            } else {
+                // After right turn, resume following if wall is still there
+                if (wallPresent && !frontBlocked) {
+                    Serial.println("[WF] Path clear after block — FOLLOW");
+                    wfState = WF_FOLLOW;
+                    wfPidI = 0; wfPrevErr = 0;
+                } else if (!wallPresent) {
+                    wfState = WF_SEARCH;
+                }
+                // else: still blocked, stay in BLOCKED and turn more (wfActionUntil reset below)
+                else {
+                    wfActionUntil = now + WF_BLOCK_TURN_MS;
+                }
+            }
+            break;
+    }
+
+    // IMU hill/pit guard: if pitching dangerously, halt and log
+    #if IMU_ENABLED
+    if (!imuFaultDetected) {
+        float wfPitch = 0;
+        // Use autoNav pitch if available (needs IMU update)
+        autoNav.updateIMU(sensorData.accelX, sensorData.accelY, sensorData.accelZ,
+                          sensorData.gyroX, sensorData.gyroY, sensorData.gyroZ);
+        wfPitch = autoNav.getPitch();
+        if (fabs(wfPitch) > HILL_PITCH_THRESHOLD * 1.5f) {
+            // Very steep — don't follow, stop and let driver/simple logic handle it
+            static unsigned long wfTerrainWarnAt = 0;
+            if (millis() - wfTerrainWarnAt > 3000) {
+                Serial.printf("[WF] Steep terrain %.1f° — holding position\n", wfPitch);
+                wfTerrainWarnAt = millis();
+            }
+            leftSpeed = 0; rightSpeed = 0;
+        }
+    }
+    #endif
+
+    motors.setMotors(leftSpeed, rightSpeed);
+    lastMotorSpeedA = leftSpeed;
+    lastMotorSpeedB = rightSpeed;
+
+    // Occupancy map update with current readings
+    float wfHeading = autoNav.getHeading();
+    if (fwd  >= 2.0f && fwd  <= 400.0f) envMap.addReading(fwd,  wfHeading);
+    if (left >= 2.0f && left <= 400.0f) envMap.addReading(left, wfHeading - 15.0f);
+
+    if (now - lastWFDebug > 2000) {
+        lastWFDebug = now;
+        const char* stateStr = wfState == WF_SEARCH  ? "SEARCH"  :
+                               wfState == WF_FOLLOW  ? "FOLLOW"  :
+                               wfState == WF_CORNER  ? "CORNER"  :
+                               wfState == WF_CRUISE  ? "CRUISE"  : "BLOCKED";
+        Serial.printf("[WF] %s | Fwd:%.0f Left:%.0f | Err:%.1f | ML:%d MR:%d\n",
+                      stateStr, fwd, left, left - WF_TARGET_DIST_CM, leftSpeed, rightSpeed);
+    }
+}
+
+// =============================================================================
+// PREMAP NAV MODE — Autonomous navigation with a web-drawn pre-seeded map.
+// Behaviour is identical to handleAutonomousMode() — the autonomous navigator
+// reads the occupancy map and avoids whatever is marked in it. The difference
+// is purely that the map was seeded by the user via the web editor before the
+// run, so the robot already "knows" the arena layout from the very first cycle
+// instead of discovering it by bumping into things.
+//
+// The map can be drawn at http://192.168.4.1/map/draw while the robot is idle,
+// then the robot is switched to this mode to start the run.
+// =============================================================================
+void handlePremapNavMode() {
+    // Delegate entirely to the autonomous nav handler — it already reads from
+    // envMap which is pre-seeded by the POST /api/premap endpoint.
+    extern void handleAutonomousMode();
+    handleAutonomousMode();
 }
 
 void handleCustomCommand(uint8_t cmd, uint8_t* data, uint8_t length) {

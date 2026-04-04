@@ -1,32 +1,10 @@
-
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include "esp_bt.h"
-#include "web_dashboard.h"
+// web_status.cpp — implementation moved to wifi_manager.cpp and web_api.cpp
+// This stub keeps the file present so nothing in the build system breaks.
 #include "web_status.h"
-#include "config.h"
-#include "globals.h"
-#include "autonomous_nav.h"
-#include "occupancy_map.h"
-#include "hall_encoder.h"
-#include "motor_control.h"
-#include "mpu6050_sensor.h"
-#include "uart_comm.h"
-#include "ultrasonic_sensor.h"
-#include "path_planner.h"
 
-const char* ssid = "ESP32-Robot";
-AsyncWebServer server(80);
-static volatile bool serverActive = false;  // Guards handlers during WiFi teardown
-
-extern AutonomousNav autoNav;
-extern SensorData sensorData;
-extern MPU6050Sensor imu;
-extern UltrasonicSensor ultrasonicLeft;
-extern UltrasonicSensor ultrasonicRight;
-extern PathPlanner pathPlanner;
-
-void setupWebServer() {
+// (no definitions here — see wifi_manager.cpp and web_api.cpp)
+#if 0  // BEGIN dead code block — preserved for reference only
+void setupWebServer_DEAD() {
     // ---- Register routes (once) ----
 
     // Tiny test endpoint
@@ -247,3 +225,4 @@ void stopWiFi() {
     WiFi.mode(WIFI_OFF);
     Serial.println("[WiFi] WiFi radio disabled");
 }
+#endif  // END dead code block

@@ -11,5 +11,6 @@ extern HallEncoder encoders;
 extern OccupancyMap envMap;
 extern uint8_t currentMode;
 extern float odomX, odomY, odomTheta;
+extern float batteryVoltage;   // Filtered battery pack voltage (V), 0 = not yet read
 
 #endif // GLOBALS_H

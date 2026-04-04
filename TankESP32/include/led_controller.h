@@ -11,7 +11,9 @@ enum LEDMode {
     LED_SOLID_ORANGE,       // Autonomous mode
     LED_SOLID_PURPLE,       // Simple autonomous mode
     LED_BLINK_BLUE_FAST,    // Bluetooth pairing
-    LED_SOLID_RED_MODE      // UART mode
+    LED_SOLID_RED_MODE,     // UART mode
+    LED_SOLID_CYAN,         // Wall-follow mode
+    LED_SOLID_LIME          // Premap nav mode
 };
 
 class LEDController {

@@ -4,10 +4,11 @@
 
 UltrasonicSensor::UltrasonicSensor(int trigPin, int echoPin)
     : _trigPin(trigPin), _echoPin(echoPin),
+      _ambientTempC(25.0f),
       _medianIdx(0), _medianFilled(false),
       _health(SENSOR_OK), _consecutiveFails(0),
-      _lastValidReading(30.0f), _stuckCount(0) {
-    _medianBuf[0] = _medianBuf[1] = _medianBuf[2] = 0.0f;
+      _lastValidReading(30.0f), _pendingReading(-1.0f), _stuckCount(0) {
+    for (int i = 0; i < MEDIAN_SIZE; i++) _medianBuf[i] = 0.0f;
 }
 
 void UltrasonicSensor::begin() {
@@ -20,62 +21,122 @@ void UltrasonicSensor::begin() {
     delay(50);
 }
 
-// Single read using polling — reliable on ESP32 without BLE interference.
+// Single ping — one trigger + echo wait.
+// Echo-rise timeout raised to 10ms for weak/absorbed returns on sand.
 float UltrasonicSensor::_readOnce() {
-    // Send 10µs trigger pulse
     digitalWrite(_trigPin, LOW);
     delayMicroseconds(4);
     digitalWrite(_trigPin, HIGH);
     delayMicroseconds(10);
     digitalWrite(_trigPin, LOW);
 
-    // Wait for echo pin to go HIGH (rising edge), timeout 5ms
+    // Wait for echo HIGH — 10ms timeout (up from 5ms) for weak sand returns
     unsigned long t = micros();
     while (digitalRead(_echoPin) == LOW) {
-        if (micros() - t > 5000UL) return -1.0f;
+        if (micros() - t > 10000UL) return -1.0f;
     }
     unsigned long echoStart = micros();
 
-    // Wait for echo pin to go LOW (falling edge), timeout = TIMEOUT_US
+    // Wait for echo LOW
     while (digitalRead(_echoPin) == HIGH) {
         if (micros() - echoStart > (unsigned long)TIMEOUT_US) return -1.0f;
     }
-    unsigned long echoEnd = micros();
-
-    unsigned long duration = echoEnd - echoStart;
+    unsigned long duration = micros() - echoStart;
     if (duration == 0) return -1.0f;
 
-    float distance = (duration * 0.0343f) / 2.0f;
+    // Temperature-compensated speed of sound: v = 331.3 + 0.606*T (m/s)
+    // Divide by 20000 instead of hardcoding 0.0343 to incorporate temp
+    float speedCmUs = (331.3f + 0.606f * _ambientTempC) / 10000.0f; // cm/µs
+    float distance = (duration * speedCmUs) / 2.0f;
+
     if (distance < 2.0f || distance > 400.0f) return -1.0f;
     return distance;
 }
 
-float UltrasonicSensor::_median3(float a, float b, float c) {
-    if (a > b) { float t = a; a = b; b = t; }
-    if (b > c) { float t = b; b = c; c = t; }
-    if (a > b) { float t = a; a = b; b = t; }
-    return b;
+// Triple-ping: fires 3 pings back-to-back with a 2ms gap, returns median.
+// Rejects single-bounce failures (sand absorption, beam scatter).
+// Adds ~30ms per readDistance() call but greatly reduces bad reads.
+float UltrasonicSensor::_readTriple() {
+    float r[3];
+    int validCount = 0;
+    for (int i = 0; i < 3; i++) {
+        r[i] = _readOnce();
+        if (r[i] > 0) validCount++;
+        delayMicroseconds(2000);  // 2ms between pings — avoids echo overlap
+    }
+    if (validCount == 0) return -1.0f;
+    if (validCount == 1) {
+        // Only one valid ping — return it but treat as low-confidence
+        for (int i = 0; i < 3; i++) if (r[i] > 0) return r[i];
+    }
+    // Sort and pick median of whichever are valid
+    // Simple insertion sort on 3 elements
+    for (int i = 1; i < 3; i++) {
+        for (int j = i; j > 0 && r[j-1] > r[j]; j--) {
+            float tmp = r[j]; r[j] = r[j-1]; r[j-1] = tmp;
+        }
+    }
+    // Return middle valid value
+    if (validCount == 3) return r[1];  // True median
+    // Two valid: return the smaller (more conservative for obstacle avoidance)
+    for (int i = 0; i < 3; i++) if (r[i] > 0) return r[i];
+    return -1.0f;
+}
+
+// N-sample median (sorts a copy of buf).
+float UltrasonicSensor::_medianN(float* buf, int n) {
+    float tmp[MEDIAN_SIZE];
+    for (int i = 0; i < n; i++) tmp[i] = buf[i];
+    for (int i = 1; i < n; i++) {
+        for (int j = i; j > 0 && tmp[j-1] > tmp[j]; j--) {
+            float t = tmp[j]; tmp[j] = tmp[j-1]; tmp[j-1] = t;
+        }
+    }
+    return tmp[n / 2];
 }
 
 float UltrasonicSensor::readDistance() {
-    float raw = _readOnce();
-    
+    // Get a triple-ping median for this cycle
+    float raw = _readTriple();
+
     // --- Health monitoring ---
     if (raw < 0) {
         _consecutiveFails++;
         if (_consecutiveFails >= FAIL_THRESHOLD) {
             if (_health != SENSOR_FAILED) {
                 _health = SENSOR_FAILED;
-                Serial.printf("[SENSOR] Pin %d FAILED (%d consecutive failures)\n",
+                Serial.printf("[SENSOR] Pin %d FAILED (%d consecutive triple-pings failed)\n",
                               _echoPin, _consecutiveFails);
             }
         } else if (_consecutiveFails >= 3) {
             _health = SENSOR_DEGRADED;
         }
-        return -1.0f;  // Don't feed bad data into median
+        return -1.0f;
     }
-    
-    // Valid reading — check for stuck sensor (constant value)
+
+    // --- Spike rejection (sand grain / dust false echo) ---
+    // If reading jumps >SPIKE_THRESHOLD from last accepted value, hold as pending.
+    // Accept it only if the NEXT reading agrees (within 15cm of the candidate).
+    float jump = fabs(raw - _lastValidReading);
+    if (jump > SPIKE_THRESHOLD && _lastValidReading > 0) {
+        if (_pendingReading < 0) {
+            // First time seeing this spike — record and wait
+            _pendingReading = raw;
+            return _lastValidReading;  // Hold last good value this cycle
+        } else if (fabs(raw - _pendingReading) < 15.0f) {
+            // Confirmed — the jump is real (two consecutive readings agree)
+            _pendingReading = -1.0f;
+            // Fall through to accept raw
+        } else {
+            // Unconfirmed fluctuation — keep waiting
+            _pendingReading = raw;
+            return _lastValidReading;
+        }
+    } else {
+        _pendingReading = -1.0f;  // No spike — clear pending
+    }
+
+    // --- Stuck sensor detection ---
     if (fabs(raw - _lastValidReading) < STUCK_TOLERANCE) {
         _stuckCount++;
         if (_stuckCount >= STUCK_THRESHOLD) {
@@ -87,32 +148,29 @@ float UltrasonicSensor::readDistance() {
             return -1.0f;
         }
     } else {
-        // Reading changed — reset stuck counter and recover health
         _stuckCount = 0;
         if (_health == SENSOR_FAILED) {
             _health = SENSOR_OK;
             Serial.printf("[SENSOR] Pin %d RECOVERED (reading changed to %.1fcm)\n", _echoPin, raw);
         }
     }
+
     _lastValidReading = raw;
     _consecutiveFails = 0;
     if (_health == SENSOR_DEGRADED) _health = SENSOR_OK;
-    
-    // --- 3-sample median filter ---
+
+    // --- 5-sample rolling median (wider window = smoother on rough terrain) ---
     _medianBuf[_medianIdx] = raw;
-    _medianIdx = (_medianIdx + 1) % 3;
+    _medianIdx = (_medianIdx + 1) % MEDIAN_SIZE;
     if (!_medianFilled && _medianIdx == 0) _medianFilled = true;
-    
-    if (!_medianFilled) {
-        return raw;  // Not enough samples yet
-    }
-    return _median3(_medianBuf[0], _medianBuf[1], _medianBuf[2]);
+
+    if (!_medianFilled) return raw;
+    return _medianN(_medianBuf, MEDIAN_SIZE);
 }
 
 bool UltrasonicSensor::obstacleDetected(float threshold) {
     float distance = readDistance();
-    if (distance < 0) {
-        return false;
-    }
+    if (distance < 0) return false;
     return distance < threshold;
 }
+

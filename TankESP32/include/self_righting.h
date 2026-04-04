@@ -26,6 +26,9 @@ public:
     void stow();          // Move arm to upright position
     void setAngle(int angle);  // Direct angle control (0-180)
 
+    // State query — used by main loop to pause motors during active righting
+    RightingState getState() const { return state; }
+
 private:
     void writeAngle(int angle);
     void detachServo();     // Stop PWM output (servo goes limp, saves power/heat)

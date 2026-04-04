@@ -499,23 +499,33 @@ void AutonomousNav::handleAvoid(float distance) {
     // Phase complete — advance
     switch (avoidPhase) {
         case AVOID_BACKUP: {
-            // Backup done → pick turn direction and turn
-            avoidTurnDir = pickTurnDirection(distance);
-            
-            // Turn duration based on wall angle
+            // Backup done → pick turn direction and turn.
+            // On retries, flip the direction so we don't spiral in circles.
+            if (avoidAttempts == 0) {
+                avoidTurnDir = pickTurnDirection(distance);
+            } else {
+                // Alternate away from the direction that didn't work
+                avoidTurnDir = (avoidTurnDir == TURN_LEFT) ? TURN_RIGHT : TURN_LEFT;
+                Serial.printf("[AVOID] Retry %d — flipping to %s\n",
+                              avoidAttempts, avoidTurnDir == TURN_LEFT ? "LEFT" : "RIGHT");
+            }
+
+            // Turn duration: longer for head-on, and grows with each retry
             float absAngle = abs(detectedWallAngle);
-            unsigned long turnTime;
-            if (absAngle > 60) turnTime = 125;       // Glancing
-            else if (absAngle > 30) turnTime = 175;   // Moderate
-            else turnTime = 250;                       // Head-on
-            
+            unsigned long baseTurn;
+            if (absAngle > 60) baseTurn = 250;       // Glancing
+            else if (absAngle > 30) baseTurn = 375;  // Moderate
+            else baseTurn = 450;                      // Head-on
+            // Add 100ms per retry so each attempt clears a wider arc
+            unsigned long turnTime = baseTurn + (unsigned long)(avoidAttempts * 100);
+
             avoidPhase = AVOID_TURN;
             avoidPhaseStart = now;
             avoidPhaseDuration = turnTime;
             targetSpeed = SPEED_TURN;
-            Serial.printf("[AVOID] TURN %s %lums (wall:%.0f°)\n",
+            Serial.printf("[AVOID] TURN %s %lums (wall:%.0f° attempt:%d)\n",
                           avoidTurnDir == TURN_LEFT ? "LEFT" : "RIGHT",
-                          turnTime, detectedWallAngle);
+                          turnTime, detectedWallAngle, avoidAttempts);
             break;
         }
         
@@ -546,9 +556,11 @@ void AutonomousNav::handleAvoid(float distance) {
                 } else {
                     Serial.printf("[AVOID] Still blocked (%.0fcm) — retry %d/%d\n",
                                   distance, avoidAttempts, AVOID_MAX_CYCLES);
+                    // Scale backup longer each retry so we get more clearance
+                    unsigned long retryBackup = AVOID_BACKUP_MS + (unsigned long)(avoidAttempts * 150);
                     avoidPhase = AVOID_BACKUP;
                     avoidPhaseStart = now;
-                    avoidPhaseDuration = AVOID_BACKUP_MS;
+                    avoidPhaseDuration = retryBackup;
                     targetSpeed = SPEED_CRUISE;
                 }
             }

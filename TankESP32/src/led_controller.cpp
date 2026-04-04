@@ -68,6 +68,14 @@ void LEDController::update() {
             writeRGB(180, 0, 255);
             break;
 
+        case LED_SOLID_CYAN:
+            writeRGB(0, 255, 220);
+            break;
+
+        case LED_SOLID_LIME:
+            writeRGB(80, 255, 0);   // Lime green — premap nav mode
+            break;
+
         case LED_BLINK_BLUE_FAST:
             if (currentMillis - lastBlinkTime >= LED_BLINK_FAST) {
                 lastBlinkTime = currentMillis;
