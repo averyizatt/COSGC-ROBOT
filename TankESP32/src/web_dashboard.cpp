@@ -147,44 +147,6 @@ button:active { background: rgba(77,166,255,0.28); }
 .stall-warn { color: var(--red); font-weight: 700; }
 .stall-ok   { color: var(--green); font-weight: 600; }
 
-/* ── Battery widget ─────────────────────────────────── */
-.batt-card {
-  display: flex; align-items: center; gap: 14px;
-  background: var(--card); border: 1px solid var(--border);
-  border-radius: 12px; padding: 12px 16px; margin-bottom: 16px;
-  box-shadow: 0 1px 8px rgba(0,0,0,0.3);
-  position: relative; overflow: hidden;
-}
-.batt-card::before {
-  content: ''; position: absolute; left: 0; top: 0; bottom: 0;
-  width: 3px; border-radius: 12px 0 0 12px;
-  background: var(--batt-color, var(--green));
-}
-.batt-icon-wrap {
-  position: relative; display: flex; align-items: center; flex-shrink: 0;
-}
-/* SVG battery drawn via CSS/HTML */
-.batt-body {
-  width: 46px; height: 24px; border: 2px solid var(--batt-color, var(--green));
-  border-radius: 4px; position: relative; overflow: hidden;
-  flex-shrink: 0;
-}
-.batt-body::after {
-  content: ''; position: absolute; right: -6px; top: 50%;
-  transform: translateY(-50%); width: 4px; height: 10px;
-  background: var(--batt-color, var(--green)); border-radius: 0 2px 2px 0;
-}
-.batt-fill {
-  height: 100%; border-radius: 2px; transition: width 0.8s ease, background 0.5s;
-}
-.batt-info { flex: 1; min-width: 0; }
-.batt-pct  { font-size: 1.5em; font-weight: 800; color: var(--batt-color, var(--green)); line-height: 1; font-variant-numeric: tabular-nums; }
-.batt-sub  { font-size: 0.75em; color: var(--dim); margin-top: 2px; }
-.batt-bar-wrap { flex: 1; }
-.batt-bar { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
-.batt-bar .bfill { height: 100%; border-radius: 4px; transition: width 0.8s ease, background 0.5s; }
-.batt-status { font-size: 0.72em; color: var(--dim); margin-top: 4px; text-align: right; }
-
 /* ── Section divider ────────────────────────────────── */
 .section-label {
   font-size: 0.68em; text-transform: uppercase; letter-spacing: 1.6px;
@@ -221,21 +183,6 @@ button:active { background: rgba(77,166,255,0.28); }
   <div class="conn-pill">
     <span class="status-dot dot-err" id="dot"></span>
     <span id="conntext">Connecting...</span>
-  </div>
-</div>
-
-<!-- Battery indicator -->
-<div class="batt-card" id="battCard">
-  <div class="batt-body">
-    <div class="batt-fill" id="battFill" style="width:0%"></div>
-  </div>
-  <div class="batt-info">
-    <div class="batt-pct" id="battPct">--</div>
-    <div class="batt-sub" id="battSub">Battery not wired</div>
-  </div>
-  <div class="batt-bar-wrap">
-    <div class="batt-bar"><div class="bfill" id="battBar" style="width:0%"></div></div>
-    <div class="batt-status" id="battStatus">-- V</div>
   </div>
 </div>
 
@@ -418,33 +365,6 @@ function fmtHeap(b){
 }
 function tempColor(t){return t>70?'var(--red)':t>55?'var(--orange)':'var(--green)';}
 
-function updateBattery(v, pct) {
-  const card = $('battCard');
-  // -1 = pin not wired / not yet read
-  if (v < 0.5 || pct === undefined || pct < 0) {
-    $('battPct').textContent = '--';
-    $('battSub').textContent = 'Connect GPIO 36 voltage divider';
-    $('battStatus').textContent = '-- V';
-    $('battFill').style.width = '0%';
-    $('battBar').style.width = '0%';
-    const c = 'var(--dim)';
-    card.style.setProperty('--batt-color', c);
-    $('battFill').style.background = c;
-    $('battBar').style.background = c;
-    return;
-  }
-  const p = Math.max(0, Math.min(100, pct));
-  const color = p > 40 ? 'var(--green)' : p > 20 ? 'var(--orange)' : 'var(--red)';
-  card.style.setProperty('--batt-color', color);
-  $('battPct').textContent = p.toFixed(0) + '%';
-  $('battSub').textContent = p > 40 ? 'Battery good' : p > 20 ? 'Battery low' : '⚠ Battery critical!';
-  $('battStatus').textContent = v.toFixed(2) + ' V';
-  $('battFill').style.width = p + '%';
-  $('battFill').style.background = color;
-  $('battBar').style.width = p + '%';
-  $('battBar').style.background = color;
-}
-
 async function poll(){
   try{
     let r=await fetch('/api/status');
@@ -501,9 +421,6 @@ async function poll(){
     $('ms').textContent=d.mapShifts;
     $('cli').textContent=d.clients;
     $('uptime').textContent=fmtTime(d.uptime);
-
-    // Battery widget
-    updateBattery(d.batteryV, d.batteryPct);
 
     $('dot').className='status-dot dot-ok';
     $('conntext').textContent='Updated '+new Date().toLocaleTimeString();

@@ -3,6 +3,9 @@
 #include "driver/gpio.h"
 #include "driver/dac.h"
 
+// File-scope flag: printed once per watchdog event, reset by setMotors() on new commands
+static bool watchdogPrinted = false;
+
 // Temperature sensor: Use internal sensor if available
 // ESP32 WROOM uses the legacy API; ESP32-S3 uses driver/temperature_sensor.h
 #ifdef __cplusplus
@@ -175,8 +178,7 @@ void MotorControl::safetyCheck() {
     // --- Motor watchdog — stop motors if no command received ---
     if (lastCommandTime > 0 && (now - lastCommandTime > MOTOR_WATCHDOG_MS)) {
         stop();
-        // Don't spam — only print once
-        static bool watchdogPrinted = false;
+        // Don't spam — only print once per watchdog event (reset by setMotors)
         if (!watchdogPrinted) {
             Serial.println("[SAFETY] Motor watchdog: no command — motors stopped");
             watchdogPrinted = true;
@@ -435,6 +437,7 @@ void MotorControl::setMotorB(int speed) {
 
 void MotorControl::setMotors(int speedA, int speedB) {
     lastCommandTime = millis();
+    watchdogPrinted = false;  // Reset so next watchdog event logs again
     
     // When upside down, swap sides and invert
     if (upsideDown) {

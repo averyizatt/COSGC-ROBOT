@@ -5,12 +5,15 @@ UARTComm::UARTComm() {
     rxIndex = 0;
     motorCommandCallback = nullptr;
     customCommandCallback = nullptr;
+    serial1Ready = false;
 }
 
 void UARTComm::begin() {
     // DISABLED: Serial1 on pins 43/44 conflicts with USB-CDC on ESP32-S3
-    // To re-enable, use different pins (e.g., 17/18)
+    // To re-enable, use different pins (e.g., 17/18) and set serial1Ready = true below.
     // Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX, UART_TX);
+    // serial1Ready = true;
+    serial1Ready = false;
     Serial.println("UART Communication initialized (Serial1 disabled - use USB Serial)");
 }
 
@@ -29,6 +32,7 @@ bool UARTComm::validateChecksum(const Message& msg) {
 }
 
 void UARTComm::sendMessage(const Message& msg) {
+    if (!serial1Ready) return;  // Serial1 not initialized
     // Send start byte
     Serial1.write(0xFF);
     
@@ -87,6 +91,7 @@ void UARTComm::sendAck(uint8_t messageType) {
 }
 
 bool UARTComm::receiveMessage(Message& msg) {
+    if (!serial1Ready) return false;  // Serial1 not initialized
     while (Serial1.available()) {
         uint8_t byte = Serial1.read();
         
@@ -99,6 +104,12 @@ bool UARTComm::receiveMessage(Message& msg) {
         
         // Check if we have at least the header (start + type + length)
         if (rxIndex >= 3) {
+            // Validate payload length before arithmetic — an untrusted value >= 251
+            // would wrap uint8_t and cause memcpy to read past rxBuffer.
+            if (rxBuffer[2] > sizeof(msg.data)) {
+                rxIndex = 0;  // Reject malformed frame
+                continue;
+            }
             uint8_t expectedLength = rxBuffer[2] + 5; // type + length + data + checksum + end
             
             // Check if we have the complete message

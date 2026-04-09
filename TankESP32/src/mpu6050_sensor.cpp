@@ -119,7 +119,11 @@ void MPU6050Sensor::update() {
     if (!initialized) return;
     
     uint8_t data[14];
-    readRegisters(MPU6050_ACCEL_XOUT_H, 14, data);
+    uint8_t got = readRegisters(MPU6050_ACCEL_XOUT_H, 14, data);
+    if (got < 14) {
+        // Partial I2C read — discard to avoid false accelZ≈0 triggering upside-down detection
+        return;
+    }
     
     // Combine high and low bytes
     accelX = (int16_t)((data[0] << 8) | data[1]);
@@ -188,7 +192,7 @@ uint8_t MPU6050Sensor::readRegister(uint8_t reg) {
     return 0xFF;  // Return error value on timeout
 }
 
-void MPU6050Sensor::readRegisters(uint8_t reg, uint8_t count, uint8_t* dest) {
+uint8_t MPU6050Sensor::readRegisters(uint8_t reg, uint8_t count, uint8_t* dest) {
     Wire.beginTransmission(MPU6050_ADDR);
     Wire.write(reg);
     Wire.endTransmission(false);
@@ -203,8 +207,7 @@ void MPU6050Sensor::readRegisters(uint8_t reg, uint8_t count, uint8_t* dest) {
         }
     }
     
-    // Fill remaining bytes with zeros on timeout
-    while (bytesRead < count) {
-        dest[bytesRead++] = 0;
-    }
+    // Do NOT zero-fill on timeout — callers check the return value
+    // and discard partial reads rather than acting on corrupt sensor data.
+    return bytesRead;
 }

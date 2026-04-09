@@ -34,7 +34,7 @@ public:
 private:
     void writeRegister(uint8_t reg, uint8_t value);
     uint8_t readRegister(uint8_t reg);
-    void readRegisters(uint8_t reg, uint8_t count, uint8_t* dest);
+    uint8_t readRegisters(uint8_t reg, uint8_t count, uint8_t* dest);  // returns bytes read
     
     // Raw sensor data
     int16_t accelX, accelY, accelZ;

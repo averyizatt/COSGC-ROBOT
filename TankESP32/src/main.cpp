@@ -429,6 +429,10 @@ void loop() {
             encoders.setForwardAccel(sensorData.accelX);
         }
         encoders.update();  // Compute speed/distance from pulse counts
+        // Propagate encoder pose to shared odometry globals (used by AutonomousNav + web API)
+        odomX     = encoders.getX();
+        odomY     = encoders.getY();
+        odomTheta = encoders.getTheta();
     }
 
     // Raw ultrasonic debug print (gated behind DEBUG_SENSORS to avoid serial overhead)
@@ -498,23 +502,6 @@ void loop() {
     // Pump DNS captive-portal server so phones get instant responses.
     // Must run every loop; loopWiFi() is a no-op when WiFi is off.
     loopWiFi();
-
-    // Sample battery voltage every 5 seconds (8-sample average for noise rejection).
-    // Divider: Vbat -> R1(100kΩ) -> GPIO36 -> R2(47kΩ) -> GND
-    // Vadc = Vbat * R2/(R1+R2)  =>  Vbat = Vadc * (R1+R2)/R2
-    {
-        static unsigned long lastBattRead = 0;
-        if (currentMillis - lastBattRead >= 5000) {
-            lastBattRead = currentMillis;
-            uint32_t sum = 0;
-            for (int i = 0; i < BATTERY_ADC_SAMPLES; i++) {
-                sum += analogReadMilliVolts(BATTERY_ADC_PIN);
-                delayMicroseconds(200);
-            }
-            float vAdc = sum / (float)BATTERY_ADC_SAMPLES / 1000.0f; // V at ADC pin
-            batteryVoltage = vAdc * ((BATTERY_R1 + BATTERY_R2) / BATTERY_R2);
-        }
-    }
 
     // Yield to RTOS — reduces CPU heat while keeping responsive timing
     // All timed work uses millis() checks, so 10ms sleep is fine
@@ -754,25 +741,13 @@ void handleButtonPress() {
     ButtonEvent event = button.update();
     
     if (event == BUTTON_SHORT_PRESS) {
-        // Short press - start Bluetooth pairing
-        // Short press — BT pairing only makes sense in RC mode
-        if (currentMode == MODE_RC_CONTROL) {
-            Serial.println("\n*** BUTTON SHORT PRESS - Starting Bluetooth pairing ***");
-            xbox.startPairing();
-            led.setMode(LED_BLINK_BLUE_FAST);
-        } else {
-            Serial.println("\n*** BUTTON SHORT PRESS - (pairing only works in RC mode) ***");
-        }
-    }
-    else if (event == BUTTON_LONG_PRESS) {
-        // Long press - cycle through modes
-        motors.stop();  // Stop motors when switching modes
+        // Short press — cycle through modes (responds immediately on release)
+        motors.stop();
         lastMotorSpeedA = 0;
         lastMotorSpeedB = 0;
 
         uint8_t prevMode = currentMode;
-        
-        // Cycle: UART -> RC -> Autonomous -> Simple Auto -> Wall Follow -> UART
+
         if (currentMode == MODE_UART_CONTROL) {
             currentMode = MODE_RC_CONTROL;
             Serial.println("\n========================================");
@@ -780,9 +755,9 @@ void handleButtonPress() {
             Serial.println("========================================\n");
         } else if (currentMode == MODE_RC_CONTROL) {
             currentMode = MODE_AUTONOMOUS;
-            autoNav.reset();  // Reset autonomous state
-            pathPlanner.startExploration();  // Start planning immediately (avoid IDLE)
-            lastAutonomousUpdate = 0;        // Force immediate autonomous cycle
+            autoNav.reset();
+            pathPlanner.startExploration();
+            lastAutonomousUpdate = 0;
             Serial.println("\n========================================");
             Serial.println("MODE SWITCHED TO: AUTONOMOUS NAVIGATION");
             Serial.println("Path planner: FRONTIER EXPLORE");
@@ -846,6 +821,16 @@ void handleButtonPress() {
             delay(100);
             updateModeIndicator();
             delay(100);
+        }
+    }
+    else if (event == BUTTON_LONG_PRESS) {
+        // Long hold (800ms) — start Bluetooth pairing in RC mode
+        if (currentMode == MODE_RC_CONTROL) {
+            Serial.println("\n*** BUTTON LONG PRESS - Starting Bluetooth pairing ***");
+            xbox.startPairing();
+            led.setMode(LED_BLINK_BLUE_FAST);
+        } else {
+            Serial.println("\n*** BUTTON LONG PRESS - hold in RC mode to pair controller ***");
         }
     }
 }

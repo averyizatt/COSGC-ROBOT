@@ -87,6 +87,13 @@ private:
     // Buffer for receiving
     uint8_t rxBuffer[64];
     uint8_t rxIndex;
+
+    // Tracks whether Serial1 has actually been initialized
+    bool serial1Ready;
 };
+
+// Compile-time guard: SensorData must fit inside Message.data[64]
+static_assert(sizeof(SensorData) <= 64,
+    "SensorData too large for Message.data — increase data[] or reduce SensorData");
 
 #endif // UART_COMM_H

@@ -349,9 +349,11 @@ void AutonomousNav::handleCruise(float distance) {
             // Normalize to -pi..pi
             while (headingError > PI) headingError -= 2*PI;
             while (headingError < -PI) headingError += 2*PI;
-            // Simple proportional steering
-            float steer = headingError * 2.0f; // gain
-            steer = constrain(steer, -40, 40); // max PWM delta
+            // Convert to degrees for a PWM-scale gain (radian gain of 2.0 gives only
+            // ~3 PWM at 90 deg error; 0.5 PWM/deg gives ~45 PWM — properly corrective)
+            float steerDeg = headingError * (180.0f / PI);
+            float steer = steerDeg * 0.5f; // 0.5 PWM per degree of error
+            steer = constrain(steer, -80.0f, 80.0f); // max PWM delta
             int baseSpeed = SPEED_CRUISE;
             int left = baseSpeed - steer;
             int right = baseSpeed + steer;

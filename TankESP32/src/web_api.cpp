@@ -19,7 +19,6 @@ extern MPU6050Sensor imu;
 extern UltrasonicSensor ultrasonicLeft;
 extern UltrasonicSensor ultrasonicRight;
 extern PathPlanner pathPlanner;
-extern float batteryVoltage;
 
 // ---------------------------------------------------------------------------
 // Route handlers
@@ -76,9 +75,7 @@ static void handleStatus(AsyncWebServerRequest *request) {
         "\"mapShifts\":%d,"
         "\"uptime\":%lu,"
         "\"freeHeap\":%u,"
-        "\"clients\":%d,"
-        "\"batteryV\":%.2f,"
-        "\"batteryPct\":%.1f"
+        "\"clients\":%d"
         "}",
         modeStr, navStr,
         odomX, odomY, odomTheta,
@@ -104,10 +101,7 @@ static void handleStatus(AsyncWebServerRequest *request) {
         envMap.getMapShiftCount(),
         millis() / 1000,
         ESP.getFreeHeap(),
-        WiFi.softAPgetStationNum(),
-        batteryVoltage,
-        batteryVoltage < 0.5f ? -1.0f  // -1 = pin not wired / not yet sampled
-            : constrain((batteryVoltage - BATTERY_EMPTY_V) / (BATTERY_FULL_V - BATTERY_EMPTY_V) * 100.0f, 0.0f, 100.0f)
+        WiFi.softAPgetStationNum()
     );
 
     AsyncWebServerResponse *response =

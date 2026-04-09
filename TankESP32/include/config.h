@@ -72,21 +72,6 @@
 #define SERVO_MIN_US       500    // Pulse width (µs) at 0°  — arm at LEFT extreme
 #define SERVO_MAX_US       2500   // Pulse width (µs) at 180° — arm at RIGHT extreme
 
-// Battery voltage monitor
-// Wire a voltage divider from battery+ → R1 → GPIO36 → R2 → GND
-// GPIO 36 (VP) is input-only ADC1_CH0 — safe for this use.
-// Default divider: R1=100kΩ, R2=47kΩ → max safe input ≈ 10.8V.
-// Adjust BATTERY_FULL_V / BATTERY_EMPTY_V to match your pack:
-//   1S LiPo: 4.2 / 3.3    2S LiPo: 8.4 / 6.6
-//   3S LiPo: 12.6 / 9.9   NiMH 6V: 7.2 / 5.4
-#define BATTERY_ADC_PIN    36       // GPIO 36 (VP) — input-only, ADC1
-#define BATTERY_R1         100000.0f // Ohms — top resistor (battery+ side)
-#define BATTERY_R2         47000.0f  // Ohms — bottom resistor (GND side)
-#define BATTERY_FULL_V     8.4f      // Voltage = 100%  (2S LiPo fully charged)
-#define BATTERY_EMPTY_V    6.6f      // Voltage =   0%  (2S LiPo safe cutoff)
-#define BATTERY_WARN_V     7.2f      // Voltage = warn  (flash LED orange below this)
-#define BATTERY_ADC_SAMPLES 8        // ADC readings to average for noise reduction
-
 // Hall effect encoders (A3144, one per output shaft, 10kΩ pull-up to 3.3V)
 #define ENCODER_LEFT_PIN   35  // Left motor hall sensor  (GPIO35 — input-only, D35, external pull-up required)
 #define ENCODER_RIGHT_PIN  32  // Right motor hall sensor (GPIO32 — input, D32, external pull-up required)
@@ -136,8 +121,8 @@
 // ==================== UI CONFIG ====================
 
 // Button Configuration
-#define BUTTON_DEBOUNCE_MS 20
-#define BUTTON_LONG_PRESS_MS 1500
+#define BUTTON_DEBOUNCE_MS 50         // ms — raised from 20ms; capacitive/mechanical switches need ~50ms
+#define BUTTON_LONG_PRESS_MS 800       // ms — hold time for long-press action (was 1500ms, too slow)
 
 // LED Configuration
 #define LED_BLINK_FAST 200   // Fast blink for pairing (ms)
@@ -230,7 +215,7 @@
 // MOTOR_RESISTANCE_OHM = 1.0 and tune up until robot has enough torque.
 
 #define DRV8871_MAX_CURRENT_A  3.6f   // Absolute max continuous current (A)
-#define DRV8871_SAFE_CURRENT_A 3.3f   // Target operating current (A) — 92% of max, brief peaks OK
+#define DRV8871_SAFE_CURRENT_A 3.5f   // Target operating current (A) — 97% of max, brief peaks OK
 #define MOTOR_RESISTANCE_OHM   4.0f   // Effective stall resistance (ohms)
                                        // Multimeter reads ~8ohm static, but stall draws ~4A at 16V
                                        // → effective R = 16V/4A = 4ohm (use this for safety calc)
@@ -238,8 +223,8 @@
 
 // Slew rate limiter — max PWM change per update cycle
 // Prevents sudden current spikes that cause voltage sag / brownout
-#define SLEW_RATE_UP    30     // Max PWM increase per cycle (ramp up)
-#define SLEW_RATE_DOWN  35     // Max PWM decrease per cycle (ramp down — faster for safety)
+#define SLEW_RATE_UP    55     // Max PWM increase per cycle (ramp up)
+#define SLEW_RATE_DOWN  50     // Max PWM decrease per cycle (ramp down — faster for safety)
 #define SLEW_INTERVAL_MS 10    // How often slew rate is applied (ms)
 
 // Direction-change dead-time — brief coast between fwd↔rev

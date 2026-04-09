@@ -288,8 +288,9 @@ bool PathPlanner::computePath(int startX, int startY, int endX, int endY) {
         int stepX = (int)(sin(heading * PI / 180.0f) * 20);
         int stepY = (int)(cos(heading * PI / 180.0f) * 20);
         
-        path[0].x = startX + stepX;
-        path[0].y = startY + stepY;
+        // Clamp to valid map bounds — a step of 20 cells can easily overshoot the 10x10 grid
+        path[0].x = constrain(startX + stepX, 0, MAP_WIDTH - 1);
+        path[0].y = constrain(startY + stepY, 0, MAP_HEIGHT - 1);
         path[0].reached = false;
         pathLength = 1;
         return true;

@@ -248,8 +248,10 @@ void OccupancyMap::shiftMap(int shiftX, int shiftY) {
                 int srcX = x - shiftX;
                 if (srcX >= 0 && srcX < MAP_WIDTH) {
                     grid[IDX(x,y)] = grid[IDX(srcX,y)];
+                    visitCount[IDX(x,y)] = visitCount[IDX(srcX,y)];
                 } else {
                     grid[IDX(x,y)] = CELL_UNKNOWN;  // New unexplored area
+                    visitCount[IDX(x,y)] = 0;
                 }
             }
         }
@@ -260,8 +262,10 @@ void OccupancyMap::shiftMap(int shiftX, int shiftY) {
                 int srcX = x - shiftX;
                 if (srcX >= 0 && srcX < MAP_WIDTH) {
                     grid[IDX(x,y)] = grid[IDX(srcX,y)];
+                    visitCount[IDX(x,y)] = visitCount[IDX(srcX,y)];
                 } else {
                     grid[IDX(x,y)] = CELL_UNKNOWN;
+                    visitCount[IDX(x,y)] = 0;
                 }
             }
         }
@@ -275,8 +279,10 @@ void OccupancyMap::shiftMap(int shiftX, int shiftY) {
                 int srcY = y - shiftY;
                 if (srcY >= 0 && srcY < MAP_HEIGHT) {
                     grid[IDX(x,y)] = grid[IDX(x,srcY)];
+                    visitCount[IDX(x,y)] = visitCount[IDX(x,srcY)];
                 } else {
                     grid[IDX(x,y)] = CELL_UNKNOWN;
+                    visitCount[IDX(x,y)] = 0;
                 }
             }
         }
@@ -287,8 +293,10 @@ void OccupancyMap::shiftMap(int shiftX, int shiftY) {
                 int srcY = y - shiftY;
                 if (srcY >= 0 && srcY < MAP_HEIGHT) {
                     grid[IDX(x,y)] = grid[IDX(x,srcY)];
+                    visitCount[IDX(x,y)] = visitCount[IDX(x,srcY)];
                 } else {
                     grid[IDX(x,y)] = CELL_UNKNOWN;
+                    visitCount[IDX(x,y)] = 0;
                 }
             }
         }

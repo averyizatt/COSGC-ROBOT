@@ -95,9 +95,12 @@ void HallEncoder::update() {
 
     if (dt < 0.01f) return;  // Too fast, skip
 
-    // Snapshot pulse counts (atomic read from volatile)
-    unsigned long leftNow = leftPulseCount;
+    // Snapshot pulse counts atomically — prevent ISR from firing between the two
+    // reads and producing a skewed delta that corrupts odometry calculations.
+    portDISABLE_INTERRUPTS();
+    unsigned long leftNow  = leftPulseCount;
     unsigned long rightNow = rightPulseCount;
+    portENABLE_INTERRUPTS();
 
     unsigned long leftDelta = leftNow - lastLeftPulses;
     unsigned long rightDelta = rightNow - lastRightPulses;
