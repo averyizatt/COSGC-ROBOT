@@ -1,5 +1,7 @@
 #include "wifi_manager.h"
 #include "esp_bt.h"
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
 // WiFi AP credentials (open network — no password, any device can connect instantly)
 static const char* WIFI_SSID = "TankBot-AP";
@@ -10,6 +12,7 @@ static const IPAddress AP_MASK(255, 255, 255, 0);
 
 // Single server instance — shared with web_api.cpp via the extern in wifi_manager.h
 AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
 // Captive-portal DNS server: responds to every DNS query with AP_IP so phones
 // automatically pop up the dashboard and don't route browser traffic to cellular.
@@ -18,6 +21,9 @@ static bool dnsRunning = false;
 
 // Shared guard flag — true only while the server is operational
 volatile bool serverActive = false;
+
+volatile int sok_left = 0;
+volatile int sok_right = 0;
 
 // ── WiFi event diagnostics ─────────────────────────────────────────────────
 static void onWiFiEvent(WiFiEvent_t event) {
@@ -40,6 +46,61 @@ static void onWiFiEvent(WiFiEvent_t event) {
             Serial.println("[WiFi] Client got DHCP IP");
             break;
         default: break;
+    }
+}
+
+static void onWsEvent(
+    AsyncWebSocket *server,
+    AsyncWebSocketClient *client,
+    AwsEventType type,
+    void *arg,
+    uint8_t *data,
+    size_t len
+) {
+
+    switch (type) {
+
+        case WS_EVT_CONNECT:
+            Serial.printf("[WS] Client #%u connected from %s\n",
+                          client->id(),
+                          client->remoteIP().toString().c_str());
+
+            // Optional: send initial state
+            client->text("connected");
+            break;
+
+        case WS_EVT_DISCONNECT:
+            Serial.printf("[WS] Client #%u disconnected\n", client->id());
+            break;
+
+        case WS_EVT_DATA: {
+            AwsFrameInfo *info = (AwsFrameInfo*)arg;
+
+            if (!(info->final && info->index == 0 && info->len == len)) break;
+            String msg(data, len);
+
+            Serial.printf("[WS] Received: %s\n", msg.c_str());
+
+            int sep = msg.indexOf(",");
+            if (sep == -1) break; // Invalid command
+
+            String leftStr = msg.substring(0, sep);
+            String rightStr = msg.substring(sep + 1);
+
+            sok_left = leftStr.toInt();
+            sok_right = rightStr.toInt();
+
+            // Acknowledge message receipt
+            ws.textAll(msg);
+            break;
+        }
+
+        case WS_EVT_ERROR:
+            Serial.println("[WS] Error");
+            break;
+
+        case WS_EVT_PONG:
+            break;
     }
 }
 
@@ -111,6 +172,10 @@ void startWiFi() {
     dnsRunning = dnsServer.start(53, "*", AP_IP);
     Serial.printf("[WiFi] DNS captive-portal: %s\n", dnsRunning ? "OK" : "FAILED");
 
+    // Connect Websocket to server
+    ws.onEvent(onWsEvent);
+    server.addHandler(&ws);
+
     server.begin();
     serverActive = true;
     Serial.printf("[WiFi] Dashboard: http://%s/  (or any URL — captive portal)\n",
@@ -119,6 +184,8 @@ void startWiFi() {
 
 void loopWiFi() {
     if (dnsRunning) dnsServer.processNextRequest();
+
+    ws.cleanupClients();
 }
 
 void stopWiFi() {

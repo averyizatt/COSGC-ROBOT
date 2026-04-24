@@ -194,6 +194,7 @@ void setup() {
     Serial.printf("Current mode: %s\n", 
                   currentMode == MODE_RC_CONTROL   ? "RC Control"   : 
                   currentMode == MODE_UART_CONTROL ? "UART Control" :
+                  currentMode == MODE_SOK_CONTROL  ? "SOK Control" :
                   currentMode == MODE_AUTONOMOUS   ? "Autonomous"   :
                   currentMode == MODE_SIMPLE_AUTO  ? "Simple Auto"  :
                   currentMode == MODE_WALL_FOLLOW  ? "Wall Follow"  : "Premap Nav");
@@ -462,17 +463,24 @@ void loop() {
         }
     } else if (currentMode == MODE_UART_CONTROL) {
         // UART mode - send sensor data and process commands
-        if (currentMillis - lastUARTSend >= UART_SEND_INTERVAL) {
-            lastUARTSend = currentMillis;
-            // Disabled automatic sensor sending to prevent serial corruption
-            // sendSensorDataViaUART();
-        }
+        // if (currentMillis - lastUARTSend >= UART_SEND_INTERVAL) {
+        //     lastUARTSend = currentMillis;
+        //     // Disabled automatic sensor sending to prevent serial corruption
+        //     // sendSensorDataViaUART();
+        // }
         
-        // Check for incoming UART messages
-        Message msg;
-        if (uart.receiveMessage(msg)) {
-            uart.processMessage(msg);
-        }
+        // // Check for incoming UART messages
+        // Message msg;
+        // if (uart.receiveMessage(msg)) {
+        //     uart.processMessage(msg);
+        // 
+        // }
+
+        motors.setMotors(255, 255);
+    } else if (currentMode == MODE_SOK_CONTROL) {
+        motors.setMotors(sok_left, sok_right);
+        lastMotorSpeedA = sok_left;
+        lastMotorSpeedA = sok_right;
     } else if (currentMode == MODE_AUTONOMOUS) {
         // Autonomous mode - update at 10 Hz
         if (currentMillis - lastAutonomousUpdate >= AUTONOMOUS_UPDATE_INTERVAL) {
@@ -754,6 +762,13 @@ void handleButtonPress() {
             Serial.println("MODE SWITCHED TO: RC CONTROL (Xbox)");
             Serial.println("========================================\n");
         } else if (currentMode == MODE_RC_CONTROL) {
+            currentMode = MODE_SOK_CONTROL;
+            sok_left = 0;
+            sok_right = 0;
+            Serial.println("\n========================================");
+            Serial.println("MODE SWITCHED TO: SOK Control");
+            Serial.println("========================================\n");
+        } else if (currentMode == MODE_SOK_CONTROL) {
             currentMode = MODE_AUTONOMOUS;
             autoNav.reset();
             pathPlanner.startExploration();
@@ -844,6 +859,8 @@ void updateModeIndicator() {
         }
     } else if (currentMode == MODE_UART_CONTROL) {
         led.setMode(LED_SOLID_RED);  // Red for UART mode
+    } else if (currentMode == MODE_SOK_CONTROL) {
+        led.setMode(LED_OFF);  // Red for UART mode
     } else if (currentMode == MODE_AUTONOMOUS) {
         led.setMode(LED_SOLID_ORANGE);  // Orange for autonomous mode
     } else if (currentMode == MODE_SIMPLE_AUTO) {
@@ -1438,7 +1455,7 @@ void handleSimpleAutonomousMode() {
     static int recoveryStep = 0;
     static int rockCycles = 0;
     static unsigned long recoveryUntil = 0;
-    static int recoveryTurnDir = 0; // 0=right, 1=left
+    static int recoveryTurnDir = 1; // 0=right, 1=left
     static unsigned long simpleRecoveryCooldownUntil = 0;  // Post-recovery cooldown
     static float simpleLastDist = 999.0f;  // Track distance changes for stuck verify
     
@@ -1644,8 +1661,11 @@ void handleSimpleAutonomousMode() {
                     simpleRecentlyStuck = true; simpleStuckTime = now;
                     simpleNoMotionStart = 0;
                     simpleRecoveryCooldownUntil = now + RECOVERY_COOLDOWN_MS;
-                    if (distL > distR) { leftSpeed = -TURN_SPEED; rightSpeed = TURN_SPEED; }
-                    else { leftSpeed = TURN_SPEED; rightSpeed = -TURN_SPEED; }
+                    // if (distL > distR) { leftSpeed = -TURN_SPEED; rightSpeed = TURN_SPEED; }
+                    // else { leftSpeed = TURN_SPEED; rightSpeed = -TURN_SPEED; }
+
+                    // only turn right
+                    leftSpeed = -TURN_SPEED; rightSpeed = TURN_SPEED;
                     break;
             }
         }
@@ -1976,7 +1996,8 @@ void handleSimpleAutonomousMode() {
                         actionUntil = now + DR_CORRECT_TURN_MS;
                         pidI = 0;
                         simpleHeadingTowardStart = 0;
-                        bool turnRight = (awayError > 0);
+                        // bool turnRight = (awayError > 0);
+                        bool turnRight = true;
                         if (turnRight) {
                             leftSpeed = TURN_SPEED; rightSpeed = -TURN_SPEED;
                         } else {

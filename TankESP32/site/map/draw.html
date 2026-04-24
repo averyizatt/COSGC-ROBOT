@@ -1,11 +1,5 @@
-#include "web_map_editor.h"
+<!-- Note that this file is used in `web_map_editor.cpp`, but is not automatically injected/extracted -->
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Pre-map editor page — stored in flash (PROGMEM) to save heap.
-// Grid is MAP_WIDTH × MAP_HEIGHT (10 × 10), each cell = 50 cm.
-// Cell encoding matches /api/map: '#'=wall ' '=free '!'=hazard 'v'=pit '^'=hill
-// ─────────────────────────────────────────────────────────────────────────────
-static const char MAP_EDITOR_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html lang="en">
     <head>
@@ -1097,18 +1091,4 @@ static const char MAP_EDITOR_HTML[] PROGMEM = R"rawliteral(
             draw();
         </script>
     </body>
-</html>)rawliteral";
-
-static const size_t MAP_EDITOR_LEN = sizeof(MAP_EDITOR_HTML) - 1;
-
-void handleMapEditor(AsyncWebServerRequest *request) {
-    AsyncWebServerResponse *response = request->beginChunkedResponse("text/html",
-        [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-            if (index >= MAP_EDITOR_LEN) return 0;
-            size_t remaining = MAP_EDITOR_LEN - index;
-            size_t toSend = (remaining < maxLen) ? remaining : maxLen;
-            memcpy_P(buffer, MAP_EDITOR_HTML + index, toSend);
-            return toSend;
-        });
-    request->send(response);
-}
+</html>

@@ -1,7 +1,5 @@
-#include "web_dashboard.h"
+<!-- Note that this file is used in `web_dashboard.cpp`, but is not automatically injected/extracted -->
 
-// Full-featured rover dashboard — WiFi runs exclusively (no BT), so size is not a concern.
-static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
 <html lang="en">
     <head>
@@ -1071,19 +1069,4 @@ static const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
             runPoll();
         </script>
     </body>
-</html>)rawliteral";
-
-static const size_t DASHBOARD_LEN = sizeof(DASHBOARD_HTML) - 1;
-
-void handleDashboard(AsyncWebServerRequest *request) {
-    // Stream the PROGMEM HTML in small chunks to avoid large heap allocation
-    AsyncWebServerResponse *response = request->beginChunkedResponse("text/html",
-        [](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-            if (index >= DASHBOARD_LEN) return 0;  // Done
-            size_t remaining = DASHBOARD_LEN - index;
-            size_t toSend = (remaining < maxLen) ? remaining : maxLen;
-            memcpy_P(buffer, DASHBOARD_HTML + index, toSend);
-            return toSend;
-        });
-    request->send(response);
-}
+</html>

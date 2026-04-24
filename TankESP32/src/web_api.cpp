@@ -12,6 +12,7 @@
 #include "uart_comm.h"
 #include "ultrasonic_sensor.h"
 #include "path_planner.h"
+#include "sok_ctrl.h"
 
 extern AutonomousNav autoNav;
 extern SensorData sensorData;
@@ -39,10 +40,12 @@ static void handleStatus(AsyncWebServerRequest *request) {
     // Human-readable mode name — mirrors the 5-mode button cycle in main.cpp
     const char* modeStr =
         currentMode == MODE_RC_CONTROL   ? "RC Control"  :
-        currentMode == MODE_UART_CONTROL ? "UART Control":
+        currentMode == MODE_UART_CONTROL ? "Straight Control":
+        currentMode == MODE_SOK_CONTROL   ? "SOK Control"  :
         currentMode == MODE_AUTONOMOUS   ? "Autonomous"  :
         currentMode == MODE_SIMPLE_AUTO  ? "Simple Auto" :
-        currentMode == MODE_WALL_FOLLOW  ? "Wall Follow" : "Unknown";
+        currentMode == MODE_WALL_FOLLOW  ? "Wall Follow" :
+        currentMode == MODE_PREMAP_NAV  ? "PREMAP" : "Unknown";
 
     const char* navStr = autoNav.getStateString();
 
@@ -267,6 +270,13 @@ void setupWebServer() {
         nullptr,                // upload handler (files) — not needed
         handlePremapBody        // body chunk handler
     );
+
+    server.on("/control", HTTP_GET, [](AsyncWebServerRequest *request){
+        if (!serverActive) { request->send(503); return; }
+        Serial.printf("[HTTP] GET /control from %s\n",
+                      request->client()->remoteIP().toString().c_str());
+        handleSokCtrl(request);
+    });
 
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
         if (!serverActive) { request->send(503); return; }

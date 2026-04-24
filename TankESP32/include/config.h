@@ -132,10 +132,11 @@
 
 #define MODE_RC_CONTROL   0  // Xbox controller (Bluetooth)
 #define MODE_UART_CONTROL 1  // UART commands
-#define MODE_AUTONOMOUS   2  // Autonomous navigation
-#define MODE_SIMPLE_AUTO  3  // Simple autonomous (distance-only)
-#define MODE_WALL_FOLLOW  4  // Wall-following perimeter mode (left-hand rule)
-#define MODE_PREMAP_NAV   5  // Pre-mapped autonomous: map drawn from web UI before run
+#define MODE_SOK_CONTROL  2  // Control via socket
+#define MODE_AUTONOMOUS   3  // Autonomous navigation
+#define MODE_SIMPLE_AUTO  4  // Simple autonomous (distance-only)
+#define MODE_WALL_FOLLOW  5  // Wall-following perimeter mode (left-hand rule)
+#define MODE_PREMAP_NAV   6  // Pre-mapped autonomous: map drawn from web UI before run
 
 // === WALL FOLLOW MODE TUNING ===
 #define WF_TARGET_DIST_CM   28.0f  // Desired distance to keep from left wall (cm)
@@ -188,8 +189,8 @@
 
 // Motor calibration - adjust if robot drifts left/right
 // Values from 0.8 to 1.2, 1.0 = no adjustment
-#define MOTOR_A_CALIBRATION 1.0f  // Left motor multiplier
-#define MOTOR_B_CALIBRATION 0.95f // Right motor multiplier (trimmed down — robot drifts right)
+#define MOTOR_A_CALIBRATION 0.8f  // Left motor multiplier
+#define MOTOR_B_CALIBRATION 1.0f // Right motor multiplier (trimmed down — robot drifts right)
 // Set to 1 if motor wiring polarity is reversed
 #define MOTOR_A_INVERTED 1
 #define MOTOR_B_INVERTED 1  // Changed: new driver has reversed wiring

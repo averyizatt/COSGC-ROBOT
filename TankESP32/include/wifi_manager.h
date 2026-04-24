@@ -10,6 +10,10 @@ extern AsyncWebServer server;
 // Guards all HTTP handlers against use-after-teardown crashes.
 extern volatile bool serverActive;
 
+// Requested values
+extern volatile int sok_left;
+extern volatile int sok_right;
+
 // Start the WiFi AP, DNS captive-portal server, and async web server.
 // Call once — after this, the dashboard is reachable at http://192.168.4.1/
 // or by any URL (captive portal DNS redirects everything to the ESP32).
